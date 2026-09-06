@@ -1,0 +1,342 @@
+MODULE LCOUNT;
+
+(* lcount -- line counter for Oberon-07 / SPHINX Oberon source files.
+   Usage (translate with SPHO.EXE LCOUNT.SMD -> LCOUNT.ASM, assemble with
+   TASM.EXE -> LCOUNT.RDF, link against SYSTEM/FILES/OUT's own .RDF into
+   an .EXE with an entry point at Run): "LCOUNT.EXE FILE.MOD".
+   Reads the filename off the DOS command tail (INT 21h/AH=62h to fetch
+   the PSP segment portably -- this program may be linked to run with
+   DS pointing anywhere, not necessarily at its own PSP, so the PSP
+   segment must be asked for rather than assumed; SRC/LIB/SYSTEM.ASM's
+   own common_init does the same AH=62h call for the same reason), then
+   opens and streams it via READER.SMD's own buffered OpenReader/ReadChar
+   (a shared BufferedFile record replaces this file's former standalone
+   readBuf/bufLen/bufPos/ReadOneByte -- same refill-once-per-block
+   behavior, just factored out into LIB/READER.SMD so every tool in this
+   tree shares one implementation instead of each keeping its own copy).
+   ReadChar returns -1 (WORD, AH<>0) at EOF and the byte zero-extended
+   into AX otherwise, so the main loop below checks AH instead of the
+   old ReadOneByte's own "0 means EOF" convention.
+   Classifies each line as blank, a comment (paren-star ... star-paren,
+   nesting tracked at any depth by this classifier itself -- an
+   intentional choice, not a claim about what either language's own
+   comment scanner does: Oberon-07 proper DOES nest (DOCS/OBERON07.EBN's
+   "nested comments allowed"), but SPHO.MOD's own SPHINX Oberon comment
+   scanner does NOT -- it closes on the first star-paren regardless of
+   any paren-star seen since (DOCS/SPHINX.MD's own "Few notes"); this
+   classifier tracks nesting depth anyway so a human skimming either
+   dialect's source sees the intuitive per-line comment/code split,
+   independent of what either compiler's own scanner would actually
+   accept. Also recognizes a slash-slash line comment -- purely this
+   classifier's own convention for counting comment-style lines in
+   arbitrary text, NOT a SPHO.MOD scanner feature (SPHO.MOD has no
+   "//" handling at all; DOCS/SPHINX.MD documents this explicitly) --
+   recognized only outside any open paren-star span), or ordinary code.
+
+   A line is:
+     - EMPTY   if it contains only spaces/tabs (or nothing) from column 1
+               to the newline;
+     - COMMENT if it is not empty, but every non-blank character on it
+               falls inside a comment span (commentDepth > 0 for the
+               whole visible portion, or the line's only real content IS
+               a comment span that closes on the same line);
+     - OBERON  otherwise (has at least one character that is real code,
+               outside any comment span).
+   This is a per-line classifier, not a token-level parser: a line with
+   both code and a trailing comment counts as OBERON (it has real code
+   on it), matching the intuitive "count of lines with code" a human
+   skimming the file would report.
+
+   IMPORT SYSTEM for Halt (the process-exit convention every other .SMD
+   program here uses), FILES for Reset/BlockRead/Close, and OUT for
+   Out_Char/Out_String/Out_Ln. The command-tail/PSP read below is still
+   done directly via INT 21h/AH=62h rather than through SYSTEM: SYSTEM.SMD
+   has no PSP/command-line accessor of its own (SPHINX Oberon has no
+   documented command-line API at all), so this program reads the raw
+   PSP layout itself, the same way SYSTEM.ASM's own common_init does for
+   its own unrelated reasons. *)
+
+IMPORT SYSTEM, FILES, OUT;
+
+CONST
+  MaxName = 128;
+
+VAR
+  fname     : BYTE[MaxName];
+  inReader  : File;         (* READER's own buffered-read state, replacing
+                               this file's own former readBuf/bufLen/
+                               bufPos/ReadOneByte *)
+  commentDepth : INTEGER;
+  lineHasCode  : BOOLEAN;   (* saw a real (non-blank, non-comment) char on the current line *)
+  lineHasAny   : BOOLEAN;   (* saw ANY non-blank char on the current line (code or comment) *)
+  prevWasStar  : BOOLEAN;   (* previous char was star, watching for a following close-paren *)
+  prevWasLParen: BOOLEAN;   (* previous char was open-paren, watching for a following star *)
+  prevWasSlash : BOOLEAN;   (* previous char was slash, watching for a following slash *)
+  inLineComment: BOOLEAN;   (* saw a slash-slash line comment start outside a block comment *)
+
+  totalLines   : WORD;
+  emptyLines   : WORD;
+  commentLines : WORD;
+  oberonLines  : WORD;
+
+(* GetCmdLine: fetch this program's own PSP segment (AH=62h, portable --
+   DS at program entry is not guaranteed to already be the PSP segment
+   for a linked .EXE), then copy the command tail (PSP offset 80h = byte
+   length, 81h.. = the raw text, DOCS none of this is SPHINX-documented,
+   it is plain DOS PSP layout) into fname, stopping at the first space/
+   tab/CR or MaxName-1 bytes, and NUL-terminating it (Reset needs
+   an ASCIIZ name, not the DOS $-terminated convention DosMessage uses
+   elsewhere). Leading spaces/tabs before the filename (a lone leading
+   space is universal -- DOS always writes at least one before the first
+   argument) are skipped first. *)
+(* IsBlank: TRUE for space or tab. A helper, not inlined, because SPHO's
+   IF condition is a single 'a REL b' test only (DOCS/SPHO.MD's own
+   "Known simplifications" -- no '&'/'OR' composition in a condition),
+   so "IF (c=Space) OR (c=Tab) THEN" doesn't parse; a plain BOOLEAN-
+   returning helper called from an ordinary single-condition IF sidesteps
+   that everywhere it's needed instead of hand-nesting IFs at each site. *)
+PROCEDURE IsBlank(AL) : BOOLEAN; NEAR;
+BEGIN
+  IF AL = Space THEN
+    AL := TRUE
+  ELSIF AL = Tab THEN
+    AL := TRUE
+  ELSE
+    AL := FALSE
+  END
+END IsBlank;
+
+(* IsNameEnd: TRUE for space, tab, or CR -- where the filename token on
+   the command tail ends. *)
+PROCEDURE IsNameEnd(c : BYTE) : BOOLEAN; NEAR;
+BEGIN
+  IF IsBlank(c) THEN
+     AL := TRUE
+  ELSIF c = CR THEN
+     AL := TRUE
+  ELSE
+     AL := FALSE
+  END
+END IsNameEnd;
+
+PROCEDURE GetCmdLine(): BOOLEAN; NEAR;
+VAR tailLen : INTEGER; i : INTEGER; n : INTEGER; c : BYTE;
+    maxNameM1 : INTEGER;
+BEGIN
+  maxNameM1 := MaxName - 1;
+  GetPSP();   (* PSP segment comes back in AX -- used directly below,
+                 no local needed to hold it (it's dead the instant
+                 ES:=AX reads it out) *)
+  ES := AX;
+  BX := 80H;
+  (* PSP offset 80h is a single BYTE (the command tail's own length),
+     not a WORD -- a bare "[ES:BX]" with no declared-field size hint
+     defaults to a word-sized read (SizeHintFor's own fallback), which
+     would read this length byte AND the very first tail character
+     packed together as one 16-bit value instead of just the length.
+     Reading through AL directly, then widening into tailLen, forces
+     the correct 1-byte access without a dead intermediate local. *)
+  AL := [ES:BX];
+  tailLen := AL;
+
+  (* skip leading spaces/tabs; BREAK on the first non-blank byte (or on
+     running past tailLen -- an all-blank tail, no filename given) stops
+     the loop WITHOUT disturbing i, unlike an "advance i past the end to
+     signal stop" trick, which would destroy the very index this loop
+     exists to find. No local to hold [ES:BX] first -- AL IS IsBlank's own
+     register-named parameter (PROCEDURE IsBlank(AL)), so loading it
+     straight into AL and calling immediately skips a dead intermediate
+     BYTE local entirely; safe here ONLY because AL's value isn't needed
+     again after the call -- IsBlank's own BOOLEAN result (returned in AX,
+     clobbering AL) is all this loop reads back (tailLen/i themselves
+     still can't move into registers -- they must survive this call, and
+     IsBlank has no USES clause to preserve anything for them). *)
+  INC(BX);
+  DX := 1;
+  WHILE DX <= tailLen DO
+    AL := [ES:BX];
+    IF IsBlank(AL) THEN INC(DX) ELSE BREAK END
+    INC(BX);
+  END;
+  i := DX;
+
+  (* Copy bytes from i into fname until a space/tab/CR, MaxName-1, or the
+     end of the tail is reached. c MUST be a real local here, unlike the
+     loop above -- the byte's own value is still needed AFTER the
+     IsNameEnd call (at "[DS:SI] := c" below), and IsNameEnd's call
+     clobbers AL/AX with its own BOOLEAN result the same way IsBlank's
+     does; a bare AL local (tried here once, reverted) silently copied
+     IsNameEnd's 0/1 result into fname instead of the real byte. *)
+  n := 0;
+  WHILE i <= tailLen DO
+    BX := 80H + i;
+    c := [ES:BX];
+    IF IsNameEnd(c) THEN BREAK END;
+    IF n >= maxNameM1 THEN BREAK END;
+    SI := ADR(fname);
+    INC(SI, n);
+    [DS:SI] := c;
+    INC(n);
+    INC(i)
+  END;
+  INC(SI);
+  AL := 0;
+  [DS:SI] := AL;
+  AL := n > 0
+END GetCmdLine;
+
+(* EndLine: classify the line just finished (blank / comment / oberon)
+   and reset the per-line flags for the next one. Blank beats comment
+   (an empty line is never counted as a comment line even though
+   lineHasAny is also FALSE for it -- same FALSE value, checked in the
+   right order below), and lineHasCode alone decides OBERON vs COMMENT
+   once the line is known non-blank. *)
+PROCEDURE EndLine(); NEAR;
+BEGIN
+  INC(totalLines);
+  IF ~lineHasAny THEN
+    INC(emptyLines)
+  ELSIF lineHasCode THEN
+    INC(oberonLines)
+  ELSE
+    INC(commentLines)
+  END;
+  AX := 0;
+  lineHasCode := AL;
+  lineHasAny := AL;
+  prevWasStar := AL;
+  prevWasLParen := AL;
+  prevWasSlash := AL;
+  inLineComment := AL
+END EndLine;
+
+(* ClassifyByte: feed one source byte through the comment-nesting state
+   machine, updating lineHasAny/lineHasCode for the CURRENT line. Called
+   once per byte in left-to-right order, so an open-paren-star or
+   star-close-paren pair split across two ReadOneByte calls is still
+   recognized correctly (prevWasLParen/prevWasStar carry the pending
+   half across calls). CR/LF themselves are never classified as content
+   (handled by the caller, which calls EndLine on LF instead of routing
+   it through here).
+
+   A slash-slash outside any paren-star span starts a line comment: once
+   seen, inLineComment stays TRUE for the rest of the line (EndLine
+   resets it), every further byte on the line is swallowed without
+   touching lineHasCode, and the line is classified COMMENT unless it
+   already had real code before the slash-slash (matching the same
+   "code beats comment" rule paren-star spans already follow). A
+   slash-slash is NOT recognized while already inside an open paren-star
+   span (neither Oberon-07 nor SPHINX Oberon has line comments at all --
+   this is purely this classifier's OWN convention for counting
+   comment-style lines, not a real SPHO.MOD scanner feature -- SPHO.MOD
+   has no "//" handling anywhere, DOCS/SPHINX.MD's own "Few notes"
+   documents this explicitly. A bare slash-slash appearing inside a
+   block comment's text is just ordinary comment text, not a fresh
+   line-comment opener). *)
+PROCEDURE ClassifyByte(b : BYTE); NEAR;
+BEGIN
+  IF inLineComment THEN
+    lineHasAny := TRUE;
+    RETURN
+  END;
+
+  IF prevWasLParen THEN
+    IF b = 42 THEN                     (* open-paren then star opens one more level *)
+      INC(commentDepth);
+      lineHasAny := TRUE;
+      prevWasLParen := FALSE;
+      prevWasStar := FALSE;
+      RETURN
+    END
+  END;
+  IF prevWasStar THEN
+    IF b = 41 THEN                     (* star then close-paren closes one level *)
+      IF commentDepth > 0 THEN DEC(commentDepth) END;
+      lineHasAny := TRUE;
+      prevWasStar := FALSE;
+      prevWasLParen := FALSE;
+      RETURN
+    END
+  END;
+  IF prevWasSlash THEN
+    prevWasSlash := FALSE;
+    AH := TRUE;
+    IF b = 47 THEN                     (* slash then slash opens a line comment *)
+      inLineComment := AH;
+      lineHasAny := AH;
+      RETURN
+    END;
+    (* not "//" after all -- the pending slash was real code (division) *)
+    lineHasCode := AH
+  END;
+
+  prevWasLParen := FALSE;
+  prevWasStar := FALSE;
+
+  IF IsBlank(b) THEN
+    (* whitespace never marks the line as having "any" content by
+       itself, and never starts an open-paren-star/star-close-paren pair *)
+    RETURN
+  END;
+
+  lineHasAny := TRUE;
+  IF commentDepth = 0 THEN
+    AL := b;
+    AH := TRUE;
+    IF AL = 40 THEN prevWasLParen := AH           (* open-paren -- might start a comment *)
+    ELSIF AL = 47 THEN prevWasSlash := AH         (* slash -- might start a line comment *)
+    ELSE lineHasCode := AH
+    END
+  ELSE
+    AL := b;
+    IF AL = 42 THEN prevWasStar := TRUE             (* star -- might end this level *)
+    ELSIF AL = 40 THEN prevWasLParen := TRUE        (* open-paren -- might open one more level *)
+    END
+  END
+END ClassifyByte;
+
+BEGIN
+  IF ~GetCmdLine() THEN
+    Out_String("usage: LCOUNT filename"); Out_Ln;
+    Halt(2)
+  END;
+
+  IF ~Reset(ADR(inReader), ADR(fname)) THEN
+    Out_String("Cannot open file"); Out_Ln;
+    Halt(1)
+  END;
+  AX := 0;
+  totalLines := AX;
+  emptyLines := AX;
+  commentLines := AX;
+  oberonLines := AX;
+  commentDepth := AX;
+  lineHasCode := AL;
+  lineHasAny := AL;
+  prevWasStar := AL;
+  prevWasLParen := AL;
+
+  ReadByte(ADR(inReader));
+  WHILE AH = 0 DO
+    IF AL = LF THEN
+      EndLine()
+    ELSIF AL # CR THEN
+      ClassifyByte(AL)
+    END;
+    ReadByte(ADR(inReader))
+  END;
+  (* a final line with no trailing LF still counts, as long as it had
+     any content at all (an empty trailing line with no LF can't exist:
+     there would be nothing left to read) *)
+  IF lineHasAny THEN EndLine() END;
+
+  Close(ADR(inReader));
+
+  Out_String(ADR(fname)); Out_Ln;
+  Out_String("Empty lines:   "); Out_Word(emptyLines);   Out_Ln;
+  Out_String("Comment lines: "); Out_Word(commentLines); Out_Ln;
+  Out_String("Oberon lines:  "); Out_Word(oberonLines);  Out_Ln;
+  Out_String("Total lines:   "); Out_Word(totalLines);   Out_Ln;
+
+  Halt(0)
+END LCOUNT.

@@ -1,0 +1,882 @@
+MODULE FILES;
+
+(* Buffered file I/O, ported from SRC/LIB/FILES.MOD's own File/BlockRead/
+   BlockWrite/Seek/FilePos/FileSize/Reset/ReWrite/Close -- same page-
+   buffered design (one BUFSIZE-byte page held in memory, tagged by which
+   page of the file it holds, flushed lazily on a page change or Close),
+   WITHOUT FILES.MOD's own EMS-backed cache (BkEms/EmsHandle/EmsCap/
+   ReWriteTemp -- disk-backed files only here).
+
+   Every procedure below takes ADR(f) (a WORD, the File record's own
+   address) as its first argument, matching LIB/READER.SMD's own
+   OpenReader(FileBuf, fname)/ReadChar(FileBuf) convention exactly -- one
+   consistent "record address as first arg" pattern across both modules,
+   since SPHINX has no VAR-record parameter passing (DOCS/SPHINX.MD
+   SS6.1/6.2: only bare register/scalar formals).
+
+   BUFSIZE (the page size) is a CONST, changeable by editing ONE line --
+   MUST stay a power of 2, with BUFSHIFT kept in sync by hand as its own
+   log2 (SPHINX has no compile-time log2, and no LONGINT arithmetic at
+   all to compute one at runtime either -- DOCS/SPHINX.MD S11:
+   register-pair MOVES only, no DIV/MOD/+/- on a 32-bit value), so the
+   page-tag/within-page-offset split (pos >> BUFSHIFT / pos AND
+   (BUFSIZE-1)) reduces to WORD shifts/masks on a Lo/Hi word pair
+   instead of real 32-bit division -- the same Lo/Hi-pair convention
+   already used throughout this tree (EXAMPLES/LZSS/LZSS.SMD's own
+   remLo/remHi, EXAMPLES/CRK/APPLYCRK.SMD's own offLo/offHi). posLo/
+   posHi and sizeLo/sizeHi below are that pair for the file's own
+   absolute cursor/size; FileSize/FilePos return them packed into DX:AX
+   (SPHINX's own LONGINT-register-pair convention, DOCS/SPHINX.MD S11),
+   matching the OLD unbuffered FileSize's own return shape exactly. *)
+
+CONST
+  InvalidHandle* = 0;
+
+  STDIN*  = 0;
+  STDOUT* = 1;
+  STDERR* = 2;
+  STDPRN* = 4;
+  STDAUX* = 5;
+
+  FILESBUFSIZE  = 2048;    (* page size -- MUST be a power of 2; keep
+                          BUFSHIFT/BUFMASK (below) in sync by hand if
+                          this changes -- SPHINX CONST values must be
+                          literals, "BUFSIZE - 1" doesn't parse here *)
+  BUFSHIFT = 11;      (* log2(BUFSIZE) -- 2048 = 1 SHL 11 *)
+  BUFMASK  = 2047;    (* BUFSIZE - 1 *)
+
+TYPE
+  File* = RECORD
+    handle  : INTEGER;
+    bufTagLo : WORD;   (* which BUFSIZE-byte page buf[] currently holds *)
+    bufTagHi : WORD;
+    bufSize : WORD;    (* valid bytes in buf[] (less than BUFSIZE at EOF) *)
+    bufPos  : WORD;    (* next unread/unwritten index within buf[] *)
+    dirty   : BOOLEAN;
+    posLo   : WORD;    (* absolute cursor, kept in sync by Seek/BlockRead/BlockWrite *)
+    posHi   : WORD;
+    sizeLo  : WORD;    (* absolute file size *)
+    sizeHi  : WORD;
+    buf     : CHAR[FILESBUFSIZE]
+  END;
+
+(* ============================ 32-bit Lo/Hi helpers ==================== *)
+(* SPHINX has no VAR (reference) parameters at all (DOCS/SPHINX.MD S6.6:
+   pass-by-value only) -- every helper below that needs to hand back TWO
+   WORDs returns them packed into DX:AX instead (SPHINX's own LONGINT-
+   register-pair convention, S11), read back via "lo := AX; hi := DX"
+   at the call site, exactly like FileSize/FilePos already do. *)
+
+(* ShlPair: (lo, hi) SHL BUFSHIFT, returned in DX:AX -- turns a page tag
+   back into its own starting byte offset. *)
+PROCEDURE ShlPair(lo, hi : WORD) : LONGINT; NEAR;
+BEGIN
+  BX := lo;
+  CL := 16 - BUFSHIFT;
+  BX := BX SHR CL;
+  AX := hi;
+  CL := BUFSHIFT;
+  AX := AX SHL CL;
+  DX := AX OR BX;
+  AX := lo;
+  CL := BUFSHIFT;
+  AX := AX SHL CL
+END ShlPair;
+
+(* ShrPair: (lo, hi) SHR BUFSHIFT, returned in DX:AX -- turns an absolute
+   byte position into its own page tag. *)
+PROCEDURE ShrPair(lo, hi : WORD) : LONGINT; NEAR;
+BEGIN
+  BX := hi;
+  CL := 16 - BUFSHIFT;
+  BX := BX SHL CL;
+  AX := lo;
+  CL := BUFSHIFT;
+  AX := AX SHR CL;
+  AX := AX OR BX;
+  DX := hi;
+  CL := BUFSHIFT;
+  DX := DX SHR CL
+END ShrPair;
+
+(* AddPairWord: (lo, hi) + delta (delta a plain WORD, 0..BUFSIZE at most
+   in every real call site here), returned in DX:AX. *)
+PROCEDURE AddPairWord(lo, hi, delta : WORD) : LONGINT; NEAR;
+BEGIN
+  AX := lo;
+  INC(AX, delta);
+  DX := hi;
+  IF CFLAG THEN INC(DX) END
+END AddPairWord;
+
+(* PairLess: TRUE if (lo1,hi1) < (lo2,hi2), unsigned 32-bit compare. *)
+PROCEDURE PairLess(lo1, hi1, lo2, hi2 : WORD) : BOOLEAN; NEAR;
+BEGIN
+  AX := hi1;
+  BX := hi2;
+  IF AX < BX THEN AL := TRUE; RETURN END;
+  IF AX > BX THEN AL := FALSE; RETURN END;
+  AX := lo1;
+  BX := lo2;
+  AL := AX < BX
+END PairLess;
+
+(* ============================ raw DOS I/O ============================ *)
+
+(* __RawOpen: LFN "Extended Open" (INT 21h/AX=716Ch -- DS:SI=name,
+   BX=22h read/write+deny-none share, DX=1 "open, fail if not exist",
+   DI=0 no attributes since the file must already exist), falling back
+   to the classic AH=3Dh/AL=02h open (DS:DX=name) if the LFN call
+   fails -- either an LFN-less DOS or a genuine "not found". CF is
+   explicitly SET (STC) before the LFN call: an LFN-less DOS doesn't
+   recognize AH=71h and returns without touching the flags register, so
+   CF's own pre-call state IS the failure signal there. *)
+PROCEDURE __RawOpen(fname : INTEGER): INTEGER; NEAR;
+USES BX, CX, SI, DI;
+BEGIN
+  SI := fname;
+  AX := 716CH;
+  BX := 22H;
+  CX := 0;
+  DX := 1;
+  DI := 0;
+  ASM
+    stc
+  END;
+  INT(21H);
+  IF CFLAG THEN
+    DX := fname;
+    AX := 3D02H;
+    INT(21H);
+    IF CFLAG THEN AX := InvalidHandle END
+  END
+END __RawOpen;
+
+(* __RawCreate: same two-step LFN-then-classic attempt as __RawOpen,
+   for creating/truncating a file (LFN DX=12h "create, truncate if
+   exists", classic AH=3Ch). *)
+PROCEDURE __RawCreate(fname : INTEGER): INTEGER; NEAR;
+USES BX, CX, SI;
+BEGIN
+  SI := fname;
+  AX := 716CH;
+  BX := 1;
+  CX := 0;
+  DX := 12H;
+  ASM
+    stc
+  END;
+  INT(21H);
+  IF CFLAG THEN
+    DX := fname;
+    AH := 3CH;
+    CX := 0;
+    INT(21H);
+    IF CFLAG THEN AX := InvalidHandle END
+  END
+END __RawCreate;
+
+PROCEDURE __fio(op : BYTE; handle, buf, count : INTEGER): INTEGER; NEAR;
+USES BX, CX, DX;
+BEGIN
+  BX := handle;
+  DX := buf;
+  CX := count;
+  AH := op;
+  INT(21H);
+  IF CFLAG THEN AX := 0 END
+END __fio;
+
+(* __RawBlockRead/__RawBlockWrite: unbuffered, single INT 21h read/write
+   of exactly the caller's own count bytes -- the raw primitive
+   BufFetch/BufFlush use to move one whole PAGE at a time. Not the
+   public BlockRead/BlockWrite (buffered, further down). *)
+PROCEDURE __RawBlockRead(handle, buf, count : INTEGER): INTEGER; NEAR;
+BEGIN
+  __fio(3FH, handle, buf, count)
+END __RawBlockRead;
+
+PROCEDURE __RawBlockWrite(handle, buf, count : INTEGER): INTEGER; NEAR;
+BEGIN
+  __fio(40H, handle, buf, count)
+END __RawBlockWrite;
+
+PROCEDURE __Close(handle : INTEGER); NEAR;
+BEGIN
+  BX := handle;
+  AH := 3EH;
+  INT(21H)
+END __Close;
+
+(* __RawSeek: unbuffered INT 21h/AH=42h/AL=0 absolute seek -- the raw
+   primitive BufFetch/BufFlush/Truncate use to reposition the real DOS
+   file pointer before a page-sized read/write. Not the public Seek
+   (buffered, further down). *)
+PROCEDURE __RawSeek(handle : INTEGER; posHi, posLo : WORD); NEAR;
+USES AX, BX, CX, DX;
+BEGIN
+  CX := posHi;
+  DX := posLo;
+  BX := handle;
+  AX := 4200H;
+  INT(21H)
+END __RawSeek;
+
+(* __RawFileSize: unbuffered file-size probe (Seek to EOF, read the
+   resulting position, restore position 0), returned in DX:AX -- the
+   raw primitive Reset uses once, at open time, to learn the file's own
+   starting size before any buffering begins. *)
+PROCEDURE __RawFileSize(handle : INTEGER) : LONGINT; NEAR;
+USES BX, CX, SI;
+BEGIN
+  AX := 4202H; BX := handle;
+  CX := 0; DX := CX;
+  INT(21H);
+  IF CFLAG THEN AX := 0; DX := AX END;
+  BX := AX; SI := DX;
+  __RawSeek(handle, 0, 0);
+  AX := BX; DX := SI
+END __RawFileSize;
+
+(* ============================ page buffer ============================ *)
+
+(* BufFlush: write buf[] back to disk at bufTag's own page, if it was
+   ever written to since the last fetch/flush (dirty). *)
+PROCEDURE BufFlush(fp : WORD); NEAR;
+VAR seekLo, seekHi : WORD;
+BEGIN
+  BX := fp;
+  IF ~[DS:BX].File.dirty THEN RETURN END;
+  DX:AX := ShlPair([DS:BX].File.bufTagLo, [DS:BX].File.bufTagHi);
+  seekLo := AX; seekHi := DX;
+  BX := fp;
+  __RawSeek([DS:BX].File.handle, seekHi, seekLo);
+  BX := fp;
+  __RawBlockWrite([DS:BX].File.handle, ADR([DS:BX].File.buf), [DS:BX].File.bufSize);
+  BX := fp;
+  AX := 0;
+  [DS:BX].File.dirty := AL
+END BufFlush;
+
+(* BufFetch: make buf[] hold the page tagged (tagLo,tagHi), flushing the
+   PREVIOUSLY held page first if it was dirty. A no-op if that page is
+   already the one held. *)
+PROCEDURE BufFetch(fp : WORD; tagLo, tagHi : WORD); NEAR;
+VAR seekLo, seekHi : WORD;
+BEGIN
+  BX := fp;
+  IF [DS:BX].File.bufTagLo = tagLo THEN
+    IF [DS:BX].File.bufTagHi = tagHi THEN RETURN END
+  END;
+  BufFlush(fp);
+  BX := fp;
+  [DS:BX].File.bufTagLo := tagLo;
+  [DS:BX].File.bufTagHi := tagHi;
+  DX:AX := ShlPair(tagLo, tagHi);
+  seekLo := AX; seekHi := DX;
+  BX := fp;
+  __RawSeek([DS:BX].File.handle, seekHi, seekLo);
+  BX := fp;
+  AX := __RawBlockRead([DS:BX].File.handle, ADR([DS:BX].File.buf), FILESBUFSIZE);
+  BX := fp;
+  [DS:BX].File.bufSize := AX;
+  AX := 0;
+  [DS:BX].File.dirty := AL
+END BufFetch;
+
+(* BufInitEmpty: reset a File's own page-buffer state for a file with
+   NOTHING on disk yet to fetch (a freshly ReWrite-created file, or an
+   existing file Reset found to be 0 bytes) -- bufTag is set to the
+   REAL page 0 (0:0), not a sentinel: buf[] legitimately already IS
+   page 0's own content from the very first byte written (all zero
+   bytes, about to be overwritten), no BufFetch ever needs to run for
+   it. This matters for NextPage's own "current tag + 1" arithmetic:
+   if bufTag were left at some placeholder instead of a real 0, the
+   first BlockWrite crossing a page boundary would land NextPage on
+   the wrong following page. See BufInitLoaded below for the opposite
+   case (an existing file Reset found to be NON-empty), which needs a
+   genuine sentinel distinct from 0:0 so its own subsequent
+   BufFetch(fp, 0, 0) doesn't wrongly skip loading page 0's real disk
+   content. *)
+PROCEDURE BufInitEmpty(fp : WORD); NEAR;
+BEGIN
+  BX := fp;
+  AX := 0;
+  [DS:BX].File.bufTagLo := AX;
+  [DS:BX].File.bufTagHi := AX;
+  [DS:BX].File.bufSize := AX;
+  [DS:BX].File.bufPos := AX;
+  [DS:BX].File.dirty := AL;
+  [DS:BX].File.posLo := AX;
+  [DS:BX].File.posHi := AX
+END BufInitEmpty;
+
+(* BufInitLoaded: reset a File's own page-buffer state right before
+   Reset loads a NON-empty file's real page 0 -- bufTag is set to the
+   sentinel 0FFFFH:0FFFFH, distinct from any real page tag, so the
+   BufFetch(fp, 0, 0) call right after this one does NOT mistake the
+   fresh buffer for an already-loaded page 0 and skip the real read. *)
+PROCEDURE BufInitLoaded(fp : WORD); NEAR;
+BEGIN
+  BX := fp;
+  AX := 0FFFFH;
+  [DS:BX].File.bufTagLo := AX;
+  [DS:BX].File.bufTagHi := AX;
+  AX := 0;
+  [DS:BX].File.bufSize := AX;
+  [DS:BX].File.bufPos := AX;
+  [DS:BX].File.dirty := AL;
+  [DS:BX].File.posLo := AX;
+  [DS:BX].File.posHi := AX
+END BufInitLoaded;
+
+(* NextPage: advance to the page right after the one currently held. *)
+PROCEDURE NextPage(fp : WORD); NEAR;
+VAR tagLo, tagHi, newLo, newHi : WORD;
+BEGIN
+  BX := fp;
+  tagLo := [DS:BX].File.bufTagLo;
+  tagHi := [DS:BX].File.bufTagHi;
+  DX:AX := AddPairWord(tagLo, tagHi, 1);
+  newLo := AX; newHi := DX;
+  BufFetch(fp, newLo, newHi);
+  BX := fp;
+  AX := 0;
+  [DS:BX].File.bufPos := AX
+END NextPage;
+
+(* ============================ public API ============================= *)
+
+(* Reset: open an existing file for reading/writing, learn its own
+   current size, and load page 0 (if non-empty) so BlockRead's own
+   first call doesn't need a special empty-buffer case.
+   Result: TRUE if the file was opened successfully. *)
+PROCEDURE Reset*(fp : WORD; fname : WORD) : BOOLEAN; NEAR;
+VAR h, sizeLo, sizeHi : WORD;
+BEGIN
+  h := __RawOpen(fname);
+  BX := fp;
+  [DS:BX].File.handle := h;
+  IF h = InvalidHandle THEN RETURN FALSE END;
+  DX:AX := __RawFileSize(h);
+  sizeLo := AX; sizeHi := DX;
+  IF sizeLo = 0 THEN
+    IF sizeHi = 0 THEN
+      BufInitEmpty(fp);
+      BX := fp;
+      [DS:BX].File.sizeLo := sizeLo;
+      [DS:BX].File.sizeHi := sizeHi;
+      RETURN TRUE
+    END
+  END;
+  BufInitLoaded(fp);
+  BX := fp;
+  [DS:BX].File.sizeLo := sizeLo;
+  [DS:BX].File.sizeHi := sizeHi;
+  BufFetch(fp, 0, 0);
+  RETURN TRUE
+END Reset;
+
+(* ReWrite: create (or truncate) a file for writing.
+   Result: TRUE if the file was created successfully. *)
+PROCEDURE ReWrite*(fp : WORD; fname : WORD) : BOOLEAN; NEAR;
+VAR h : WORD;
+BEGIN
+  h := __RawCreate(fname);
+  BX := fp;
+  [DS:BX].File.handle := h;
+  IF h = InvalidHandle THEN RETURN FALSE END;
+  BufInitEmpty(fp);
+  RETURN TRUE
+END ReWrite;
+
+(* AttachHandle: wrap an ALREADY-OPEN DOS handle (e.g. STDOUT=1, opened
+   by DOS itself before this process ever runs, DOCS/SPHINX.MD's own
+   STDIN/STDOUT/STDERR/STDPRN/STDAUX constants above) in fp's own File
+   record, for a caller with no real file to Reset/ReWrite -- no
+   __RawOpen/__RawCreate call, unlike Reset/ReWrite. Buffered writes
+   through fp still go through the normal BlockWrite/Close page-flush
+   path; Close still calls __Close on the handle, matching Reset/
+   ReWrite's own Close symmetry (harmless for STDOUT, DOS ignores a
+   redundant close of a handle it owns). *)
+PROCEDURE AttachHandle*(fp : WORD; handle : WORD); NEAR;
+BEGIN
+  BX := fp;
+  [DS:BX].File.handle := handle;
+  BufInitEmpty(fp)
+END AttachHandle;
+
+(* Seek: move fp's read/write cursor to an absolute byte position,
+   clamped to [0, current file size]. pos is DX:AX (a register-pair
+   LONGINT argument, DOCS/SPHINX.MD S11), matching every existing
+   caller's own "Seek(handle, DX:AX)"-shaped call site.
+   CALLER HAZARD: fp must be a plain local/global WORD variable already
+   holding ADR(theFile), NOT "Seek(ADR(theFile), DX:AX)" written
+   directly -- Spho.pas's own call-argument codegen evaluates arguments
+   left to right with no protection against an earlier argument
+   clobbering a live register a later one depends on (a known,
+   documented, accepted hazard, not specific to this module); ADR(...)
+   of a global loads its address into AX, which would stomp DX:AX's own
+   low half if evaluated (as arg 0) after "DX := hi; AX := lo" (the
+   pos argument) was already set up. Capture fp := ADR(theFile) as its
+   own statement first, then call Seek(fp, DX:AX). *)
+PROCEDURE Seek*(fp : WORD; pos : LONGINT); NEAR;
+USES BX;
+VAR posLo, posHi, tagLo, tagHi : WORD;
+BEGIN
+  DX:AX := pos;
+  posLo := AX; posHi := DX;
+  IF PairLess(posLo, posHi, 0, 0) THEN posLo := 0; posHi := 0 END;
+  BX := fp;
+  IF PairLess([DS:BX].File.sizeLo, [DS:BX].File.sizeHi, posLo, posHi) THEN
+    BX := fp;
+    posLo := [DS:BX].File.sizeLo;
+    posHi := [DS:BX].File.sizeHi
+  END;
+  DX:AX := ShrPair(posLo, posHi);
+  tagLo := AX; tagHi := DX;
+  BufFetch(fp, tagLo, tagHi);
+  BX := fp;
+  AX := posLo;
+  AX := AX & BUFMASK;
+  [DS:BX].File.bufPos := AX;
+  [DS:BX].File.posLo := posLo;
+  [DS:BX].File.posHi := posHi
+END Seek;
+
+(* FilePos: fp's current absolute cursor position, in DX:AX. *)
+PROCEDURE FilePos*(fp : WORD) : LONGINT; NEAR;
+USES BX;
+BEGIN
+  BX := fp;
+  AX := [DS:BX].File.posLo;
+  DX := [DS:BX].File.posHi
+END FilePos;
+
+(* FileSize: fp's total file size, in DX:AX -- matches the OLD
+   unbuffered FileSize's own return shape exactly (every real caller,
+   e.g. EXAMPLES/CRK/MKCRK.SMD's own "AX := FileSize(ADR(han1)); len1Lo
+   := AX; len1Hi := DX;", needs no change to its own DX:AX handling). *)
+PROCEDURE FileSize*(fp : WORD) : LONGINT; NEAR;
+USES BX;
+BEGIN
+  BX := fp;
+  AX := [DS:BX].File.sizeLo;
+  DX := [DS:BX].File.sizeHi
+END FileSize;
+
+(* ClampToEnd: MIN(len, bytes remaining between fp's own current
+   position and its own size) -- BlockRead's own EOF clamp.
+
+   Real bug fixed here (DOCS/TRBUG.MD): the low-word-only "DEC(AX,
+   posLo); IF CFLAG THEN RETURN 0" subtraction used to run
+   UNCONDITIONALLY, even when sizeHi <> posHi -- a borrow out of the
+   low word (sizeLo < posLo) was misread as "0 bytes remain" even when
+   sizeHi > posHi meant there was actually at least 65536 more bytes
+   left (e.g. size=100000=(34464,1), pos=34816=(34816,0): sizeLo(34464)
+   < posLo(34816) borrows, but the real remaining amount is 65184, not
+   0). The borrow check is only meaningful when both Hi words already
+   agree -- moved inside the "remHi = posHi" branch, where it belongs;
+   the remHi > posHi case now always falls through to "RETURN len"
+   without ever consulting the low-word borrow flag, matching what the
+   comment on that branch already claimed happened. Found via
+   EXAMPLES/LZSS/LZSS.SMD's own real compress round-trip silently
+   truncating any input over 34816 bytes (17 pages of the 2048-byte
+   BUFSIZE) -- BlockRead returned 0 there long before real EOF. *)
+PROCEDURE ClampToEnd(fp : WORD; len : WORD) : WORD; NEAR;
+USES BX;
+VAR remLo, remHi : WORD;
+BEGIN
+  BX := fp;
+  remLo := [DS:BX].File.sizeLo;
+  remHi := [DS:BX].File.sizeHi;
+  IF PairLess(remLo, remHi, [DS:BX].File.posLo, [DS:BX].File.posHi) THEN
+    RETURN 0
+  END;
+  BX := fp;
+  IF remHi = [DS:BX].File.posHi THEN
+    AX := remLo;
+    DEC(AX, [DS:BX].File.posLo);
+    IF CFLAG THEN RETURN 0 END;   (* posLo > remLo, equal Hi -- 0 left *)
+    remLo := AX;
+    IF remLo > len THEN RETURN len END;
+    RETURN remLo
+  END;
+  RETURN len   (* remHi > posHi (PairLess above already ruled out
+                  remHi < posHi): at least 65536 bytes remain, len
+                  itself (never more than one page, BUFSIZE <= 65535)
+                  already fits *)
+END ClampToEnd;
+
+(* BlockRead: read up to len bytes from fp into dst, advancing the
+   cursor. dst is a near offset (DS implicit), same convention every
+   other buffer address in this tree already uses.
+   Result: number of bytes actually read (less than len at EOF). *)
+PROCEDURE BlockRead*(fp : WORD; dst : WORD; len : WORD) : WORD; NEAR;
+USES BX, DI, SI;
+VAR total, avail, delta, i : WORD;
+    srcSI, dstDI, addLo, addHi : WORD;
+BEGIN
+  len := ClampToEnd(fp, len);
+  IF len = 0 THEN RETURN 0 END;
+  total := 0;
+  WHILE total < len DO
+    BX := fp;
+    avail := [DS:BX].File.bufSize;
+    DEC(avail, [DS:BX].File.bufPos);
+    IF avail = 0 THEN
+      NextPage(fp);
+      BX := fp;
+      IF [DS:BX].File.bufSize = 0 THEN
+        DX:AX := AddPairWord([DS:BX].File.posLo, [DS:BX].File.posHi, total);
+        BX := fp;
+        [DS:BX].File.posLo := AX;
+        [DS:BX].File.posHi := DX;
+        RETURN total
+      END;
+      avail := [DS:BX].File.bufSize
+    END;
+    delta := len; DEC(delta, total);
+    IF delta > avail THEN delta := avail END;
+    BX := fp;
+    srcSI := ADR([DS:BX].File.buf);
+    INC(srcSI, [DS:BX].File.bufPos);
+    dstDI := dst; INC(dstDI, total);
+    i := 0;
+    WHILE i < delta DO
+      SI := srcSI; INC(SI, i);
+      AL := [DS:SI];
+      DI := dstDI; INC(DI, i);
+      [DS:DI] := AL;
+      INC(i)
+    END;
+    BX := fp;
+    INC([DS:BX].File.bufPos, delta);
+    INC(total, delta)
+  END;
+  BX := fp;
+  DX:AX := AddPairWord([DS:BX].File.posLo, [DS:BX].File.posHi, total);
+  BX := fp;
+  [DS:BX].File.posLo := AX;
+  [DS:BX].File.posHi := DX;
+  RETURN total
+END BlockRead;
+
+(* BlockWrite: write len bytes from src into fp, advancing the cursor
+   and growing the file's own recorded size if the write extends past
+   it. src is a near offset (DS implicit).
+   Result: number of bytes actually written (always len; 0 short-
+   circuits immediately). *)
+PROCEDURE BlockWrite*(fp : WORD; src : WORD; len : WORD) : WORD; NEAR;
+USES BX, DI, SI;
+VAR total, room, delta, i : WORD;
+    dstSI, srcDI, grow : WORD;
+    newLo, newHi : WORD;
+BEGIN
+  IF len = 0 THEN RETURN 0 END;
+  total := 0;
+  WHILE total < len DO
+    BX := fp;
+    room := FILESBUFSIZE;
+    DEC(room, [DS:BX].File.bufPos);
+    IF room = 0 THEN
+      NextPage(fp);
+      room := FILESBUFSIZE
+    END;
+    delta := len; DEC(delta, total);
+    IF delta > room THEN delta := room END;
+    BX := fp;
+    dstSI := ADR([DS:BX].File.buf);
+    INC(dstSI, [DS:BX].File.bufPos);
+    srcDI := src; INC(srcDI, total);
+    i := 0;
+    WHILE i < delta DO
+      SI := srcDI; INC(SI, i);
+      AL := [DS:SI];
+      DI := dstSI; INC(DI, i);
+      [DS:DI] := AL;
+      INC(i)
+    END;
+    BX := fp;
+    AX := 1;
+    [DS:BX].File.dirty := AL;
+    INC([DS:BX].File.bufPos, delta);
+    BX := fp;
+    IF [DS:BX].File.bufPos > [DS:BX].File.bufSize THEN
+      [DS:BX].File.bufSize := [DS:BX].File.bufPos
+    END;
+    INC(total, delta)
+  END;
+  BX := fp;
+  DX:AX := AddPairWord([DS:BX].File.posLo, [DS:BX].File.posHi, total);
+  newLo := AX; newHi := DX;
+  BX := fp;
+  [DS:BX].File.posLo := newLo;
+  [DS:BX].File.posHi := newHi;
+  IF PairLess([DS:BX].File.sizeLo, [DS:BX].File.sizeHi, newLo, newHi) THEN
+    BX := fp;
+    [DS:BX].File.sizeLo := newLo;
+    [DS:BX].File.sizeHi := newHi
+  END;
+  RETURN total
+END BlockWrite;
+
+(* ReadByte: single-byte fast path for BlockRead(fp, dst, 1) callers
+   (e.g. LZPLIB.SMD's own bit-at-a-time compress/decompress loop) --
+   skips BlockRead's own ClampToEnd/multi-page WHILE/inner byte-copy
+   loop entirely, going straight to fp's own already-buffered page.
+   Result: the byte value (0..255) in the low byte, or -1 at EOF --
+   -1 never collides with a real byte value. *)
+PROCEDURE ReadByte*(fp : WORD) : INTEGER; NEAR;
+USES BX, SI;
+BEGIN
+  BX := fp;
+  IF [DS:BX].File.bufPos = [DS:BX].File.bufSize THEN
+    NextPage(fp);
+    BX := fp;
+    IF [DS:BX].File.bufSize = 0 THEN RETURN -1 END
+  END;
+  BX := fp;
+  SI := ADR([DS:BX].File.buf);
+  INC(SI, [DS:BX].File.bufPos);
+  AL := [DS:SI];
+  AH := 0;
+  PUSH(AX);
+  INC([DS:BX].File.bufPos);
+  DX:AX := AddPairWord([DS:BX].File.posLo, [DS:BX].File.posHi, 1);
+  BX := fp;
+  [DS:BX].File.posLo := AX;
+  [DS:BX].File.posHi := DX;
+  POP(AX);
+END ReadByte;
+
+PROCEDURE ReadLine*(fp:WORD; str : WORD; len : WORD) : BOOLEAN; NEAR;
+USES CX, DX;
+VAR dstOfs : WORD;   (* NOT named "di": register names are case-insensitive
+                         here, so a local literally named di/DI aliases
+                         the DI register itself instead of being a real
+                         separate stack slot *)
+BEGIN
+  CX := len;
+  DEC(CX);
+  DX := 0;
+  dstOfs := str;
+  BH := TRUE;
+  WHILE BH # 0 DO
+    ReadByte(fp);         (* clobbers DI internally (via BlockRead) --
+                             dstOfs kept as a plain WORD local instead of
+                             relying on the register surviving the call *)
+    IF AH # 0 THEN
+      BH := FALSE
+    ELSE
+      BL := AL;
+      DL := TRUE;
+      IF BL = 0AH THEN
+        BH := FALSE
+      ELSIF BL # 0DH THEN
+        IF CX # 0 THEN
+          DI := dstOfs;
+          [DS:DI] := BL;
+          INC(dstOfs);
+          DEC(CX)
+        END
+      END
+    END
+  END;
+  AL := 0;
+  DI := dstOfs;
+  [DS:DI] := AL;
+  AL := DL
+END ReadLine;
+
+(* WriteByte: single-byte fast path for BlockWrite(fp, src, 1) callers.
+   Same page-buffered fast path as ReadByte above, mirrored for writes:
+   skips BlockWrite's own multi-page WHILE/inner byte-copy loop/dirty-
+   flag-every-iteration overhead, going straight to fp's own already-
+   buffered page.
+
+   USES AX, BX, CX, DX, SI: the real, full clobber set, not just this
+   body's own direct AX/BX/SI use -- on a page-boundary crossing this
+   also calls NextPage -> BufFetch -> (BufFlush,) __RawSeek/
+   __RawBlockRead/__RawBlockWrite, none of which have a USES clause of
+   their own protecting CX/DX either, so without this callers had no
+   compiler-enforced guarantee at all and had to track the clobber by
+   hand (a real bug this exact gap caused: LZSSLIB.SMD's own OutByte
+   kept its match-copy length counter live in CX across a WriteByte
+   call with only "USES BX" of its own, silently corrupting output). *)
+PROCEDURE WriteByte*(fp : WORD; b : BYTE); NEAR;
+USES AX, BX, CX, DX, SI;
+BEGIN
+  BX := fp;
+  IF [DS:BX].File.bufPos = FILESBUFSIZE THEN NextPage(fp) END;
+  BX := fp;
+  SI := ADR([DS:BX].File.buf);
+  INC(SI, [DS:BX].File.bufPos);
+  AL := b;
+  [DS:SI] := AL;
+  AX := 1;
+  [DS:BX].File.dirty := AL;
+  INC([DS:BX].File.bufPos);
+  BX := fp;
+  IF [DS:BX].File.bufPos > [DS:BX].File.bufSize THEN
+    [DS:BX].File.bufSize := [DS:BX].File.bufPos
+  END;
+  DX:AX := AddPairWord([DS:BX].File.posLo, [DS:BX].File.posHi, 1);
+  BX := fp;
+  [DS:BX].File.posLo := AX;
+  [DS:BX].File.posHi := DX;
+  IF PairLess([DS:BX].File.sizeLo, [DS:BX].File.sizeHi, [DS:BX].File.posLo, [DS:BX].File.posHi) THEN
+    BX := fp;
+    [DS:BX].File.sizeLo := [DS:BX].File.posLo;
+    [DS:BX].File.sizeHi := [DS:BX].File.posHi
+  END
+END WriteByte;
+
+PROCEDURE WriteLine*(fp:WORD; line : WORD); NEAR;
+USES SI;
+VAR srcOfs : WORD;   (* NOT named si: register names are case-insensitive
+                         here, so a local literally named si/SI aliases
+                         the SI register itself instead of being a real
+                         separate stack slot *)
+BEGIN
+  srcOfs := line;
+  SI := srcOfs;
+  ASM
+    cld
+    lodsb
+  END;
+  INC(srcOfs);
+  WHILE AL # 0 DO
+    WriteByte(fp, AX);   (* clobbers SI internally (via BlockWrite)
+                                  -- srcOfs kept as a plain WORD local
+                                  instead of relying on the register
+                                  surviving the call *)
+    SI := srcOfs;
+    ASM
+      lodsb
+    END;
+    INC(srcOfs)
+  END
+END WriteLine;
+
+PROCEDURE WriteLn*(fp:WORD); NEAR;
+BEGIN
+  WriteByte(fp, 0DH);
+  WriteByte(fp, 0AH)
+END WriteLn;
+(* Truncate: cut fp off at its own current cursor position, discarding
+   everything after it. *)
+PROCEDURE Truncate*(fp : WORD); NEAR;
+VAR posLo, posHi, pageBaseLo, pageBaseHi : WORD;
+BEGIN
+  BX := fp;
+  posLo := [DS:BX].File.posLo;
+  posHi := [DS:BX].File.posHi;
+  BufFlush(fp);
+  BX := fp;
+  DX:AX := ShlPair([DS:BX].File.bufTagLo, [DS:BX].File.bufTagHi);
+  pageBaseLo := AX; pageBaseHi := DX;
+  BX := fp;
+  IF PairLess(pageBaseLo, pageBaseHi, posLo, posHi) THEN
+    AX := posLo;
+    DEC(AX, pageBaseLo);
+    BX := fp;
+    [DS:BX].File.bufSize := AX
+  ELSE
+    AX := 0;
+    BX := fp;
+    [DS:BX].File.bufSize := AX
+  END;
+  BX := fp;
+  [DS:BX].File.sizeLo := posLo;
+  [DS:BX].File.sizeHi := posHi;
+  __RawSeek([DS:BX].File.handle, posHi, posLo);
+  BX := fp;
+  __RawBlockWrite([DS:BX].File.handle, ADR([DS:BX].File.buf), 0)
+END Truncate;
+
+(* Close: flush any buffered write and release fp's own DOS handle.
+
+   Real bug fixed here (DOCS/TRBUG.MD): the guard used to read
+   "IF BX > 5 THEN __Close(BX) END", intending to skip DOS's own 5
+   reserved standard handles (0-4: STDIN/STDOUT/STDERR/STDAUX/STDPRN)
+   -- but that's an off-by-one: handle 5 is the FIRST real handle DOS
+   ever hands out to an opened file, so the very first file a program
+   opened was silently never closed at the DOS level (no AH=3Eh INT 21h
+   call at all) -- __Close was simply skipped for it. The write itself
+   still eventually reached disk (e.g. once the process exited and
+   emu2/DOS tore down all still-open handles), but a same-process
+   Close-then-Reset of that same file (exactly what BlockWrite/BlockRead
+   round-trip tests do) could see a stale/short view: confirmed the hard
+   way with a 40000-byte file, written and closed, then immediately
+   reopened in the same run -- FileSize reported only 38912 (the size as
+   of the last page flushed before the still-open handle's final,
+   unflushed extension) until the process actually exited. Fixed by
+   comparing against 4, not 5 -- handle 5 (the first genuinely
+   user-openable one) now gets closed like any other. *)
+PROCEDURE Close*(fp : WORD); NEAR;
+BEGIN
+  BufFlush(fp);
+  BX := fp;
+  BX := [DS:BX].File.handle;
+  IF BX > 4 THEN __Close(BX) END;
+  AX := 0;
+  BX := fp;
+  [DS:BX].File.handle := AX
+END Close;
+
+(* DeleteFile: remove a file from disk. Same two-step attempt as
+   SRC/LIB/FILES.MOD's own Delete: try the LFN delete first (INT
+   21h/AX=7141h -- DS:DX=name, CX=0, SI=0, clearing the read-only
+   attribute first if needed so a read-only file can still be deleted),
+   which also transparently accepts a long file name; fall back to the
+   classic AH=41h delete (DS:DX=name, short names only) if the LFN call
+   fails. STC before the LFN call for the same reason as Reset/ReWrite
+   above -- an LFN-less DOS doesn't recognize AH=71h and leaves the
+   flags register exactly as this pre-set it. *)
+PROCEDURE DeleteFile*(fname : INTEGER): BOOLEAN; NEAR;
+USES CX, DX, SI;
+BEGIN
+  DX := fname;
+  AX := 7141H;
+  CX := 0;
+  SI := 0;
+  ASM
+    stc
+  END;
+  INT(21H);
+  IF CFLAG THEN
+    DX := fname;
+    AH := 41H;
+    INT(21H)
+  END;
+  (* CFLAG is only recognized directly in condition position (IF/WHILE/
+     REPEAT..UNTIL) -- DOCS/SPHO.MD's own documented "Known
+     simplifications" list -- not as a general boolean-valued expression,
+     so "RETURN ~CFLAG" doesn't parse; test it in an IF instead. *)
+  IF CFLAG THEN RETURN FALSE END;
+  RETURN TRUE
+END DeleteFile;
+
+(* RenameFile: rename/move a file on disk (DOS AH=56h, DS:DX=old name,
+   ES:DI=new name -- SRC/LIB/FILES.MOD's own Rename uses this one call
+   with no LFN/fallback dance at all, since AH=56h itself already
+   handles long names natively when the DOS redirector supports them).
+   Unlike every other name in this module (a bare offset, DS always
+   implicit), the new name's segment is genuinely independent of the
+   old name's -- SPHINX has no ARRAY OF CHAR VAR-parameter passing (only
+   bare register/typed-scalar formals, DOCS/SPHINX.MD SS6.1/6.2), so ES
+   must already hold the new name's own segment before calling, the
+   same caller-sets-the-segment convention DOCS/SPHINX.MD SS13's own
+   xmsCopy example uses for DS:SI. *)
+PROCEDURE RenameFile*(oldName, newName : INTEGER): BOOLEAN; NEAR;
+USES DI;
+BEGIN
+  DX := oldName;
+  DI := newName;
+  AH := 56H;
+  INT(21H);
+  IF CFLAG THEN AL := FALSE ELSE AL := TRUE END;
+END RenameFile;
+
+END FILES.

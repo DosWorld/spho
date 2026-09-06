@@ -1,0 +1,642 @@
+(* APPLYCRK - list or apply patches from a .CRK file (DOCS/CRK.TXT's
+   own format: an optional multi-line title, then one or more patches
+   separated by blank lines, each patch a title line, a target
+   filename line, then one or more "OFFSET: OO NN" diff lines; a ';'
+   starts a comment running to end of line anywhere, and a
+   comment-only line does NOT count as a blank separator).
+
+   Usage:
+     APPLYCRK file.crk            -- list the title and each patch's
+                                      own title, numbered
+     APPLYCRK file.crk +N         -- "Apply" patch N using each diff
+                                      line's THIRD column (NN, the
+                                      cracked byte)
+     APPLYCRK file.crk -N         -- "Revert" patch N using each diff
+                                      line's SECOND column (OO, the
+                                      original byte) -- column 1 is
+                                      the offset
+
+   Patch target filenames are resolved relative to the current
+   directory, opened read+write in place (Reset already opens
+   read/write, DOCS/EXAMPLES/CRK/FILES.SMD's own doc comment), and
+   only the listed byte offsets are modified -- no backup. Hex digits
+   (the offset and both byte columns) are parsed case-insensitively.
+   The offset column is 1 to 8 hex digits, not required to be
+   zero-padded ("000: 00 00" is as valid as "00000000: 00 00"). *)
+
+MODULE APPLYCRK;
+
+IMPORT SYSTEM, OUT, FILES;
+
+CONST
+  MaxName = 128;
+  MaxLine = 256;
+  Semi = 3BH;
+
+VAR
+  help        : BYTE[] = FILE("APPLYCRK.HLP");
+
+  crkName     : BYTE[MaxName];
+  wantApply   : BOOLEAN;      (* TRUE if a +N/-N argument was given *)
+  isApply     : BOOLEAN;      (* TRUE for +N "Apply" (write NN, column 3),
+                                FALSE for -N "Revert" (write OO, column 2) *)
+  wantNum     : WORD;         (* the N from +N/-N *)
+
+  line        : BYTE[MaxLine];
+  lineLen     : WORD;         (* length after comment-strip + trim *)
+  rawWasBlank : BOOLEAN;      (* set by PrepLine: TRUE only if the raw
+                                line (before comment-strip) had no
+                                non-blank character at all *)
+
+  patchNum    : WORD;          (* patches seen so far *)
+  applied     : BOOLEAN;       (* TRUE once the requested patch was found+applied *)
+  patchTitle  : BYTE[MaxLine]; (* saved copy of the current patch's own
+                                  title line -- 'line' itself gets
+                                  overwritten by the filename line
+                                  before the Apply/Revert status line
+                                  (below) can be printed *)
+  targetH     : File;
+  cmdIdx, cmdTailLen : INTEGER;
+
+  crkReader   : File;           (* READER's own multifile-capable state
+                                   for crkName -- passed to Open/Close/
+                                   ReadLine as ADR(crkReader) *)
+
+(* ============================ line prep =============================== *)
+
+PROCEDURE IsBlank(AL) : BOOLEAN; NEAR;
+BEGIN
+  IF AL = Space THEN
+    AL := TRUE
+  ELSIF AL = Tab THEN
+    AL := TRUE
+  ELSE
+    AL := FALSE
+  END
+END IsBlank;
+
+(* strips a ';' comment (running to end of line, wherever it starts)
+   and trims trailing spaces/tabs left over from before the ';' (or
+   from the line's own natural end) -- ReadLine has already stripped
+   CR/LF. Sets lineLen (the stripped length) and rawWasBlank (TRUE
+   only if the line had no non-blank character at all BEFORE
+   comment-stripping) -- a comment-only line strips down to lineLen=0
+   same as a genuinely blank one, but CRK.TXT's own format note is
+   explicit that only a truly blank line is a patch separator; a
+   comment-only line must be silently skipped instead (NextLine below
+   uses rawWasBlank to tell the two apart). line[] is NUL-terminated
+   at lineLen. *)
+PROCEDURE PrepLine(); NEAR;
+VAR i : WORD;
+    c : BYTE;
+    cut : WORD;
+BEGIN
+  SI := ADR(line);
+  i := 0;
+  cut := 0FFFFH;
+  rawWasBlank := TRUE;
+  c := [DS:SI];
+  WHILE c # 0 DO
+    IF c = Semi THEN
+      IF cut = 0FFFFH THEN cut := i END
+    END;
+    IF cut = 0FFFFH THEN
+      IF ~IsBlank(c) THEN rawWasBlank := FALSE END
+    END;
+    INC(SI);
+    INC(i);
+    c := [DS:SI]
+  END;
+  IF cut # 0FFFFH THEN
+    SI := ADR(line);
+    INC(SI, cut);
+    AL := 0;
+    [DS:SI] := AL;
+    i := cut
+  END;
+  (* trim trailing blanks *)
+  WHILE i > 0 DO
+    SI := ADR(line);
+    INC(SI, i);
+    DEC(SI);
+    c := [DS:SI];
+    IF ~IsBlank(c) THEN BREAK END;
+    AL := 0;
+    [DS:SI] := AL;
+    DEC(i)
+  END;
+  lineLen := i
+END PrepLine;
+
+(* copies 'line' (NUL-terminated, lineLen bytes) into patchTitle *)
+PROCEDURE SaveTitle(); NEAR;
+VAR i : WORD;
+    c : BYTE;
+BEGIN
+  i := 0;
+  WHILE i <= lineLen DO
+    SI := ADR(line);
+    INC(SI, i);
+    c := [DS:SI];
+    DI := ADR(patchTitle);
+    INC(DI, i);
+    [DS:DI] := c;
+    INC(i)
+  END
+END SaveTitle;
+
+(* reads the next line via READER.ReadLine into 'line', then applies
+   PrepLine -- silently skipping and re-reading a comment-only line
+   (lineLen=0 but rawWasBlank=FALSE), since CRK.TXT's own format note
+   is explicit that a line with a comment is never a blank separator,
+   only a truly empty/whitespace-only line is. Returns FALSE only on
+   true EOF (mirrors ReadLine's own contract). *)
+PROCEDURE NextLine() : BOOLEAN; NEAR;
+VAR skip : BOOLEAN;
+BEGIN
+  skip := TRUE;
+  WHILE skip DO
+    IF ~ReadLine(ADR(crkReader), ADR(line), MaxLine) THEN
+      AL := FALSE;
+      RETURN
+    END;
+    PrepLine();
+    IF lineLen = 0 THEN
+      skip := ~rawWasBlank
+    ELSE
+      skip := FALSE
+    END
+  END;
+  AL := TRUE
+END NextLine;
+
+(* ============================ hex parsing =============================== *)
+
+(* single hex digit -> 0..15, case-insensitive; BH set TRUE on a bad
+   (non-hex) digit -- checked by the caller. Each range check RETURNs
+   immediately once matched (legal anywhere in a procedure body,
+   DOCS/SPHINX.MD S8.3) instead of setting a flag VAR per range and
+   re-dispatching on all three afterward -- same result, far less
+   generated code (no flag-variable stack slots, no second IF/ELSIF
+   pass, no repeated stack reloads of c). *)
+PROCEDURE HexNibble(c : BYTE) : WORD; NEAR;
+BEGIN
+  BH := FALSE;
+  AL := c;
+  AH := 0;
+  IF AL >= '0' THEN IF AL <= '9' THEN DEC(AL, 30H); RETURN END END;
+  IF AL >= 'A' THEN IF AL <= 'F' THEN DEC(AL, 37H); RETURN END END;
+  IF AL >= 'a' THEN IF AL <= 'f' THEN DEC(AL, 57H); RETURN END END;
+  BH := TRUE;
+  AL := 0
+END HexNibble;
+
+(* parses exactly 'digits' hex chars starting at line[pos], returns
+   the value in AX and the new scan position (pos+digits) in BX. BH
+   is TRUE on any bad digit (caller should treat the whole diff line
+   as malformed and skip it). *)
+PROCEDURE ParseHex(pos : WORD; digits : WORD) : WORD; NEAR;
+VAR val : WORD;
+    i : WORD;
+    bad : BOOLEAN;
+    c : BYTE;
+    nib : WORD;
+BEGIN
+  val := 0;
+  bad := FALSE;
+  i := 0;
+  WHILE i < digits DO
+    SI := ADR(line);
+    INC(SI, pos);
+    INC(SI, i);
+    c := [DS:SI];
+    HexNibble(c);
+    nib := AX;                (* snapshot AX before anything else
+                                  below touches it *)
+    IF BH # 0 THEN bad := TRUE END;
+    BX := val;
+    CL := 4;
+    BX := BX SHL CL;
+    BX := BX OR nib;
+    val := BX;
+    INC(i)
+  END;
+  BX := pos;
+  INC(BX, digits);
+  IF bad THEN BH := TRUE ELSE BH := FALSE END;
+  AX := val
+END ParseHex;
+
+(* parses a variable-length hex offset starting at line[0] (1 to 8
+   hex digits -- CRK.TXT's own diff lines aren't required to zero-pad
+   the offset to a fixed 8 digits, e.g. "000: 00 00" is valid, not
+   just "00000000: 00 00"), stopping at the first non-hex character.
+   Accumulates into a 32-bit value split across outHi/outLo (WORD
+   halves, SPHINX LONGINT has no arithmetic -- same reason MKCRK.SMD's
+   own numLo/numHi pair exists). Returns the scan position of the
+   first non-hex character (where ':' is expected next) in AX; BH is
+   TRUE if zero digits were found (an empty/missing offset) or if
+   more than 8 hex digits were seen (doesn't fit 32 bits). *)
+PROCEDURE ParseOffset(outHi : WORD; outLo : WORD) : WORD; NEAR;
+VAR i : WORD;
+    c : BYTE;
+    nib : WORD;
+    hi, lo : WORD;
+    bad : BOOLEAN;
+BEGIN
+  hi := 0; lo := 0;
+  i := 0;
+  bad := FALSE;
+  WHILE i < lineLen DO
+    SI := ADR(line);
+    INC(SI, i);
+    c := [DS:SI];
+    HexNibble(c);
+    IF BH # 0 THEN BREAK END;
+    nib := AX;
+    IF i >= 8 THEN
+      bad := TRUE
+    END;
+    (* shift (hi:lo) left 4 bits, OR the new nibble into lo's bottom *)
+    BX := hi;
+    CL := 4;
+    BX := BX SHL CL;
+    DX := lo;
+    CL := 12;
+    DX := DX SHR CL;
+    BX := BX OR DX;
+    hi := BX;
+    BX := lo;
+    CL := 4;
+    BX := BX SHL CL;
+    BX := BX OR nib;
+    lo := BX;
+    INC(i)
+  END;
+  IF i = 0 THEN bad := TRUE END;
+  BX := outHi;
+  DX := hi;
+  [DS:BX] := DX;
+  BX := outLo;
+  DX := lo;
+  [DS:BX] := DX;
+  IF bad THEN BH := TRUE ELSE BH := FALSE END;
+  AX := i
+END ParseOffset;
+
+(* ============================ apply core =============================== *)
+
+PROCEDURE Error(msg : INTEGER); NEAR;
+BEGIN
+  Out_Ln;
+  Out_String(msg);
+  Out_Ln;
+  Halt(1)
+END Error;
+
+(* reads the byte at line[pos]; TRUE only if it equals 'want' *)
+PROCEDURE ExpectChar(pos : WORD; want : BYTE) : BOOLEAN; NEAR;
+BEGIN
+  SI := ADR(line);
+  INC(SI, pos);
+  AL := [DS:SI];
+  AH := 0;
+  BL := want;
+  BH := 0;
+  AL := AX = BX
+END ExpectChar;
+
+(* parses one "OFFSET: OO NN" diff line and writes the selected byte
+   (NN for +N "Apply", OO for -N "Revert") at OFFSET in targetH. The
+   offset is 1 to 8 hex digits (not required to be zero-padded to a
+   fixed width, e.g. "000: 00 00" is as valid as "00000000: 00 00"),
+   so its own end position (colPos, where ':' is expected) is found by
+   ParseOffset rather than assumed at a fixed column; the ':' and the
+   two spaces around the byte columns are then validated wherever they
+   actually land, not at hardcoded positions -- a malformed line
+   (wrong spacing, a stray character, anything not matching CRK.TXT's
+   own documented format) is otherwise a plausible-looking but WRONG
+   parse instead of a caught error. Returns FALSE (writing nothing) on
+   any malformed line; the caller aborts the whole patch on a FALSE
+   return, per APPLYCRK's own "a bad line means don't trust the rest
+   of this patch" policy -- silently applying a partial/corrupted
+   patch would be worse than refusing it outright. *)
+PROCEDURE ApplyDiffLine() : BOOLEAN; NEAR;
+VAR offLo, offHi : WORD;
+    orig, new : WORD;
+    bad : BOOLEAN;
+    wb : BYTE;
+    colPos : WORD;
+    fp : WORD;
+BEGIN
+  bad := FALSE;
+  colPos := ParseOffset(ADR(offHi), ADR(offLo));
+  IF BH # 0 THEN bad := TRUE END;
+  IF ~ExpectChar(colPos, ':') THEN bad := TRUE END;
+  INC(colPos);
+  IF ~ExpectChar(colPos, Space) THEN bad := TRUE END;
+  INC(colPos);
+  orig := ParseHex(colPos, 2);
+  IF BH # 0 THEN bad := TRUE END;
+  INC(colPos, 2);
+  IF ~ExpectChar(colPos, Space) THEN bad := TRUE END;
+  INC(colPos);
+  new := ParseHex(colPos, 2);
+  IF BH # 0 THEN bad := TRUE END;
+  IF bad THEN AL := FALSE; RETURN END;
+
+  IF isApply THEN wb := new ELSE wb := orig END;
+
+  (* fp captured first -- Seek(ADR(targetH), DX:AX) directly would let
+     ADR(targetH)'s own arg-0 evaluation clobber DX:AX after it's set
+     up here, a known Spho.pas call-argument-ordering hazard (see
+     LIB/FILES.SMD's own Seek doc comment). *)
+  fp := ADR(targetH);
+  DX := offHi;
+  AX := offLo;
+  Seek(fp, DX:AX);
+  BlockWrite(fp, ADR(wb), 1);
+  Out_Char('.');
+  AL := TRUE
+END ApplyDiffLine;
+
+(* skips diff lines belonging to the CURRENT patch without applying
+   them (used when walking past patches before the requested one, and
+   for the list-mode walk) *)
+PROCEDURE SkipDiffLines() : BOOLEAN; NEAR;
+VAR more : BOOLEAN;
+BEGIN
+  more := NextLine();
+  WHILE more DO
+    IF lineLen = 0 THEN RETURN more END;
+    more := NextLine()
+  END;
+  AL := more
+END SkipDiffLines;
+
+(* applies every diff line of the CURRENT patch (targetH already
+   open), stopping at the next blank separator or EOF. A malformed
+   diff line aborts the whole patch (Error halts the process) rather
+   than silently applying a partial/corrupted patch. *)
+PROCEDURE ApplyDiffLines() : BOOLEAN; NEAR;
+VAR more : BOOLEAN;
+BEGIN
+  more := NextLine();
+  WHILE more DO
+    IF lineLen = 0 THEN RETURN more END;
+    IF ~ApplyDiffLine() THEN Error("Malformed diff line") END;
+    more := NextLine()
+  END;
+  AL := more
+END ApplyDiffLines;
+
+(* ============================ output helpers ============================ *)
+
+PROCEDURE PrintLine(); NEAR;
+BEGIN
+  Out_String(ADR(line));
+  Out_Ln
+END PrintLine;
+
+(* prints APPLYCRK.HLP (dropping its own trailing '$' terminator, same
+   FILE()-embedded-text convention as MKCRK.SMD's own help) and halts
+   -- called on bad/missing command-line arguments, mirroring
+   MKCRK.SMD's own Error procedure *)
+PROCEDURE Usage(); NEAR;
+VAR stdoutF : File;
+BEGIN
+  AttachHandle(ADR(stdoutF), STDOUT);
+  BlockWrite(ADR(stdoutF), ADR(help), SIZE(help)-1);
+  Close(ADR(stdoutF));
+  Halt(1)
+END Usage;
+
+(* ============================ main walk ================================= *)
+
+(* reads the (possibly multi-line) title, up to the first blank
+   separator line or EOF -- printed only in list mode (no +N/-N
+   argument); apply mode stays silent on success. *)
+PROCEDURE ReadTitle() : BOOLEAN; NEAR;
+VAR more : BOOLEAN;
+BEGIN
+  more := NextLine();
+  WHILE more DO
+    IF lineLen = 0 THEN RETURN more END;
+    IF ~wantApply THEN
+    Out_String("\x1b[36;40m");
+    PrintLine();
+    Out_String("\x1b[37;40m")
+    END;
+    more := NextLine()
+  END;
+  AL := more
+END ReadTitle;
+
+(* one patch block: title line, filename line, diff lines. In list
+   mode (apply=FALSE) just numbers+prints the title and skips the
+   rest; in apply mode, opens the filename and (only if this is the
+   requested patch number) rewrites the listed bytes. *)
+PROCEDURE DoPatch() : BOOLEAN; NEAR;
+VAR more : BOOLEAN;
+    isTarget : BOOLEAN;
+BEGIN
+  more := NextLine();          (* patch title line *)
+  IF ~more THEN AL := FALSE; RETURN END;
+  IF lineLen = 0 THEN AL := TRUE; RETURN END;   (* trailing blank run at EOF *)
+
+  INC(patchNum);
+  IF wantApply THEN
+    isTarget := patchNum = wantNum
+  ELSE
+    isTarget := FALSE
+  END;
+
+  IF ~wantApply THEN
+    Out_String("\x1b[33;40m#");
+    Out_Word(patchNum);
+    Out_String("\x1b[37;40m " );
+    PrintLine()
+  ELSIF isTarget THEN
+    SaveTitle()
+  END;
+
+  more := NextLine();          (* filename line *)
+  IF ~more THEN AL := FALSE; RETURN END;
+  IF lineLen = 0 THEN AL := TRUE; RETURN END;   (* patch with no filename/diffs *)
+
+  IF isTarget THEN
+    IF isApply THEN Out_String("Apply ") ELSE Out_String("Revert ") END;
+    Out_String("\x1b[33;40m");
+    Out_Char('#');
+    Out_Word(patchNum);
+    Out_String("\x1b[37;40m");
+    Out_Char(' ');
+    Out_String(ADR(patchTitle));
+    Out_Ln;
+    Out_String(ADR(line));
+    Out_Char(' ');
+    IF ~Reset(ADR(targetH), ADR(line)) THEN Error("Cannot open target file") END;
+    more := ApplyDiffLines();
+    Close(ADR(targetH));
+    Out_Ln;
+    applied := TRUE
+  ELSE
+    more := SkipDiffLines()
+  END;
+  AL := more
+END DoPatch;
+
+(* ============================ command line ============================ *)
+
+PROCEDURE IsSep(c : BYTE) : BOOLEAN; NEAR;
+BEGIN
+  IF IsBlank(c) THEN
+    AL := TRUE
+  ELSIF c = CR THEN
+    AL := TRUE
+  ELSE
+    AL := FALSE
+  END
+END IsSep;
+
+PROCEDURE SkipBlanks(); NEAR;
+VAR c : BYTE;
+BEGIN
+  WHILE cmdIdx <= cmdTailLen DO
+    BX := 80H + cmdIdx;
+    c := [ES:BX];
+    IF IsBlank(c) THEN
+      INC(cmdIdx)
+    ELSE
+      BREAK
+    END
+  END
+END SkipBlanks;
+
+PROCEDURE GetToken(dst : INTEGER) : BOOLEAN; NEAR;
+VAR n : INTEGER;
+    c : BYTE;
+    maxLenM1 : INTEGER;
+BEGIN
+  maxLenM1 := MaxName - 1;
+  IF cmdIdx > cmdTailLen THEN
+    RETURN FALSE
+  END;
+  BX := 80H + cmdIdx;
+  c := [ES:BX];
+  IF c = CR THEN
+    RETURN FALSE
+  END;
+  n := 0;
+  WHILE cmdIdx <= cmdTailLen DO
+    BX := 80H + cmdIdx;
+    c := [ES:BX];
+    IF IsSep(c) THEN BREAK END;
+    IF n < maxLenM1 THEN
+      SI := dst;
+      INC(SI, n);
+      [DS:SI] := c;
+      INC(n)
+    END;
+    INC(cmdIdx)
+  END;
+  SI := dst;
+  INC(SI, n);
+  AL := 0;
+  [DS:SI] := AL;
+  AL := n > 0
+END GetToken;
+
+(* parses an optional trailing "+N" or "-N" token (decimal N) into
+   wantApply/isApply/wantNum. Returns FALSE on a malformed token
+   (present but not +/- followed by at least one digit) OR on N
+   overflowing WORD range (> 65535) -- the multiply's own high word
+   (DX) catches a 16x16->32-bit overflow, and the following add's
+   carry flag catches the case where the multiply alone still fit but
+   adding the next digit pushed it past 65535 (e.g. 65530 + '9'). *)
+PROCEDURE ParseApplyArg(tok : INTEGER) : BOOLEAN; NEAR;
+VAR sign : BYTE;
+    n : WORD;
+    any : BOOLEAN;
+    c : BYTE;
+BEGIN
+  SI := tok;
+  sign := [DS:SI];
+  IF sign = '+' THEN
+    isApply := TRUE
+  ELSIF sign = '-' THEN
+    isApply := FALSE
+  ELSE
+    RETURN FALSE
+  END;
+  INC(SI);
+  n := 0;
+  any := FALSE;
+  c := [DS:SI];
+  WHILE c # 0 DO
+    IF c < '0' THEN RETURN FALSE END;
+    IF c > '9' THEN RETURN FALSE END;
+    BX := n;
+    CX := 10;
+    AX := BX;
+    ASM
+      mul cx
+    END;
+    IF DX # 0 THEN RETURN FALSE END;
+    BX := AX;
+    AL := c;
+    DEC(AL, 30H);
+    AH := 0;
+    INC(BX, AX);
+    IF CFLAG THEN RETURN FALSE END;
+    n := BX;
+    any := TRUE;
+    INC(SI);
+    c := [DS:SI]
+  END;
+  IF ~any THEN RETURN FALSE END;
+  wantNum := n;
+  wantApply := TRUE;
+  AL := TRUE
+END ParseApplyArg;
+
+PROCEDURE ParseCmdLine() : BOOLEAN; NEAR;
+USES ES;
+VAR argBuf : BYTE[MaxName];
+    have : BOOLEAN;
+BEGIN
+  GetPSP();
+  ES := AX;
+  BX := 80H;
+  AL := [ES:BX];
+  cmdTailLen := AL;
+  cmdIdx := 1;
+  SkipBlanks();
+  IF ~GetToken(ADR(crkName)) THEN RETURN FALSE END;
+  wantApply := FALSE;
+  SkipBlanks();
+  have := GetToken(ADR(argBuf));
+  IF have THEN
+    IF ~ParseApplyArg(ADR(argBuf)) THEN RETURN FALSE END
+  END;
+  AL := TRUE
+END ParseCmdLine;
+
+(* ============================ entry ==================================== *)
+
+BEGIN
+  IF ~ParseCmdLine() THEN Usage() END;
+
+  Out_String("\x1b[37;40m");
+  IF ~Reset(ADR(crkReader), ADR(crkName)) THEN Error("Cannot open CRK file") END;
+  IF ~ReadTitle() THEN Close(ADR(crkReader)); Halt(1) END;
+
+  patchNum := 0;
+  applied := FALSE;
+
+  WHILE DoPatch() DO END;
+
+  Close(ADR(crkReader));
+  IF wantApply THEN IF ~applied THEN Error("No such patch number") END END;
+  Halt(0)
+END APPLYCRK.

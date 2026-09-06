@@ -1,0 +1,372 @@
+(* MKCRK - compare two files and report differences as a CRK listing. *)
+
+MODULE MKCRK;
+
+IMPORT SYSTEM, OUT, FILES;
+
+CONST
+  BufIo   = 4096;   (* each input file's own read-ahead cache -- the
+                        shared output buffer is READER's own
+                        BufferedFile.buf now, sized READER_BUFSIZE *)
+  MaxName = 128;
+
+VAR
+  help   : BYTE[] = FILE("MKCRK.HLP");
+
+  (* ---- shared buffered output (stdout, handle 1), via READER's
+     BufferedFile/OpenHandle/WriteChar/WriteLine/WriteLn/CloseWriter --
+     attached directly to the already-open STDOUT handle (OpenHandle,
+     not OpenReader/OpenWriter, since there's no file to Reset/ReWrite;
+     STDOUT is opened by DOS itself before this program ever runs). ---- *)
+  stdout : File;
+
+  (* ---- input file handles + double read-ahead cache, mirrors the
+     original's GETBYTE(buf1/buf2) ---- *)
+  han1, han2 : File;
+  buf1     : BYTE[BufIo];
+  buf2     : BYTE[BufIo];
+  b1l, b2l : INTEGER;    (* valid bytes currently in buf1/buf2 *)
+  p1, p2   : INTEGER;    (* next unread index into buf1/buf2 *)
+
+  (* ---- 32-bit byte offset counter and file lengths, as WORD pairs
+     (Lo=low 16 bits, Hi=high 16 bits) -- SPHINX LONGINT has no
+     arithmetic (DOCS/SPHINX.MD S11: register-pair MOVES only), same
+     reason LZSS.SMD's own remLo/remHi countdown exists. ---- *)
+  numLo, numHi : WORD;
+  len1Lo, len1Hi : WORD;
+  len2Lo, len2Hi : WORD;
+
+  anyDiff  : BOOLEAN;
+
+  inName1, inName2 : BYTE[MaxName];
+  cmdIdx, cmdTailLen : INTEGER;
+
+(* ============================ output ================================ *)
+
+(* writes 'count' bytes from a FILE()-embedded array (base=ADR(arr)),
+   used for title/help -- their own trailing '$' terminator byte is
+   excluded by the caller passing SIZE(arr)-1 *)
+PROCEDURE OutBytes(base : WORD; count : INTEGER); NEAR;
+BEGIN
+  SI := base;
+  CX := count;
+  WHILE CX # 0 DO
+    BL := [DS:SI];
+    WriteByte(ADR(stdout), BL);
+    INC(SI);
+    DEC(CX)
+  END
+END OutBytes;
+
+PROCEDURE OutHexNibble(n : BYTE); NEAR;
+BEGIN
+  AL := n;
+  AL := AL & 0FH;
+  IF AL > 9 THEN INC(AL, 7) END;
+  INC(AL, 30H);
+  BL := AL;
+  WriteByte(ADR(stdout), BL)
+END OutHexNibble;
+
+PROCEDURE OutHexByte(b : BYTE); NEAR;
+BEGIN
+  AL := b;
+  CL := 4;
+  AL := AL SHR CL;
+  OutHexNibble(AL);
+  OutHexNibble(b)
+END OutHexByte;
+
+(* ============================ 32-bit helpers ========================= *)
+
+PROCEDURE NumInc(); NEAR;
+BEGIN
+  AX := numLo;
+  INC(AX);
+  numLo := AX;
+  IF AX = 0 THEN
+    AX := numHi;
+    INC(AX);
+    numHi := AX
+  END
+END NumInc;
+
+(* TRUE once num >= (lenLo,lenHi) -- unsigned 32-bit compare via a
+   high-word-first, then low-word, comparison *)
+PROCEDURE NumAtEnd() : BOOLEAN; NEAR;
+BEGIN
+  AX := numHi;
+  BX := len1Hi;
+  IF AX > BX THEN AL := TRUE; RETURN END;
+  IF AX < BX THEN AL := FALSE; RETURN END;
+  AX := numLo;
+  BX := len1Lo;
+  AL := AX >= BX
+END NumAtEnd;
+
+(* ============================ input ================================== *)
+
+(* refills buf1 (which=0) or buf2 (which=1) from han1/han2 *)
+PROCEDURE Refill1(); NEAR;
+BEGIN
+  b1l := BlockRead(ADR(han1), ADR(buf1), BufIo);
+  p1 := 0
+END Refill1;
+
+PROCEDURE Refill2(); NEAR;
+BEGIN
+  b2l := BlockRead(ADR(han2), ADR(buf2), BufIo);
+  p2 := 0
+END Refill2;
+
+PROCEDURE GetByte1() : BYTE; NEAR;
+BEGIN
+  IF p1 >= b1l THEN
+    Refill1()
+  END;
+  SI := ADR(buf1);
+  INC(SI, p1);
+  AL := [DS:SI];
+  INC(p1)
+END GetByte1;
+
+PROCEDURE GetByte2() : BYTE; NEAR;
+BEGIN
+  IF p2 >= b2l THEN
+    Refill2()
+  END;
+  SI := ADR(buf2);
+  INC(SI, p2);
+  AL := [DS:SI];
+  INC(p2)
+END GetByte2;
+
+(* ============================ diff core =============================== *)
+
+(* writes 'w's two bytes as 4 hex digits, high byte first *)
+PROCEDURE OutHexWord(w : WORD); NEAR;
+VAR hi, lo : BYTE;
+BEGIN
+  AX := w;
+  lo := AL;
+  CL := 8;
+  AX := AX SHR CL;
+  hi := AL;
+  OutHexByte(hi);
+  OutHexByte(lo)
+END OutHexWord;
+
+(* writes one "XXXXXXXX: OO NN\r\n" diff line -- 8 hex digits of num
+   (numHi then numLo -- big-endian order, matching the original's
+   STD/LODSB walk from #num+3 down to #num) *)
+PROCEDURE ReportDiff(orig, new : BYTE); NEAR;
+BEGIN
+  OutHexWord(numHi);
+  OutHexWord(numLo);
+  WriteByte(ADR(stdout), ':');
+  WriteByte(ADR(stdout), ' ');
+  OutHexByte(orig);
+  WriteByte(ADR(stdout), ' ');
+  OutHexByte(new);
+  WriteLn(ADR(stdout));
+  anyDiff := TRUE
+END ReportDiff;
+
+(* base compare pass -- mirrors DOCRKBLK *)
+PROCEDURE DoCompare(); NEAR;
+VAR b1, b2 : BYTE;
+    sameSize, len2Smaller : BOOLEAN;
+BEGIN
+  WriteLine(ADR(stdout), "Comparing files ");
+  WriteLine(ADR(stdout), ADR(inName1));
+  WriteLine(ADR(stdout), " and ");
+  WriteLine(ADR(stdout), ADR(inName2));
+  WriteLn(ADR(stdout));
+  WriteLine(ADR(stdout), ADR(inName1));
+  WriteLn(ADR(stdout));
+
+  len1Lo := 0; len1Hi := 0;
+  AX := FileSize(ADR(han1));
+  len1Lo := AX; len1Hi := DX;
+  AX := FileSize(ADR(han2));
+  len2Lo := AX; len2Hi := DX;
+
+  sameSize := TRUE;
+  IF len1Lo # len2Lo THEN sameSize := FALSE END;
+  IF len1Hi # len2Hi THEN sameSize := FALSE END;
+  IF ~sameSize THEN
+    WriteLine(ADR(stdout), "Files have diffrent sizes!");
+    WriteLn(ADR(stdout));
+    (* compare only over the smaller file's own length, matching the
+       original's EAX>ln1 check *)
+    len2Smaller := FALSE;
+    IF len2Hi < len1Hi THEN len2Smaller := TRUE END;
+    IF len2Hi = len1Hi THEN
+      IF len2Lo < len1Lo THEN len2Smaller := TRUE END
+    END;
+    IF len2Smaller THEN
+      len1Lo := len2Lo; len1Hi := len2Hi
+    END
+  END;
+
+  numLo := 0; numHi := 0;
+  anyDiff := FALSE;
+  WHILE ~NumAtEnd() DO
+    b1 := GetByte1();
+    b2 := GetByte2();
+    IF b1 # b2 THEN
+      ReportDiff(b1, b2)
+    END;
+    NumInc()
+  END;
+
+  IF ~anyDiff THEN
+    WriteLine(ADR(stdout), "No diffrences found!");
+    WriteLn(ADR(stdout))
+  END;
+
+  Close(ADR(han1));
+  Close(ADR(han2))
+END DoCompare;
+
+(* ============================ command line ============================ *)
+
+PROCEDURE IsBlank(AL) : BOOLEAN; NEAR;
+BEGIN
+  IF AL = Space THEN
+    AL := TRUE
+  ELSIF AL = Tab THEN
+    AL := TRUE
+  ELSE
+    AL := FALSE
+  END
+END IsBlank;
+
+PROCEDURE IsSep(c : BYTE) : BOOLEAN; NEAR;
+BEGIN
+  IF IsBlank(c) THEN
+    AL := TRUE
+  ELSIF c = CR THEN
+    AL := TRUE
+  ELSE
+    AL := FALSE
+  END
+END IsSep;
+
+PROCEDURE SkipBlanks(); NEAR;
+VAR c : BYTE;
+BEGIN
+  WHILE cmdIdx <= cmdTailLen DO
+    BX := 80H + cmdIdx;
+    c := [ES:BX];
+    IF IsBlank(c) THEN
+      INC(cmdIdx)
+    ELSE
+      BREAK
+    END
+  END
+END SkipBlanks;
+
+PROCEDURE GetToken(dst : INTEGER) : BOOLEAN; NEAR;
+VAR n : INTEGER;
+    c : BYTE;
+    quoted : BOOLEAN;
+    maxNameM1 : INTEGER;
+BEGIN
+  maxNameM1 := MaxName - 1;
+  IF cmdIdx > cmdTailLen THEN
+    RETURN FALSE
+  END;
+  BX := 80H + cmdIdx;
+  c := [ES:BX];
+  IF c = CR THEN
+    RETURN FALSE
+  END;
+  quoted := FALSE;
+  IF c = 22H THEN
+    quoted := TRUE;
+    INC(cmdIdx)
+  END;
+  n := 0;
+  WHILE cmdIdx <= cmdTailLen DO
+    BX := 80H + cmdIdx;
+    c := [ES:BX];
+    IF quoted THEN
+      IF c = 22H THEN
+        INC(cmdIdx);
+        BREAK
+      END;
+      IF c = CR THEN
+        BREAK
+      END
+    ELSE
+      IF IsSep(c) THEN
+        BREAK
+      END
+    END;
+    IF n < maxNameM1 THEN
+      SI := dst;
+      INC(SI, n);
+      [DS:SI] := c;
+      INC(n)
+    END;
+    INC(cmdIdx)
+  END;
+  SI := dst;
+  INC(SI, n);
+  AL := 0;
+  [DS:SI] := AL;
+  AL := n > 0
+END GetToken;
+
+PROCEDURE ParseCmdLine() : BOOLEAN; NEAR;
+USES ES;
+BEGIN
+  GetPSP();
+  ES := AX;
+  BX := 80H;
+  AL := [ES:BX];
+  cmdTailLen := AL;
+  cmdIdx := 1;
+  SkipBlanks();
+  IF ~GetToken(ADR(inName1)) THEN RETURN FALSE END;
+  SkipBlanks();
+  IF ~GetToken(ADR(inName2)) THEN RETURN FALSE END;
+  AL := TRUE
+END ParseCmdLine;
+
+(* ============================ entry ==================================== *)
+
+PROCEDURE ErrFile(nameAddr : INTEGER); NEAR;
+BEGIN
+  WriteLine(ADR(stdout), "Cannot read file ");
+  WriteLine(ADR(stdout), nameAddr);
+  WriteLn(ADR(stdout));
+  Close(ADR(stdout));
+  Halt(2)
+END ErrFile;
+
+PROCEDURE Error; NEAR;
+BEGIN
+  OutBytes(ADR(help), SIZE(help) - 1);
+  Close(ADR(stdout));
+  Halt(1)
+END Error;
+
+BEGIN
+  AttachHandle(ADR(stdout), STDOUT);
+
+  IF ~ParseCmdLine() THEN Error END;
+
+  IF ~Reset(ADR(han1), ADR(inName1)) THEN ErrFile(ADR(inName1)) END;
+  IF ~Reset(ADR(han2), ADR(inName2)) THEN Close(ADR(han1)); ErrFile(ADR(inName2)) END;
+  b1l := 0; p1 := 0;
+  b2l := 0; p2 := 0;
+
+  WriteLine(ADR(stdout), "Place your CRK title here\r\n\r\n");
+  DoCompare();
+  WriteLn(ADR(stdout));
+  WriteLn(ADR(stdout));
+  Close(ADR(stdout));
+  Halt(0)
+END MKCRK.

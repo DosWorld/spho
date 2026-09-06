@@ -1,0 +1,485 @@
+(*  RFC1978 PPP Predictor Compression Protocol -- compress/decompress
+    core, factored out of LZP.SMD so other programs can IMPORT it
+    directly (LZP.SMD itself has its own BEGIN...END CLI init part,
+    which IMPORT -- textual splicing, DOCS/SPHINX.MD's own "same as
+    #include" -- does not allow in an imported file). No IMPORT of its
+    own, same convention as EXAMPLES/CRK/READER.SMD: relies on the
+    caller already having IMPORTed SYSTEM/FILES/OUT (for Halt/GetPSP,
+    the File type and Reset/ReWrite/BlockRead/BlockWrite/Close/
+    FileSize, and Out_String/Out_Ln respectively) ahead of LZPLIB in
+    its own IMPORT list -- IMPORT has no #include-style guard, so
+    LZPLIB importing them itself would double-splice and collide with
+    the caller's own copies (duplicate PROCEDURE Halt/GetPSP, etc).
+
+    Reads/writes go straight through FILES.SMD's own ReadByte/WriteByte
+    one byte at a time -- no separate inBuf/outBuf staging buffer of
+    its own, since FILES.SMD's own File record is already page-buffered
+    (2048-byte buf[]), so a second buffering layer here would only add
+    overhead without saving any real I/O calls; ReadByte/WriteByte skip
+    BlockRead/BlockWrite's own multi-page WHILE/inner-copy-loop
+    machinery entirely (real overhead for a 1-byte request), going
+    straight to fp's own already-buffered page instead. This also
+    sidesteps a real bug a staging buffer used to cause: a BufIo-sized
+    refill could read PAST the end of one lzp_decompress_fp* call's own
+    compressed stream into whatever follows it in inFp (e.g. the next
+    tar member), leaving inFp's cursor wrong for the caller's own next
+    read -- with no staging buffer, each read only ever pulls exactly
+    one byte, so inFp's cursor always lands exactly where the logical
+    stream ends. *)
+MODULE LZPLIB;
+
+IMPORT FILES;
+
+CONST
+//  Window   = 4096;
+//  HashMask = 4095;
+  Window   = 8192;
+  HashMask = 8191;
+
+VAR
+  curByte  : BYTE;
+  bitCount : INTEGER;
+
+  lzpTable  : BYTE[Window];
+  rollHash  : WORD;
+
+  remZero      : BOOLEAN;
+  sizeLo, sizeHi : WORD;
+
+PROCEDURE BitFlush(outFp : WORD); NEAR;
+BEGIN
+  WriteByte(outFp, curByte);
+  curByte := 0;
+  bitCount := 0
+END BitFlush;
+
+PROCEDURE BitWrite(outFp : WORD; bit : BYTE); NEAR;
+USES BX;   (* BitFlush -> WriteByte clobbers BX as its own scratch --
+  lzp_compress_fp*'s own rolling hash lives in BX across this call
+  (same class of bug BitWriteBits/BitReadByte's own internal calls
+  had, fixed earlier) *)
+BEGIN
+  AL := curByte;
+  AL := AL SHL 1;
+  AH := bit;
+  AH := AH & 1;
+  AL := AL OR AH;
+  curByte := AL;
+  INC(bitCount);
+  IF bitCount = 8 THEN BitFlush(outFp) END
+END BitWrite;
+
+PROCEDURE BitWriteBits(outFp : WORD; value : WORD; numBits : INTEGER); NEAR;
+USES BX;
+BEGIN
+  AX := value;
+  CX := 16;
+  DEC(CX, numBits);
+  AX := AX SHL CL;
+  CX := numBits;
+  BL := curByte;
+  BH := bitCount;
+  WHILE CX # 0 DO
+    AX := AX SHL 1;
+    IF CFLAG THEN
+      BL := BL SHL 1;
+      INC(BL)
+    ELSE
+      BL := BL SHL 1
+    END;
+    INC(BH);
+    IF BH = 8 THEN
+      curByte := BL;
+      PUSH(AX, CX, BX);   (* BitFlush -> WriteByte clobbers BX as its own
+        scratch -- this procedure's OWN BH/BL accumulator lives in BX
+        across this call, not just the caller's BX the USES clause
+        above protects (same class of bug BitReadByte's own
+        BitInFillBuf call had, fixed earlier) *)
+      BitFlush(outFp);
+      POP(AX, CX, BX);   (* POP(r1,r2,...) pops in reverse order
+        automatically (DOCS/SPHINX.MD S11's own table) -- same argument
+        ORDER as the PUSH above, not manually reversed *)
+      BL := 0;
+      BH := 0
+    END;
+    DEC(CX)
+  END;
+  curByte := BL;
+  AL := BH; AH := 0; bitCount := AX   (* NOT "bitCount := BH" -- BH is a
+    BYTE register but bitCount is a WORD/INTEGER var; assigning a BYTE
+    register directly into a WORD var only stores its low byte, leaving
+    the high byte whatever garbage was already there (a real bug this
+    exact pattern used to have, silently relying on that garbage
+    already being 0 by luck of .bss layout) *)
+END BitWriteBits;
+
+PROCEDURE BitFinish(outFp : WORD); NEAR;
+BEGIN
+  IF bitCount # 0 THEN
+    AL := curByte;
+    CL := 8 - bitCount;
+    AL := AL SHL CL;
+    curByte := AL;
+    BitFlush(outFp)
+  END
+END BitFinish;
+
+PROCEDURE BitInFillBuf(inFp : WORD) : BOOLEAN; NEAR;
+VAR v : INTEGER;
+BEGIN
+  v := ReadByte(inFp);
+  IF v < 0 THEN RETURN FALSE END;
+  curByte := v;
+  bitCount := 8;
+  RETURN TRUE
+END BitInFillBuf;
+
+PROCEDURE BitReadBit(inFp : WORD) : INTEGER; NEAR;
+USES BX, SI;
+BEGIN
+  IF bitCount = 0 THEN
+    IF ~BitInFillBuf(inFp) THEN RETURN -1 END
+  END;
+  DEC(bitCount);
+  AL := curByte;
+  CL := bitCount;
+  AL := AL SHR CL;
+  AH := 0;
+  AL := AL & 1;
+END BitReadBit;
+
+PROCEDURE BitReadByte(inFp : WORD) : INTEGER; NEAR;
+USES BX, CX, SI;   (* BX must stay protected even though this procedure's
+                       own body also uses BX as scratch (BH/BL) --
+                       lzp_decompress_fp*'s own rolling hash lives in BX
+                       across this call, same reason BitReadBit above
+                       needs it *)
+VAR bitsLeft, acc : WORD; ok : BOOLEAN;
+BEGIN
+  BH := bitCount; BL := curByte;
+  acc := 0;
+  bitsLeft := 8;
+  WHILE bitsLeft # 0 DO
+    IF BH = 0 THEN
+      bitCount := 0;   (* not "bitCount := BH" -- BH is known 0 here
+        anyway (the IF condition), but a WORD var still needs a real
+        WORD store, not a partial BYTE one; see BitWriteBits's own
+        header comment on this exact bug *)
+      curByte := BL;
+      ok := BitInFillBuf(inFp);   (* clobbers BX as its own scratch
+        (FILES.SMD's own ReadByte, File-record-address convention) --
+        this procedure's OWN BH/BL accumulator lives in BX across this
+        call, not just the caller's BX the USES clause above protects,
+        but bitCount/curByte were just saved to globals above so BX's
+        old value isn't needed here regardless; also clobbers CX/DX
+        internally, which is why bitsLeft/acc are kept as plain WORD
+        locals instead of relying on them surviving *)
+      IF ~ok THEN RETURN -1 END;
+      BH := bitCount; BL := curByte
+    END;
+    DEC(BH);
+    AL := BL;
+    CL := BH;
+    AL := AL SHR CL;
+    AL := AL & 1;
+    DX := acc;
+    DX := DX SHL 1;
+    AH := 0;
+    DX := DX OR AX;
+    acc := DX;
+    DEC(bitsLeft)
+  END;
+  AL := BH; AH := 0; bitCount := AX;   (* not "bitCount := BH", see
+    BitWriteBits's own header comment on this exact bug *)
+  curByte := BL;
+  AX := acc
+END BitReadByte;
+
+PROCEDURE InitLzpTable; NEAR;
+USES ES;
+BEGIN
+  DI := ADR(lzpTable);
+  CX := Window;
+  AL := 0;
+  PUSH(DS);
+  POP(ES);
+  ASM
+    cld
+    rep stosb
+  END;
+END InitLzpTable;
+
+PROCEDURE IsZero(a1, a2 : WORD) : BOOLEAN; NEAR;
+BEGIN
+  AX := a1;
+  BX := a2;
+  IF AX = 0 THEN
+    IF BX = 0 THEN
+      RETURN TRUE
+    END
+  END;
+  RETURN FALSE;
+END IsZero;
+
+(* lzp_compress_fp*/lzp_decompress_fp*: same compress/decompress core as
+   lzp_compress*/lzp_decompress* below, but operating on File records the
+   CALLER has already Reset/ReWrite'd (and still owns -- Close is left to
+   the caller too) instead of opening files by name itself. Lets a caller
+   compress/decompress into an already-open output stream (e.g. one
+   member's content inside a larger file such as a tar archive) without
+   a temp file. lzp_compress_fp* takes an explicit byte count (limitLo/
+   limitHi, a genuine LONGINT pair) instead of using FileSize, since inFp
+   may be a stream shared with other content before/after the range being
+   compressed (FileSize would return the WHOLE stream's size, not just
+   this range).
+
+   limit is a real 32-bit pair, not a WORD (DOCS/TRBUG.MD): an earlier
+   version of this procedure took a WORD-only limit, which is what
+   lzp_compress* used to feed only the low half of FileSize's own real
+   LONGINT result into, silently truncating any file over 65535 bytes
+   (confirmed the hard way: a 4788190-byte file, 4788190 mod 65536 =
+   4062, compressed only its own first 4062 bytes, silently dropping the
+   rest -- no error, no diagnostic, just a truncated output). Widened in
+   place here instead of adding a second procedure -- this is the ONLY
+   lzp_compress_fp*, used identically by both lzp_compress* (passes
+   FileSize's own real DX:AX pair) and TARPAK/TARUNPAK (pass their own
+   WORD-sized origSize, zero-extended: origSize, 0 -- tar members are
+   always well under 65536 bytes by the tar format's own convention, so
+   the extra high word is always 0 at that call site, but the procedure
+   itself no longer assumes that). remLo/remHi's own borrow-decrement
+   loop uses the exact same idiom LZSSLIB.SMD's own OutByte/remLo/remHi
+   already establishes; sizeLo/sizeHi (this module's own header fields)
+   were already a real 32-bit pair on disk, matching lzp_decompress_fp*'s
+   own already-correct 32-bit remLo/remHi-style countdown below. *)
+(* lzp_compress_fp*/lzp_decompress_fp*: rewritten to follow
+   EXAMPLES/LZP.C's own reference algorithm EXACTLY (DOCS/TRBUG.MD's
+   own "known issue" entry, now resolved by switching formats) --
+   byte-oriented groups of up to 8 predictions per FLAG BYTE, not the
+   previous from-scratch bit-packed format (1 bit per match, 9 bits
+   per literal via BitWrite/BitWriteBits/BitReadBit/BitReadByte,
+   deleted below). One flag byte is emitted per (up to) 8 source
+   bytes: bit N (LSB first, matching LZP.C's own "bitmask <<= 1"
+   left-to-right order) is 1 if the table's own prediction for that
+   byte was correct (nothing else emitted for that byte), 0 if wrong
+   (the real byte is emitted immediately after the flag byte, in bit
+   order -- LZP.C's own "GuessTable[Hash] = *source; *dest++ =
+   *source" on a miss). Decompress mirrors this exactly. The BitWrite*
+   procedures above (BitFlush/BitWrite/BitWriteBits/BitFinish/
+   BitInFillBuf/BitReadBit/BitReadByte) are now dead code, left
+   in place only because LZP.C's own byte/bit-oriented split matches
+   this file's own historical structure -- not called by anything
+   below this point anymore. *)
+
+PROCEDURE lzp_compress_fp*(inFp, outFp : WORD; limitLo, limitHi : WORD); NEAR;
+VAR v : INTEGER; b : BYTE; remLo, remHi : WORD; remZero : BOOLEAN; rb : INTEGER;
+    flags, bitmask, i : WORD; flagPos, flagPosHi : WORD; curPos, curPosHi : WORD;
+    dummyPos : LONGINT;
+BEGIN
+  sizeLo := limitLo;
+  sizeHi := limitHi;
+  BlockWrite(outFp, ADR(sizeLo), 2);
+  BlockWrite(outFp, ADR(sizeHi), 2);
+  remLo := limitLo; remHi := limitHi;
+  remZero := IsZero(remLo, remHi);
+
+  InitLzpTable;
+
+  BX := 0;
+
+  v := 0;
+  IF remZero THEN v := -1
+  ELSE
+    rb := ReadByte(inFp);
+    IF rb < 0 THEN v := -1 ELSE b := rb END;
+    IF remLo = 0 THEN DEC(remHi) END;
+    DEC(remLo);
+    remZero := IsZero(remLo, remHi);
+  END;
+
+  WHILE v >= 0 DO
+    (* one group: reserve a flag-byte slot, then up to 8 predictions *)
+    flags := 0;
+    dummyPos := FilePos(outFp);
+    flagPosHi := DX; flagPos := AX;
+    WriteByte(outFp, 0);   (* placeholder flag byte, patched below *)
+
+    bitmask := 1;
+    i := 0;
+    WHILE i < 8 DO
+      IF v < 0 THEN BREAK END;
+
+      AX := BX;
+      AX := AX & HashMask;
+      SI := ADR(lzpTable);
+      INC(SI, AX);
+      AL := [DS:SI];
+      AH := b;
+      IF AL = AH THEN
+        flags := flags OR bitmask   (* guess correct -- nothing to emit *)
+      ELSE
+        [DS:SI] := AH;
+        WriteByte(outFp, b)         (* guess wrong -- emit the real byte *)
+      END;
+
+      CL := 4;
+      BX := BX SHL CL;
+      AX := 0; AL := b;
+      BX := BX XOR AX;
+      BX := BX & HashMask;
+
+      bitmask := bitmask SHL 1;
+      INC(i, 1);
+
+      v := 0;
+      IF remZero THEN v := -1
+      ELSE
+        PUSH(BX);
+        rb := ReadByte(inFp);
+        POP(BX);
+        IF rb < 0 THEN v := -1 ELSE b := rb END;
+        IF remLo = 0 THEN DEC(remHi) END;
+        DEC(remLo);
+        PUSH(BX);   (* IsZero has no USES BX of its own (same as
+          PairLess -- BX is fair-game scratch there) and clobbers it as
+          its own a2 copy -- this call sits in the middle of this
+          procedure's own rolling hash living in BX across the whole
+          per-byte loop, same reason the ReadByte call just above needs
+          this exact wrapper (confirmed the hard way: without it, every
+          byte's hash lookup silently saw BX=0 instead of the real
+          rolling hash, corrupting compression from the very first
+          group onward). *)
+        remZero := IsZero(remLo, remHi);
+        POP(BX)
+      END
+    END;
+
+    (* patch the group's own flag byte in place -- Seek back, write,
+       Seek forward again, same pattern TARPAK.SMD's own header-patch
+       already uses. *)
+    dummyPos := FilePos(outFp);
+    curPos := AX; curPosHi := DX;
+    AX := flagPos; DX := flagPosHi;
+    Seek(outFp, DX:AX);
+    curByte := flags;
+    WriteByte(outFp, curByte);
+    AX := curPos; DX := curPosHi;
+    Seek(outFp, DX:AX)
+  END;
+
+  rollHash := BX
+END lzp_compress_fp;
+
+PROCEDURE lzp_decompress_fp*(inFp, outFp : WORD) : BOOLEAN; NEAR;
+VAR bad : BOOLEAN; outByte : BYTE; flagVal : INTEGER; flags, bitmask, i : WORD;
+    remLo, remHi : WORD; remZero : BOOLEAN; rb : INTEGER;
+BEGIN
+  BlockRead(inFp, ADR(sizeLo), 2);
+  IF AX # 2 THEN RETURN FALSE END;
+  BlockRead(inFp, ADR(sizeHi), 2);
+  IF AX # 2 THEN RETURN FALSE END;
+  IF sizeLo = 0 THEN
+    IF sizeHi = 0 THEN RETURN TRUE END
+  END;
+
+  InitLzpTable;
+  bad := FALSE;
+  remLo := sizeLo; remHi := sizeHi;
+  remZero := IsZero(remLo, remHi);
+
+  BX := 0;
+  WHILE ~remZero DO
+    flagVal := ReadByte(inFp);
+    IF flagVal < 0 THEN bad := TRUE; BREAK END;
+    flags := flagVal;
+
+    bitmask := 1;
+    i := 0;
+    WHILE i < 8 DO
+      IF remZero THEN BREAK END;
+
+      AX := BX;
+      AX := AX & HashMask;
+      SI := ADR(lzpTable); INC(SI, AX);
+
+      AX := flags; AX := AX & bitmask;
+      IF AX # 0 THEN
+        AL := [DS:SI]   (* guess correct *)
+      ELSE
+        rb := ReadByte(inFp);
+        IF rb < 0 THEN bad := TRUE; BREAK END;
+        AL := rb;
+        [DS:SI] := AL
+      END;
+
+      CL := 4;
+      BX := BX SHL CL;
+      AH := 0;
+      BX := BX XOR AX;
+      BX := BX & HashMask;
+      outByte := AL;
+      PUSH(BX);
+      WriteByte(outFp, outByte);
+      POP(BX);
+
+      bitmask := bitmask SHL 1;
+      INC(i, 1);
+
+      IF remLo = 0 THEN DEC(remHi) END;
+      DEC(remLo);
+      PUSH(BX);   (* IsZero has no USES BX of its own and clobbers it as
+        its own a2 copy -- this call sits in the middle of this
+        procedure's own rolling hash living in BX across the whole
+        per-byte loop, same reason lzp_compress_fp's own matching
+        IsZero call needs this exact wrapper. *)
+      remZero := IsZero(remLo, remHi);
+      POP(BX)
+    END;
+    IF bad THEN BREAK END
+  END;
+
+  rollHash := BX;
+  AL := ~bad
+END lzp_decompress_fp;
+
+PROCEDURE lzp_compress*(infile, outfile : POINTER) : BOOLEAN; NEAR;
+VAR inH, outH : File;
+    inFp, outFp, nameOfs, limitLo, limitHi : WORD;
+BEGIN
+  inFp := ADR(inH);
+  DX:AX := infile; nameOfs := AX;
+  IF ~Reset(inFp, nameOfs) THEN RETURN FALSE END;
+  outFp := ADR(outH);
+  DX:AX := outfile; nameOfs := AX;
+  IF ~ReWrite(outFp, nameOfs) THEN Close(inFp); RETURN FALSE END;
+  (* FileSize's own real LONGINT result (DX:AX), kept as a genuine
+     32-bit pair -- lzp_compress_fp*'s own limitLo/limitHi below, not
+     just FileSize's own AX half, which is what this call site used to
+     feed it, silently truncating any file over 65535 bytes
+     (DOCS/TRBUG.MD has the full writeup, also on lzp_compress_fp*'s
+     own header comment). *)
+  FileSize(inFp);
+  limitLo := AX; limitHi := DX;
+  lzp_compress_fp(inFp, outFp, limitLo, limitHi);
+  Close(inFp);
+  Close(outFp);
+  RETURN TRUE
+END lzp_compress;
+
+PROCEDURE lzp_decompress*(infile, outfile : POINTER) : BOOLEAN; NEAR;
+VAR inH, outH : File;
+    inFp, outFp, nameOfs : WORD;
+    ok : BOOLEAN;
+BEGIN
+  inFp := ADR(inH);
+  DX:AX := infile; nameOfs := AX;
+  IF ~Reset(inFp, nameOfs) THEN RETURN FALSE END;
+  outFp := ADR(outH);
+  DX:AX := outfile; nameOfs := AX;
+  IF ~ReWrite(outFp, nameOfs) THEN Close(inFp); RETURN FALSE END;
+  ok := lzp_decompress_fp(inFp, outFp);
+  Close(inFp);
+  Close(outFp);
+  RETURN ok
+END lzp_decompress;
+
+END LZPLIB.

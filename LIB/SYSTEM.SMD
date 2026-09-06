@@ -1,0 +1,24 @@
+MODULE SYSTEM;
+
+CONST
+  CR*    = 0DH;
+  LF*    = 0AH;
+  Space* = 20H;
+  Tab*   = 09H;
+
+PROCEDURE Halt*(code : BYTE); NEAR;
+BEGIN
+  AL := code;
+  AH := 4CH;
+  INT(21H)
+END Halt;
+
+PROCEDURE GetPSP*() : WORD; NEAR;
+USES BX;
+BEGIN
+  AH := 62H;
+  INT(21H);
+  AX := BX
+END GetPSP;
+
+END SYSTEM.

@@ -1,0 +1,1007 @@
+MODULE TETRIS;
+
+CONST
+
+  ChVL    = 05H;
+  ChHL    = 06H;
+  ChLC    = 07H;
+  ChRC    = 08H;
+  ChDot   = 04H;
+  ChEmpty = 00H;
+  ChRB    = 01H;
+  ChGB    = 02H;
+  ChFull  = 09H;
+  ChSkip  = 0FFH;
+
+  ScEsc   = 01H;
+  ScP     = 19H;
+  ScM     = 32H;
+  ScSpace = 39H;
+  ScLeft  = 4BH;
+  ScRight = 4DH;
+  ScUp    = 48H;
+  ScDown  = 50H;
+
+  ScrW = 40; ScrH = 25;
+  FldW = 10; FldH = 20;
+  FigW = 4;  FigH = 4;
+
+  GlyphW = 3; GlyphH = 5; Gap = 1; NGlyph = 46;
+
+  WaitStepSlice = 10;
+  CgaSeg = 0B800H;
+
+VAR
+  spr         : BYTE[] = BASE64("AAAAAAAAAAAAAAAAAAAAAP//6qrqquqq6qrqquqq6qr//9VV1VXVVdVV1VXV
+                                 VdVVAAA//z//P/8//z//P/8//wAAAAABAAAAAAAAAAAAAAADMAMwAzADMAMw
+                                 AzADMAMwAAAAAP//AAD//wAAAAAAAAMwAzADPwMAA/8AAAAAAAADMAMw/zAA
+                                 MP/wAAAAAAAA/////////////////////w==");
+  font        : BYTE[] = BASE64("BwUHBQUGBQYFBgcEBAQHBgUFBQYHBAYEBwcEBgQEBwQFBQcFBQcFBQcCAgIH
+                                 AQEBBQcFBQYFBQQEBAQHBQcHBQUGBQUFBQcFBQUHBwUHBAQHBQUHAQYFBgUF
+                                 BwQHAQcHAgICAgUFBQUHBQUFBQIFBQcHBQUFAgUFBQUCAgIHAQIEBwcFBQUH
+                                 AgYCAgcGAQIEBwcBAwEHBQUHAQEHBAYBBgcEBwUHBwECBAQHBQcFBwcFBwEH
+                                 AAAAAAIAAAACBAAABwAAAAIHAgAHAQMAAgICAgACBQIHAgUBAgICAQQCAgIE
+                                 AQECBAQ=");
+  figures     : BYTE[] = BASE64("ICAqICAqKiogICAgACAqKiogICogICAgIAAqKioqICAgICAgICAAICoqICAg
+                                 KiogICAgACoqICAgKiogICAgIAAqKiAgKiogICAgICAAICAgICoqKiAgICog
+                                 ACAgKiAqKiogICAgIAA=");
+
+  screen      : BYTE[1000];
+  prev        : BYTE[1000];
+  field       : BYTE[200];
+  figureField : BYTE[16];
+
+  figI        : INTEGER;
+  figN        : INTEGER;
+  figX        : INTEGER;
+  figY        : INTEGER;
+  figA        : INTEGER;
+  figCurW     : INTEGER;
+  figCurH     : INTEGER;
+  pause       : INTEGER;
+  lines       : INTEGER;
+
+  randSeed    : WORD;
+
+  needRedraw  : BOOLEAN;
+  muted       : BOOLEAN;
+  gFall       : BOOLEAN;
+  gQuit       : BOOLEAN;
+
+PROCEDURE GraphMode; NEAR;
+BEGIN
+  AX := 0004H;
+  INT(10H)
+END GraphMode;
+
+PROCEDURE TextMode; NEAR;
+BEGIN
+  AX := 0003H;
+  INT(10H)
+END TextMode;
+
+PROCEDURE GetKey() : BYTE; NEAR;
+BEGIN
+  AX := 0;
+  INT(16H);
+  AL := AH;
+END GetKey;
+
+PROCEDURE HasKey() : BOOLEAN; NEAR;
+BEGIN
+  AH := 01H;
+  INT(16H);
+  IF ~ZFLAG THEN AL := TRUE ELSE AL := FALSE END
+END HasKey;
+
+PROCEDURE ClearKey; NEAR;
+BEGIN
+  WHILE HasKey() DO AX := 0; INT(16H) END;
+END ClearKey;
+
+PROCEDURE WaitKey; NEAR;
+BEGIN
+  ClearKey;
+  GetKey
+END WaitKey;
+
+PROCEDURE Delay(ms : INTEGER); NEAR;
+BEGIN
+  IF ms # 0 THEN
+    AX := ms;
+    CX := 1000;
+    ASM
+      mul cx
+    END;
+    CX := DX;
+    DX := AX;
+    AX := 8600H;
+    INT(15H)
+  END
+END Delay;
+
+PROCEDURE Sound(hz : INTEGER); NEAR;
+BEGIN
+  IF hz > 0 THEN
+    BX := hz;
+    DX := 12H;
+    AX := 34DDH;
+    ASM
+      div bx
+      mov bx, ax
+      mov al, 0B6h
+      out 43h, al
+      mov al, bl
+      out 42h, al
+      mov al, bh
+      out 42h, al
+      in al, 61h
+      or al, 03h
+      out 61h, al
+    END
+  END
+END Sound;
+
+PROCEDURE NoSound; NEAR;
+BEGIN
+  ASM
+    in al, 61h
+    and al, 0FCh
+    out 61h, al
+  END
+END NoSound;
+
+PROCEDURE CalcDiff(scrAddr, prevAddr : WORD); NEAR;
+USES DS, ES, SI, DI;
+BEGIN
+  ES := DS;
+  SI := scrAddr;
+  DI := prevAddr;
+  CX := 1000;
+  ASM
+    cld
+  .cdloop:
+    lodsb
+    cmp al, [es:di]
+    jne .cdchanged
+    mov byte [si-1], 0FFh
+    inc di
+    jmp .cdnext
+  .cdchanged:
+    stosb
+  .cdnext:
+    dec cx
+    jnz .cdloop
+  END
+END CalcDiff;
+
+PROCEDURE Draw(bufAddr, sprAddr : WORD); NEAR;
+USES DS, ES, SI, DI, BP;
+BEGIN
+  ES := DS;
+  SI := bufAddr;
+  DI := sprAddr;
+  AX := CgaSeg;
+  BP := AX;
+  DH := 25;
+  BX := 0;
+  ASM
+    cld
+  .drawrow:
+    push bx
+    mov dl, 40
+  .drawcol:
+    lodsb
+    cmp al, 0FFh
+    je .skipcell
+    push di
+    push bx
+    push ds
+    xor ah, ah
+    mov cl, 4
+    shl ax, cl
+    add di, ax
+    mov ds, bp
+    mov cl, 4
+  .drawchar:
+    mov ax, [es:di]
+    mov [bx], ax
+    add di, 2
+    mov ax, [es:di]
+    mov [bx+2000h], ax
+    add di, 2
+    add bx, 80
+    dec cl
+    jnz .drawchar
+    pop ds
+    pop bx
+    pop di
+  .skipcell:
+    add bx, 2
+    dec dl
+    jnz .drawcol
+    pop bx
+    add bx, 320
+    dec dh
+    jnz .drawrow
+  END
+END Draw;
+
+PROCEDURE Rand16() : WORD; NEAR;
+BEGIN
+  AX := randSeed;
+  BX := AX;
+  CL := 7;
+  ASM
+    shl bx, cl
+    xor ax, bx
+    mov bx, ax
+    mov cl, 9
+    shr bx, cl
+    xor ax, bx
+    mov bx, ax
+    mov cl, 8
+    shl bx, cl
+    xor ax, bx
+  END;
+  IF AX = 0 THEN AX := 1 END;
+  randSeed := AX;
+END Rand16;
+
+PROCEDURE RandMod8() : INTEGER; NEAR;
+BEGIN
+  AX := Rand16();
+  AX := AX & 7
+END RandMod8;
+
+PROCEDURE RandMod3() : INTEGER; NEAR;
+BEGIN
+  AX := Rand16();
+  AX := AX & 03H;
+END RandMod3;
+
+PROCEDURE SeedRandom; NEAR;
+BEGIN
+  AX := 0;
+  INT(1AH);
+  AX := DX;
+  IF AX = 0 THEN AX := 12345 END;
+  randSeed := AX
+END SeedRandom;
+
+PROCEDURE GetRandColor() : BYTE; NEAR;
+BEGIN
+  AX := RandMod3();
+  IF AX = 0 THEN AL := ChGB
+  ELSIF AX = 1 THEN AL := ChRB
+  ELSE AL := ChFull END
+END GetRandColor;
+
+PROCEDURE FillBytes(addr, count : WORD; val : BYTE); NEAR;
+USES ES, DI, CX;
+BEGIN
+  DI := addr;
+  CX := count;
+  AL := val;
+  AH := AL;
+  PUSH(DS); POP(ES);
+  ASM
+    cld
+    shr cx,1
+    rep stosw
+    adc cx,0
+    rep stosb
+  END;
+END FillBytes;
+
+PROCEDURE CopyBytesUp(src, dest, count : WORD); NEAR;
+USES ES;
+BEGIN
+  SI := src;
+  DI := dest;
+  CX := count;
+  PUSH(DS); POP(ES);
+  ASM
+    cld
+    rep movsb
+  END
+END CopyBytesUp;
+
+PROCEDURE CopyBytesDown(src, dest, count : WORD); NEAR;
+USES ES;
+BEGIN
+  SI := src;
+  INC(SI, count);
+  DEC(SI);
+  DI := dest;
+  INC(DI, count);
+  DEC(DI);
+  CX := count;
+  PUSH(DS); POP(ES);
+  ASM
+    std
+    rep movsb
+    cld
+  END
+END CopyBytesDown;
+
+PROCEDURE RowOff(base, width, row, col : INTEGER) : WORD; NEAR;
+USES BX;
+BEGIN
+  AX := row;
+  AX := AX * width;
+  INC(AX, base);
+  INC(AX, col);
+END RowOff;
+
+PROCEDURE IsFigLineEmpty(line : INTEGER) : BOOLEAN; NEAR;
+BEGIN
+  SI := RowOff(ADR(figureField), FigW, line, 0);
+  CX := FigW;
+  WHILE CX # 0 DO
+    ASM
+    lodsb
+    END;
+    IF AL # ChEmpty THEN RETURN FALSE END;
+    DEC(CX)
+  END;
+  AL := TRUE
+END IsFigLineEmpty;
+
+PROCEDURE IsFigColEmpty(col : INTEGER) : BOOLEAN; NEAR;
+BEGIN
+  BX := RowOff(ADR(figureField), FigW, 0, col);
+  CX := FigH;
+  WHILE CX # 0 DO
+    AL := [DS:BX];
+    IF AL # ChEmpty THEN RETURN FALSE END;
+    INC(BX, FigW);
+    DEC(CX)
+  END;
+  AL := TRUE
+END IsFigColEmpty;
+
+PROCEDURE LoadFigure; NEAR;
+VAR x      : INTEGER;
+    y      : INTEGER;
+BEGIN
+  FillBytes(ADR(figureField), 16, ChEmpty);
+
+  SI := RowOff(ADR(figures), 13, figI, 0);
+  y := 0;
+  WHILE y <= 2 DO
+    x := 0;
+    WHILE x <= 3 DO
+      PUSH(SI);
+      INC(SI, x);
+      AL := [DS:SI];
+      IF AL # 20H THEN
+        AX := figA;
+        IF AX = 0 THEN
+          CX := y;
+          DX := x;
+        ELSIF AX = 1 THEN
+          CX := 3 - x;
+          DX := y;
+        ELSIF AX = 2 THEN
+          CX := 3 - y;
+          DX := 3 - x;
+        ELSE
+          CX := x;
+          DX := 3 - y;
+        END;
+        BX := RowOff(ADR(figureField), FigW, CX, DX);
+        AL := ChRB;
+        [DS:BX] := AL
+      END;
+      INC(x)
+      POP(SI);
+    END;
+    INC(SI, 4);
+    INC(y)
+  END;
+
+  WHILE IsFigLineEmpty(0) DO
+    y := 1;
+    WHILE y <= 3 DO
+      BX := RowOff(ADR(figureField), FigW, y, 0);
+      CopyBytesUp(BX, BX - FigW, FigW);
+      INC(y)
+    END;
+    FillBytes(RowOff(ADR(figureField), FigW, 3, 0), FigW, ChEmpty)
+  END;
+  WHILE IsFigColEmpty(0) DO
+    y := 0;
+    WHILE y <= 3 DO
+      BX := RowOff(ADR(figureField), FigW, y, 1);
+      CopyBytesUp(BX, BX - 1, FigW - 1);
+      BX := RowOff(ADR(figureField), FigW, y, 3);
+      AL := ChEmpty;
+      [DS:BX] := AL;
+      INC(y)
+    END
+  END;
+
+  figCurW := 4;
+  WHILE figCurW > 0 DO
+    IF ~IsFigColEmpty(figCurW - 1) THEN BREAK END;
+    DEC(figCurW)
+  END;
+  figCurH := 4;
+  WHILE figCurH > 0 DO
+    IF ~IsFigLineEmpty(figCurH - 1) THEN BREAK END;
+    DEC(figCurH)
+  END;
+  x := figCurW + figX;
+  IF x > FldW THEN figX := FldW - figCurW END
+END LoadFigure;
+
+PROCEDURE ReDraw; NEAR;
+BEGIN
+  needRedraw := FALSE;
+  ES := DS;
+  DI := RowOff(ADR(screen), ScrW, 1, 16);
+  SI := ADR(field);
+  CX := 20;
+  WHILE CX # 0 DO
+    PUSH(CX);
+    FillBytes(DI, FldW, ChDot);
+    PUSH(SI, DI);
+    CX := 10;
+    WHILE CX # 0 DO
+      ASM
+        lodsb
+      END;
+      IF AL # ChEmpty THEN
+        [DS:DI] := AL
+      END;
+      INC(DI);
+      DEC(CX)
+    END;
+    POP(SI, DI);
+    INC(DI, ScrW);
+    INC(SI, FldW);
+    POP(CX);
+    DEC(CX)
+  END;
+
+  SI := ADR(figureField);
+  DI := RowOff(ADR(screen), ScrW, figY + 1, figX + 16);
+  CX := 4;
+  WHILE CX # 0 DO
+    PUSH(DI, SI, CX);
+    CX := 4;
+    WHILE CX # 0 DO
+      ASM
+        lodsb
+      END;
+      IF AL # ChEmpty THEN
+        [DS:DI] := AL
+      END;
+      INC(DI);
+      DEC(CX)
+    END;
+    POP(DI, SI, CX);
+    INC(SI, FigW);
+    INC(DI, ScrW);
+    DEC(CX)
+  END;
+
+  RowOff(ADR(figures), 13, figN, 0);
+  PUSH(AX);
+  DI := RowOff(ADR(screen), ScrW, 1, 29);
+  POP(SI); 
+  CX := 3;
+  WHILE CX # 0 DO
+    PUSH(DI, CX);
+    ASM
+      cld
+    END;
+    CX := 4;
+    WHILE CX # 0 DO
+      ASM
+        lodsb
+      END;
+      IF AL = 20H THEN AL := ChEmpty ELSE AL := ChGB END;
+      ASM
+        stosb
+      END;
+      DEC(CX)
+    END;
+    POP(DI, CX);
+    INC(DI, ScrW);
+    DEC(CX)
+  END;
+
+  CalcDiff(ADR(screen), ADR(prev));
+  Draw(ADR(screen), ADR(spr))
+END ReDraw;
+
+PROCEDURE FigCollides(fldBase : INTEGER) : BOOLEAN; NEAR;
+BEGIN
+  CX := 4;
+  BX := ADR(figureField);
+  SI := fldBase;
+  WHILE CX # 0 DO
+    PUSH(CX, BX, SI);
+    CX := 4;
+    WHILE CX # 0 DO
+      AL := [DS:BX];
+      IF AL # ChEmpty THEN
+        DI := SI;
+        AL := [DS:DI];
+        IF AL # ChEmpty THEN POP(CX); RETURN TRUE END
+      END;
+      INC(BX);
+      INC(SI);
+      DEC(CX)
+    END;
+    POP(CX, BX, SI);
+    INC(SI, FldW);
+    INC(BX, FigW);
+    DEC(CX)
+  END;
+  AL := FALSE
+END FigCollides;
+
+PROCEDURE CanMoveLeft() : BOOLEAN; NEAR;
+BEGIN
+  IF figX = 0 THEN RETURN FALSE END;
+  AL := ~FigCollides(RowOff(ADR(field), FldW, figY, figX - 1))
+END CanMoveLeft;
+
+PROCEDURE CanMoveRight() : BOOLEAN; NEAR;
+BEGIN
+  AX := figX + figCurW;
+  IF AX >= FldW THEN RETURN FALSE END;
+  AL := ~FigCollides(RowOff(ADR(field), FldW, figY, figX + 1))
+END CanMoveRight;
+
+PROCEDURE CanDoStepDown() : BOOLEAN; NEAR;
+BEGIN
+  AL := ~FigCollides(RowOff(ADR(field), FldW, figY + 1, figX))
+END CanDoStepDown;
+
+PROCEDURE FigureMerge; NEAR;
+BEGIN
+  SI := RowOff(ADR(field), FldW, figY, figX);
+  BX := ADR(figureField);
+  CX := 4;
+  WHILE CX # 0 DO
+    PUSH(CX, BX, SI);
+    CX := 4;
+    WHILE CX # 0 DO
+      AL := [DS:BX];
+      IF AL # ChEmpty THEN
+        DI := SI;
+        AL := ChGB;
+        [DS:DI] := AL
+      END;
+      INC(BX);
+      INC(SI);
+      DEC(CX)
+    END;
+    POP(CX, BX, SI);
+    INC(SI, FldW);
+    INC(BX, FigW);
+    DEC(CX)
+  END
+END FigureMerge;
+
+PROCEDURE IsRowFull(y : INTEGER) : BOOLEAN; NEAR;
+BEGIN
+  SI := RowOff(ADR(field), FldW, y, 0);
+  CX := 10;
+  ASM
+  cld
+  END;
+  WHILE CX # 0 DO
+    ASM
+    lodsb
+    END;
+    IF AL = ChEmpty THEN RETURN FALSE END;
+    DEC(CX)
+  END;
+  AL := TRUE
+END IsRowFull;
+
+PROCEDURE RemoveRows; NEAR;
+VAR y   : INTEGER;
+    row : INTEGER;
+BEGIN
+  y := 19;
+  WHILE y >= 0 DO
+    IF ~IsRowFull(y) THEN
+      DEC(y)
+    ELSE
+      FillBytes(RowOff(ADR(field), FldW, y, 0), FldW, ChFull);
+      ReDraw;
+      IF ~muted THEN Sound(100) END;
+      Delay(50);
+      IF ~muted THEN NoSound END;
+      Delay(150);
+
+      row := y - 1;
+      WHILE row >= 0 DO
+        BX := RowOff(ADR(field), FldW, row, 0);
+        CopyBytesUp(BX, BX + FldW, FldW);
+        DEC(row)
+      END;
+      FillBytes(ADR(field), FldW, ChEmpty);
+      INC(lines);
+
+      AX := lines;
+      AX := AX DIV 20;
+      BX := 7;
+      DEC(BX, AX);
+      pause := BX;
+      IF pause < 1 THEN pause := 1 END
+    END
+  END
+END RemoveRows;
+
+PROCEDURE MkAnimDown(x, y, width, heigh : INTEGER); NEAR;
+VAR dy  : INTEGER;
+    ofs : INTEGER;
+    gx  : INTEGER;
+BEGIN
+  dy := 0;
+  ofs := y;
+  WHILE dy < heigh DO
+    FillBytes(RowOff(ADR(screen), ScrW, ofs, x), width, ChFull);
+    IF dy # 0 THEN
+      gx := x;
+      CX := width;
+      WHILE CX # 0 DO
+        PUSH(CX);
+        DI := RowOff(ADR(screen), ScrW, ofs - 1, gx);
+        GetRandColor();
+        [DS:DI] := AL;
+        INC(gx);
+        POP(CX);
+        DEC(CX)
+      END
+    END;
+    Delay(15);
+    INC(dy);
+    INC(ofs);
+    CalcDiff(ADR(screen), ADR(prev));
+    Draw(ADR(screen), ADR(spr))
+  END
+END MkAnimDown;
+
+PROCEDURE MkAnimUp(x, y, width, heigh : INTEGER; emptyCh : BYTE); NEAR;
+VAR dy    : INTEGER;
+    ofs   : INTEGER;
+    hlim  : INTEGER;
+BEGIN
+  AX := heigh; DEC(AX);
+  dy := AX;
+  hlim := AX;
+  ofs := y;
+  INC(ofs, dy);
+  WHILE dy >= 0 DO
+    BX := RowOff(ADR(screen), ScrW, ofs, x);
+    FillBytes(BX, width, ChFull);
+    IF dy < hlim THEN
+      FillBytes(BX + ScrW, width, emptyCh)
+    END;
+    Delay(15);
+    DEC(dy);
+    DEC(ofs);
+    CalcDiff(ADR(screen), ADR(prev));
+    Draw(ADR(screen), ADR(spr))
+  END
+END MkAnimUp;
+
+PROCEDURE FillScreenRandom(x, y, width, heigh : INTEGER); NEAR;
+VAR gx : INTEGER;
+    gy : INTEGER;
+    hh : INTEGER;
+BEGIN
+  hh := heigh - 1;
+  WHILE hh >= 0 DO
+    gy := y;
+    INC(gy, hh);
+    gx := x;
+    CX := width;
+    WHILE CX # 0 DO
+      PUSH(CX);
+      GetRandColor();
+      PUSH(AX);
+      BX := RowOff(ADR(screen), ScrW, gy, gx);
+      POP(AX);
+      [DS:BX] := AL;
+      INC(gx);
+      POP(CX);
+      DEC(CX)
+    END;
+    DEC(hh)
+  END
+END FillScreenRandom;
+
+PROCEDURE NextFigure; NEAR;
+BEGIN
+  IF ~muted THEN Sound(60) END;
+  figA := 0;
+  figX := 4;
+  figY := 0;
+  figI := figN;
+  figN := RandMod8();
+  Delay(50);
+  LoadFigure;
+  IF ~muted THEN NoSound END
+END NextFigure;
+
+PROCEDURE FigureIsDown() : BOOLEAN; NEAR;
+BEGIN
+  AX := figY + figCurH - 1;
+  AX := AX >= 19
+END FigureIsDown;
+
+PROCEDURE HandleKeys; NEAR;
+BEGIN
+  WHILE HasKey() DO
+    GetKey();
+    IF AL = ScEsc THEN
+      gQuit := TRUE
+    ELSIF AL = ScLeft THEN
+      IF CanMoveLeft() THEN DEC(figX); needRedraw := TRUE END
+    ELSIF AL = ScRight THEN
+      IF CanMoveRight() THEN INC(figX); needRedraw := TRUE END
+    ELSIF AL = ScUp THEN
+      AX := figA + 1;
+      AX := AX & 3;
+      figA := AX;
+      LoadFigure;
+      needRedraw := TRUE
+    ELSIF AL = ScDown THEN
+      AX := figA + 3;
+      AX := AX & 3;
+      figA := AX;
+      LoadFigure;
+      needRedraw := TRUE
+    ELSIF AL = ScP THEN
+      MkAnimDown(16, 1, 10, 20);
+      WaitKey;
+      MkAnimUp(16, 1, 10, 20, ChDot)
+    ELSIF AL = ScSpace THEN
+      gFall := TRUE
+    ELSIF AL = ScM THEN
+      muted := ~muted;
+    END
+  END
+END HandleKeys;
+
+PROCEDURE WaitStep; NEAR;
+VAR waited : WORD;
+    target : WORD;
+BEGIN
+  target := 0;
+  CX := pause;
+  AX := 55;
+  DX := 0;
+  ASM
+    MUL CL
+  END;
+  target := AX;
+  waited := 0;
+  WHILE waited < target DO
+    IF gFall THEN BREAK END;
+    IF gQuit THEN BREAK END;
+    HandleKeys;
+    IF gFall THEN BREAK END;
+    IF gQuit THEN BREAK END;
+    IF needRedraw THEN ReDraw END;
+    Delay(WaitStepSlice);
+    INC(waited, WaitStepSlice)
+  END
+END WaitStep;
+
+PROCEDURE AtRest() : BOOLEAN; NEAR;
+BEGIN
+  IF ~CanDoStepDown() THEN AL := TRUE
+  ELSIF FigureIsDown() THEN AL := TRUE
+  ELSE AL := FALSE
+  END
+END AtRest;
+
+PROCEDURE PlayGame; NEAR;
+VAR steps : WORD;
+    y     : INTEGER;
+BEGIN
+  FillBytes(ADR(field), 200, ChEmpty);
+  FillBytes(ADR(prev), 1000, ChSkip);
+  FillBytes(ADR(screen), 1000, ChEmpty);
+
+  y := 1;
+  WHILE y <= 21 DO
+    BX := RowOff(ADR(screen), ScrW, y, 15);
+    AL := ChVL;
+    [DS:BX] := AL;
+    INC(BX, 11);
+    [DS:BX] := AL;
+    INC(y)
+  END;
+  BX := RowOff(ADR(screen), ScrW, 21, 15);
+  FillBytes(BX, 12, ChHL);
+  AL := ChLC;
+  [DS:BX] := AL;
+  INC(BX, 11);
+  [DS:BX] := AL;
+  FillScreenRandom(16, 1, 10, 20);
+  MkAnimUp(16, 1, 10, 20, ChDot);
+  muted := FALSE;
+  figN := RandMod8();
+  NextFigure;
+  pause := 7;
+  needRedraw := TRUE;
+  AX := 0;
+  lines := AX;
+  steps := AX;
+  gFall := AL;
+  gQuit := AL;
+
+  WHILE ~gQuit DO
+    IF needRedraw THEN ReDraw END;
+    IF AtRest() THEN
+      HandleKeys;
+      IF ~gQuit THEN
+        IF steps = 0 THEN
+          gQuit := TRUE
+        ELSE
+          FigureMerge;
+          NextFigure;
+          RemoveRows;
+          steps := 0;
+          gFall := FALSE;
+          needRedraw := TRUE
+        END
+      END
+    ELSE
+      IF ~gFall THEN WaitStep END;
+      IF ~gQuit THEN
+        IF needRedraw THEN ReDraw END;
+        IF ~muted THEN Sound(80) END;
+        needRedraw := TRUE;
+        INC(figY);
+        INC(steps);
+        IF ~muted THEN NoSound END
+      END
+    END
+  END
+END PlayGame;
+
+PROCEDURE FontIndex(chr : BYTE) : INTEGER; NEAR;
+BEGIN
+  AH := 0;
+  AL := chr;
+  IF AL >= 41H THEN
+    IF AL <= 5AH THEN DEC(AL, 41H); RETURN END
+  END;
+  IF AL >= 30H THEN
+    IF AL <= 39H THEN DEC(AL, 16H); RETURN END
+  END;
+  IF AL = 2EH THEN RETURN 36 END;
+  IF AL = 2CH THEN RETURN 37 END;
+  IF AL = 2DH THEN RETURN 38 END;
+  IF AL = 2BH THEN RETURN 39 END;
+  IF AL = 3FH THEN RETURN 40 END;
+  IF AL = 21H THEN RETURN 41 END;
+  IF AL = 2AH THEN RETURN 42 END;
+  IF AL = 28H THEN RETURN 43 END;
+  IF AL = 29H THEN RETURN 44 END;
+  IF AL = 2FH THEN RETURN 45 END;
+  AX := -1
+END FontIndex;
+
+PROCEDURE DrawText(s : INTEGER; col0, row0 : INTEGER); NEAR;
+VAR k      : INTEGER;
+    gi     : INTEGER;
+    gx     : INTEGER;
+    gy     : INTEGER;
+    curCol : INTEGER;
+    row    : BYTE;
+    chr    : BYTE;
+    bit    : INTEGER;
+BEGIN
+  curCol := col0;
+  k := 0;
+  SI := s;
+  INC(SI, k);
+  AL := [DS:SI];
+  chr := AL;
+  WHILE chr # 0 DO
+    gi := FontIndex(chr);
+    IF gi # -1 THEN
+      gy := 0;
+      WHILE gy <= 4 DO
+        BX := RowOff(ADR(font), GlyphH, gi, gy);
+        AL := [DS:BX];
+        row := AL;
+        gx := 0;
+        bit := 4;
+        WHILE gx <= 2 DO
+          AL := row;
+          AL := AL & bit;
+          IF AL # 0 THEN
+            DI := RowOff(ADR(screen), ScrW, row0 + gy, curCol + gx);
+            GetRandColor();
+            [DS:DI] := AL
+          END;
+          AX := bit;
+          bit := AX SHR 1;
+          INC(gx)
+        END;
+        INC(gy)
+      END
+    END;
+    INC(curCol, GlyphW + Gap);
+    INC(k);
+    SI := s;
+    INC(SI, k);
+    AL := [DS:SI];
+    chr := AL
+  END
+END DrawText;
+
+PROCEDURE Welcome; NEAR;
+BEGIN
+  SeedRandom;
+  GraphMode;
+
+  FillBytes(ADR(prev), 1000, ChSkip);
+  FillBytes(ADR(screen), 1000, ChDot);
+
+  BX := 23;
+  AX := ScrW - BX;
+  DI := AX SHR 1;
+  AX := ScrH - GlyphH;
+  SI := AX SHR 1;
+  ClearKey;
+  WHILE ~HasKey() DO
+    PUSH(DI, SI);
+    DrawText("TETRIS", DI, SI);
+    CalcDiff(ADR(screen), ADR(prev));
+    Draw(ADR(screen), ADR(spr));
+    Delay(10);
+    POP(DI, SI)
+  END;
+  GetKey();
+  MkAnimDown(0, 0, 40, 25)
+END Welcome;
+
+PROCEDURE GameOver; NEAR;
+VAR x0 : INTEGER;
+    y0 : INTEGER;
+BEGIN
+  MkAnimDown(16, 1, 10, 20);
+  FillScreenRandom(0, 0, 40, 25);
+  MkAnimUp(0, 0, 40, 25, ChDot);
+  FillBytes(ADR(screen), 1000, ChDot);
+
+  BX := 15;
+  x0 := ScrW - BX;
+  AX := x0;
+  x0 := AX SHR 1;
+  y0 := ScrH - 11;
+  AX := y0;
+  y0 := AX SHR 1;
+  ClearKey;
+  WHILE ~HasKey() DO
+    DrawText("GAME", x0 - 1, y0);
+    DrawText("OVER", x0 + 1, y0 + GlyphH + 1);
+    CalcDiff(ADR(screen), ADR(prev));
+    Draw(ADR(screen), ADR(spr));
+    Delay(10)
+  END;
+  GetKey();
+  TextMode;
+END GameOver;
+
+BEGIN
+  Welcome;
+  PlayGame;
+  GameOver
+  AX := 4C00H; INT(21H)
+END TETRIS.

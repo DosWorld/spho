@@ -1,0 +1,566 @@
+(*  LZ77-style sliding-window compressor (12-bit offset / 4-bit length,
+    hash-chained match search) -- compress/decompress core, factored out
+    of LZSS.SMD so other programs could IMPORT it directly, same split as
+    LZP.SMD -> LZPLIB.SMD (LZPLIB.SMD's own header comment). No IMPORT of
+    its own, same convention as LZPLIB.SMD: relies on the caller already
+    having IMPORTed SYSTEM/FILES/OUT ahead of LZSSLIB in its own IMPORT
+    list -- IMPORT has no #include-style guard, so LZSSLIB importing them
+    itself would double-splice and collide with the caller's own copies.
+
+    All bit-level and decompressed-output I/O goes straight through
+    FILES.SMD's own ReadByte/WriteByte one byte at a time -- no separate
+    bitBuf/outBuf staging buffer of its own (the original LZSS.SMD had
+    both), since FILES.SMD's own File record is already page-buffered
+    (2048-byte buf[]), so a second buffering layer here would only add
+    overhead without saving any real I/O calls, same reasoning as
+    LZPLIB.SMD's own header comment. buf/win below are NOT I/O staging --
+    they're the LZ77 sliding window and match history itself (algorithmic
+    state FindMatch/OutByte need, not a buffering layer over FILES), so
+    they stay; Refill still uses BlockRead to fill buf in chunks, which
+    is FILES.SMD's own already-buffered bulk path, not a redundant extra
+    layer. *)
+MODULE LZSSLIB;
+
+IMPORT FILES;
+
+CONST
+  WindowSize = 4096;
+  MinMatch   = 3;
+  MaxMatch   = 18;      (* MinMatch + 15 -- fits a 4-bit length code *)
+  OffsetBits = 12;
+  LengthBits = 4;
+  BufIo      = 512;     (* chunk size for Refill's own file-read of buf *)
+  BufCap     = 8210;    (* WindowSize + 8*BufIo + MaxMatch -- generous
+                            slack over the shift threshold; see the
+                            original LZSS.SMD's own header comment for
+                            the full reasoning (unchanged by this split). *)
+  NoPos      = 0FFFFH;  (* lastPos/prevPos "no entry" sentinel -- never a
+                            real buf index, which is always < BufCap *)
+  MaxChain   = 16;       (* FindMatch's own hash-chain walk cutoff -- see
+                            the original LZSS.SMD's own header comment. *)
+
+VAR
+  (* ---- shared bit-level I/O state ---- *)
+  curByte  : BYTE;
+  bitCount : INTEGER;      (* compress: bits filled in curByte so far;
+                               decompress: bits left unread in curByte *)
+
+  (* ---- compression: sliding-block buffer ---- *)
+  buf      : BYTE[BufCap];
+  bufFill  : INTEGER;      (* valid bytes in buf, starting at index 0 *)
+  pos      : INTEGER;      (* index of the next not-yet-encoded byte *)
+
+  (* ---- compression: first-byte hash chain, FindMatch's own index ----
+     see the original LZSS.SMD's own header comment for the full
+     reasoning (unchanged by this split). *)
+  lastPos  : INTEGER[256];
+  prevPos  : INTEGER[BufCap];
+  inAtEof  : BOOLEAN;      (* the input file has no more bytes past buf *)
+
+  (* ---- decompression: history ring ---- *)
+  win      : BYTE[WindowSize];
+  winPos   : INTEGER;      (* next write index into win, wraps at WindowSize *)
+
+  origSizeLo, origSizeHi : WORD;
+
+  (* remLo/remHi: bytes still owed to the output file, a 2-WORD little-
+     endian countdown -- see the original LZSS.SMD's own header comment. *)
+  remLo, remHi : WORD;
+  remZero      : BOOLEAN;
+
+  (* matchOff/matchLen: FindMatch's own result, module-level for the
+     same "no VAR/by-reference parameter exists" reason as elsewhere in
+     this codebase -- FindMatch has exactly one caller (Compress), so no
+     reentrancy concern. *)
+  matchOff : INTEGER;
+  matchLen : INTEGER;
+
+PROCEDURE BitFlush(outFp : WORD); NEAR;
+USES BX;   (* WriteByte clobbers BX as its own scratch -- lzss_compress_fp*'s
+  own FindMatch/Compress state doesn't live in BX across this call today,
+  but protecting it here matches LZPLIB.SMD's own BitFlush convention. *)
+BEGIN
+  WriteByte(outFp, curByte);
+  curByte := 0;
+  bitCount := 0
+END BitFlush;
+
+PROCEDURE BitWrite(outFp : WORD; bit : BYTE); NEAR;
+BEGIN
+  AL := curByte;
+  AL := AL SHL 1;
+  AH := bit;
+  AH := AH & 1;
+  AL := AL OR AH;
+  curByte := AL;
+  INC(bitCount);
+  IF bitCount = 8 THEN
+    BitFlush(outFp)
+  END
+END BitWrite;
+
+PROCEDURE BitWriteBits(outFp : WORD; value : WORD; numBits : INTEGER); NEAR;
+BEGIN
+  AX := value;
+  CX := 16;
+  DEC(CX, numBits);
+  AX := AX SHL CL;
+  CX := numBits;
+  BL := curByte;
+  BH := bitCount;
+  WHILE CX # 0 DO
+    AX := AX SHL 1;
+    IF CFLAG THEN
+      BL := BL SHL 1;
+      INC(BL)
+    ELSE
+      BL := BL SHL 1
+    END;
+    INC(BH);
+    IF BH = 8 THEN
+      curByte := BL;
+      PUSH(AX, CX, BX);   (* BitFlush -> WriteByte clobbers BX -- this
+        procedure's OWN BH/BL accumulator lives in BX across that call *)
+      BitFlush(outFp);
+      POP(AX, CX, BX);
+      BL := 0;
+      BH := 0
+    END;
+    DEC(CX)
+  END;
+  curByte := BL;
+  AL := BH; AH := 0; bitCount := AX   (* NOT "bitCount := BH" -- see
+    LZPLIB.SMD's own BitWriteBits comment on this exact bug class *)
+END BitWriteBits;
+
+PROCEDURE BitFinish(outFp : WORD); NEAR;
+BEGIN
+  IF bitCount > 0 THEN
+    AL := curByte;
+    CL := 8 - bitCount;
+    AL := AL SHL CL;
+    curByte := AL;
+    BitFlush(outFp)
+  END
+END BitFinish;
+
+PROCEDURE BitInFillBuf(inFp : WORD) : BOOLEAN; NEAR;
+VAR v : INTEGER;
+BEGIN
+  v := ReadByte(inFp);
+  IF v < 0 THEN RETURN FALSE END;
+  curByte := v;
+  bitCount := 8;
+  RETURN TRUE
+END BitInFillBuf;
+
+PROCEDURE BitReadBit(inFp : WORD) : INTEGER; NEAR;
+USES BX;
+BEGIN
+  IF bitCount = 0 THEN
+    IF ~BitInFillBuf(inFp) THEN RETURN -1 END
+  END;
+  DEC(bitCount);
+  AL := curByte;
+  CL := bitCount;
+  AL := AL SHR CL;
+  AH := 0;
+  AL := AL & 1;
+END BitReadBit;
+
+PROCEDURE BitReadBits(inFp : WORD; numBits : INTEGER; outAddr : INTEGER) : BOOLEAN; NEAR;
+VAR bit : INTEGER;
+    value : WORD;
+BEGIN
+  value := 0;
+  CX := 0;
+  WHILE CX < numBits DO
+    PUSH(CX);
+    bit := BitReadBit(inFp);
+    IF bit < 0 THEN
+      POP(CX);
+      RETURN FALSE
+    END;
+    AX := value;
+    AX := AX SHL 1;
+    BX := bit;
+    AX := AX OR BX;
+    value := AX;
+    POP(CX);
+    INC(CX)
+  END;
+  BX := outAddr;
+  AX := value;
+  [DS:BX] := AX;
+  AL := TRUE
+END BitReadBits;
+
+PROCEDURE ChainInsert(p : INTEGER); NEAR;
+USES CX;
+BEGIN
+  SI := ADR(buf);
+  INC(SI, p);
+  AL := [DS:SI];
+  AH := 0;
+  BX := AX;
+  SI := ADR(lastPos);
+  INC(SI, BX);
+  INC(SI, BX);
+  AX := [DS:SI];
+  DI := ADR(prevPos);
+  INC(DI, p);
+  INC(DI, p);
+  [DS:DI] := AX;
+  AX := p;
+  [DS:SI] := AX
+END ChainInsert;
+
+PROCEDURE ShiftEntry(shiftBy : INTEGER); NEAR;
+USES CX;
+BEGIN
+  AX := [DS:DI];
+  IF AX = NoPos THEN
+    RETURN
+  END;
+  IF AX < shiftBy THEN
+    AX := NoPos
+  ELSE
+    DEC(AX, shiftBy)
+  END;
+  [DS:DI] := AX
+END ShiftEntry;
+
+PROCEDURE ShiftChains(shiftBy : INTEGER; keep : INTEGER); NEAR;
+BEGIN
+  DI := ADR(lastPos);
+  CX := 256;
+  WHILE CX # 0 DO
+    ShiftEntry(shiftBy);
+    INC(DI, 2);
+    DEC(CX)
+  END;
+  CX := 0;
+  DI := ADR(prevPos);
+  WHILE CX < keep DO
+    ShiftEntry(shiftBy);
+    INC(DI, 2);
+    INC(CX)
+  END
+END ShiftChains;
+
+PROCEDURE RebuildChains(); NEAR;
+BEGIN
+  SI := ADR(lastPos);
+  CX := 256;
+  WHILE CX # 0 DO
+    AX := NoPos;
+    [DS:SI] := AX;
+    INC(SI, 2);
+    DEC(CX)
+  END;
+  CX := 0;
+  WHILE CX < pos DO
+    ChainInsert(CX);
+    INC(CX)
+  END
+END RebuildChains;
+
+PROCEDURE Refill(inFp : WORD); NEAR;
+USES ES;
+VAR shiftBy, keep, room, lookahead : INTEGER;
+BEGIN
+  IF pos > WindowSize THEN
+    room := BufCap - bufFill;
+    IF room < BufIo THEN
+      shiftBy := pos - WindowSize;
+      keep := bufFill - shiftBy;
+      SI := ADR(buf);
+      INC(SI, shiftBy);
+      DI := ADR(buf);
+      CX := keep;
+      PUSH(DS);
+      POP(ES);
+      ASM
+        cld
+        rep movsb
+      END;
+      bufFill := keep;
+      pos := WindowSize;
+      ShiftChains(shiftBy, keep)
+    END
+  END;
+  IF inAtEof THEN
+    RETURN
+  END;
+  lookahead := bufFill - pos;
+  WHILE lookahead < MaxMatch DO
+    room := BufCap - bufFill;
+    IF room > BufIo THEN
+      room := BufIo
+    END;
+    IF room = 0 THEN
+      RETURN
+    END;
+    DI := ADR(buf);
+    INC(DI, bufFill);
+    BX := BlockRead(inFp, DI, room);
+    IF BX = 0 THEN
+      inAtEof := TRUE;
+      RETURN
+    END;
+    INC(bufFill, BX);
+    lookahead := bufFill - pos
+  END
+END Refill;
+
+PROCEDURE FindMatch(); NEAR;
+VAR len, avail, maxLen, chainLeft : INTEGER;
+BEGIN
+  avail := bufFill - pos;
+  maxLen := MaxMatch;
+  IF avail < maxLen THEN
+    maxLen := avail
+  END;
+  DX := 0;
+  BX := 0;
+  SI := ADR(buf);
+  INC(SI, pos);
+  AL := [DS:SI];
+  AH := 0;
+  DI := ADR(lastPos);
+  INC(DI, AX);
+  INC(DI, AX);
+  CX := [DS:DI];
+  chainLeft := MaxChain;
+  WHILE CX # NoPos DO
+    avail := pos - CX;
+    IF avail <= WindowSize THEN
+      DI := ADR(buf);
+      INC(DI, CX);
+      PUSH(SI, DI, BX);
+      len := 0;
+      WHILE len < maxLen DO
+        AL := [DS:SI];
+        BL := [DS:DI];
+        IF AL # BL THEN BREAK END;
+        INC(SI);
+        INC(DI);
+        INC(len)
+      END;
+      POP(SI, DI, BX);
+      IF len >= MinMatch THEN
+        IF len > BX THEN
+          DX := pos - CX;
+          BX := len;
+          IF len = MaxMatch THEN
+            CX := NoPos;
+            chainLeft := 1
+          END
+        END
+      END
+    END;
+    DEC(chainLeft);
+    IF chainLeft = 0 THEN
+      CX := NoPos
+    ELSE
+      IF CX # NoPos THEN
+        DI := ADR(prevPos);
+        INC(DI, CX);
+        INC(DI, CX);
+        CX := [DS:DI]
+      END
+    END
+  END;
+  matchOff := DX;
+  matchLen := BX
+END FindMatch;
+
+(* lzss_compress_fp*/lzss_decompress_fp*: same compress/decompress core as
+   lzss_compress*/lzss_decompress* below, but operating on File records
+   the CALLER has already Reset/ReWrite'd (and still owns -- Close is
+   left to the caller too) instead of opening files by name itself. Same
+   convention as LZPLIB.SMD's own lzp_compress_fp*/lzp_decompress_fp*,
+   for the same reason (e.g. compressing one member's content inside a
+   larger file such as a tar archive, without a temp file). *)
+PROCEDURE lzss_compress_fp*(inFp, outFp : WORD); NEAR;
+VAR lit : BYTE;
+    oldPos : INTEGER;
+BEGIN
+  FileSize(inFp);
+  origSizeLo := AX;
+  origSizeHi := DX;
+  BlockWrite(outFp, ADR(origSizeLo), 2);
+  BlockWrite(outFp, ADR(origSizeHi), 2);
+  curByte := 0;
+  bitCount := 0;
+  bufFill := 0;
+  pos := 0;
+  inAtEof := FALSE;
+  RebuildChains();
+  Refill(inFp);
+  WHILE pos < bufFill DO
+    FindMatch();
+    oldPos := pos;
+    IF matchLen >= MinMatch THEN
+      BitWrite(outFp, 0);
+      BitWriteBits(outFp, matchOff - 1, OffsetBits);
+      BitWriteBits(outFp, matchLen - MinMatch, LengthBits);
+      INC(pos, matchLen)
+    ELSE
+      BitWrite(outFp, 1);
+      SI := ADR(buf);
+      INC(SI, pos);
+      AL := [DS:SI];
+      lit := AL;
+      BitWriteBits(outFp, lit, 8);
+      INC(pos)
+    END;
+    WHILE oldPos < pos DO
+      ChainInsert(oldPos);
+      INC(oldPos)
+    END;
+    Refill(inFp)
+  END;
+  BitFinish(outFp)
+END lzss_compress_fp;
+
+PROCEDURE OutByte(outFp : WORD; b : BYTE); NEAR;
+USES BX, CX;   (* WriteByte has no USES clause of its own, so it's free to
+  clobber BX/CX/etc internally (AddPairWord/NextPage's own scratch) --
+  Decompress's own match-copy loop keeps its remaining-length counter
+  live in CX across every OutByte call in that loop (a real bug this
+  exact split introduced: the original LZSS.SMD's own OutByte only
+  called BlockWrite once every BufIo=512 bytes via a staging outBuf, so
+  CX survived almost every call by luck; this split's own OutByte calls
+  WriteByte on EVERY byte, so the clobber fires on every match-copy
+  iteration -- confirmed via SAMPLE.OUT corruption, e.g. "is a test"
+  decoding to "ia test", one byte short mid-match). *)
+BEGIN
+  SI := ADR(win);
+  INC(SI, winPos);
+  [DS:SI] := b;
+  AX := winPos;
+  INC(AX);
+  IF AX = WindowSize THEN
+    AX := 0
+  END;
+  winPos := AX;
+  WriteByte(outFp, b);
+  IF remLo = 0 THEN
+    DEC(remHi)
+  END;
+  DEC(remLo);
+  IF remLo = 0 THEN
+    IF remHi = 0 THEN
+      remZero := TRUE
+    END
+  END
+END OutByte;
+
+PROCEDURE lzss_decompress_fp*(inFp, outFp : WORD) : BOOLEAN; NEAR;
+VAR flag : INTEGER;
+    byteVal : WORD;
+    offsetCode : WORD;
+    lengthCode : WORD;
+    offset : INTEGER;
+    length : INTEGER;
+    srcIdx : INTEGER;
+    b : BYTE;
+    bad : BOOLEAN;
+BEGIN
+  BlockRead(inFp, ADR(remLo), 2);
+  IF AX # 2 THEN
+    RETURN FALSE
+  END;
+  BlockRead(inFp, ADR(remHi), 2);
+  IF AX # 2 THEN
+    RETURN FALSE
+  END;
+  remZero := FALSE;
+  IF remLo = 0 THEN
+    IF remHi = 0 THEN
+      remZero := TRUE
+    END
+  END;
+  curByte := 0;
+  bitCount := 0;
+  winPos := 0;
+  bad := FALSE;
+  WHILE ~remZero DO
+    flag := BitReadBit(inFp);
+    IF flag < 0 THEN
+      bad := TRUE;
+      BREAK
+    END;
+    IF flag = 1 THEN
+      IF ~BitReadBits(inFp, 8, ADR(byteVal)) THEN
+        bad := TRUE;
+        BREAK
+      END;
+      b := byteVal;
+      OutByte(outFp, b)
+    ELSE
+      IF ~BitReadBits(inFp, OffsetBits, ADR(offsetCode)) THEN
+        bad := TRUE;
+        BREAK
+      END;
+      IF ~BitReadBits(inFp, LengthBits, ADR(lengthCode)) THEN
+        bad := TRUE;
+        BREAK
+      END;
+      offset := offsetCode + 1;
+      length := lengthCode + MinMatch;
+      CX := length;
+      WHILE CX # 0 DO
+        srcIdx := winPos - offset;
+        IF offset > winPos THEN
+          INC(srcIdx, WindowSize)
+        END;
+        SI := ADR(win);
+        INC(SI, srcIdx);
+        AL := [DS:SI];
+        OutByte(outFp, AL);
+        IF remZero THEN
+          BREAK
+        END
+        DEC(CX);
+      END
+    END
+  END;
+  AL := ~bad
+END lzss_decompress_fp;
+
+PROCEDURE lzss_compress*(infile, outfile : POINTER) : BOOLEAN; NEAR;
+VAR inH, outH : File;
+    inFp, outFp, nameOfs : WORD;
+BEGIN
+  inFp := ADR(inH);
+  DX:AX := infile; nameOfs := AX;
+  IF ~Reset(inFp, nameOfs) THEN RETURN FALSE END;
+  outFp := ADR(outH);
+  DX:AX := outfile; nameOfs := AX;
+  IF ~ReWrite(outFp, nameOfs) THEN Close(inFp); RETURN FALSE END;
+  lzss_compress_fp(inFp, outFp);
+  Close(inFp);
+  Close(outFp);
+  RETURN TRUE
+END lzss_compress;
+
+PROCEDURE lzss_decompress*(infile, outfile : POINTER) : BOOLEAN; NEAR;
+VAR inH, outH : File;
+    inFp, outFp, nameOfs : WORD;
+    ok : BOOLEAN;
+BEGIN
+  inFp := ADR(inH);
+  DX:AX := infile; nameOfs := AX;
+  IF ~Reset(inFp, nameOfs) THEN RETURN FALSE END;
+  outFp := ADR(outH);
+  DX:AX := outfile; nameOfs := AX;
+  IF ~ReWrite(outFp, nameOfs) THEN Close(inFp); RETURN FALSE END;
+  ok := lzss_decompress_fp(inFp, outFp);
+  Close(inFp);
+  Close(outFp);
+  RETURN ok
+END lzss_decompress;
+
+END LZSSLIB.

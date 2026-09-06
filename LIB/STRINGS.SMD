@@ -1,0 +1,59 @@
+MODULE STRINGS;
+
+PROCEDURE StrLen*(str : INTEGER) : INTEGER; NEAR;
+USES ES;
+BEGIN
+  BX := str;
+  DI := BX;
+  PUSH(DS); POP(ES);
+  CX := 0FFFFH;
+  AL := 0;
+  ASM
+    cld
+    repne scasb
+  END;
+  DEC(DI);
+  RETURN DI - BX
+END StrLen;
+
+PROCEDURE StrCopy*(src, dst : INTEGER); NEAR;
+USES ES;
+VAR n : INTEGER;
+BEGIN
+  n := StrLen(src);
+  SI := src;
+  DI := dst;
+  PUSH(DS); POP(ES);
+  CX := n;
+  INC(CX);
+  ASM
+    cld
+    rep movsb
+  END
+END StrCopy;
+
+PROCEDURE StrCat*(str, dst : INTEGER); NEAR;
+BEGIN
+  StrCopy(str, StrLen(dst) + dst)
+END StrCat;
+
+PROCEDURE StrEquals*(a, b : INTEGER) : BOOLEAN; NEAR;
+USES ES;
+BEGIN
+  StrLen(a);
+  PUSH(AX);
+  StrLen(a);
+  POP(BX);
+  IF AX # BX THEN RETURN FALSE END;
+  CX := AX + 1;
+  SI := a;
+  DI := b;
+  PUSH(DS); POP(ES);
+  ASM
+    cld
+    repe cmpsb
+  END;
+  IF ZFLAG THEN AX := TRUE ELSE AX := FALSE END
+END StrEquals;
+
+END STRINGS.

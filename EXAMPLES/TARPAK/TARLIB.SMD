@@ -1,0 +1,189 @@
+(* USTAR tar header parsing/building, shared by TARPAK.SMD/TARUNPAK.SMD.
+   No IMPORT of its own, same convention as EXAMPLES/LZSS/LZPLIB.SMD:
+   relies on the caller already having IMPORTed SYSTEM/FILES/OUT ahead
+   of TARLIB in its own IMPORT list.
+
+   USTAR header layout (DOCS -- POSIX ustar, 512 bytes total):
+     name[100] mode[8] uid[8] gid[8] size[12] mtime[12] chksum[8]
+     typeflag[1] linkname[100] magic[6] version[2] uname[32] gname[32]
+     devmajor[8] devminor[8] prefix[155] pad[12]
+   size/mode/uid/gid/mtime/chksum are octal ASCII, NUL or space
+   terminated/padded. Content is padded to a 512-byte boundary; the
+   archive ends with two consecutive all-zero 512-byte blocks.
+
+   Member sizes are a genuine LONGINT (32-bit) pair here (DOCS/TRBUG.MD)
+   -- ParseOctal*/FormatOctal* both work in lo/hi WORD pairs (register-
+   pair MOVES, DOCS/SPHINX.MD S11: SPHINX has no native 32-bit
+   arithmetic), matching LZPLIB.SMD's own lzp_compress_fp*/
+   lzp_decompress_fp* LONGINT limit/size. BlockRead/BlockWrite
+   themselves are still WORD-per-call (their own len parameter), so a
+   member's content is still copied/(de)compressed CopyChunk-sized
+   piece at a time either way -- only the per-member TOTAL size
+   tracking is now a real 32-bit value, not truncated to 16 bits. *)
+MODULE TARLIB;
+
+CONST
+  BlockSize = 512;
+  ChksumOfs = 148;   (* byte offset of TarHeader.chksum within the 512-
+    byte header -- name[100]+mode[8]+uid[8]+gid[8]+size[12]+mtime[12] =
+    100+8+8+8+12+12 = 148. Hardcoded rather than derived from ADR() of
+    a RECORD field, since ADR() only accepts a real [seg:base].Type.field
+    memory operand (an actual instance), not a bare type-relative
+    offset (DOCS/SPHINX.MD's own ADR() entry) -- USTAR's own layout is
+    fixed, so this never needs to track a TarHeader field reorder. *)
+
+TYPE
+  TarHeader* = RECORD
+    name     : BYTE[100];
+    mode     : BYTE[8];
+    uid      : BYTE[8];
+    gid      : BYTE[8];
+    size     : BYTE[12];
+    mtime    : BYTE[12];
+    chksum   : BYTE[8];
+    typeflag : BYTE;
+    linkname : BYTE[100];
+    magic    : BYTE[6];
+    version  : BYTE[2];
+    uname    : BYTE[32];
+    gname    : BYTE[32];
+    devmajor : BYTE[8];
+    devminor : BYTE[8];
+    prefix   : BYTE[155];
+    pad      : BYTE[12]
+  END;
+
+(* IsZeroBlock*: TRUE if all BlockSize bytes at ptr are zero -- the
+   end-of-archive marker (two of these in a row) and also used to
+   detect EOF-of-archive on a short/final read. *)
+PROCEDURE IsZeroBlock*(ptr : WORD) : BOOLEAN; NEAR;
+USES SI;
+VAR i : WORD; c : BYTE;
+BEGIN
+  SI := ptr;
+  i := 0;
+  WHILE i < BlockSize DO
+    c := [DS:SI];
+    IF c # 0 THEN RETURN FALSE END;
+    INC(SI);
+    INC(i)
+  END;
+  RETURN TRUE
+END IsZeroBlock;
+
+(* ParseOctal*: parse an up-to-len-byte octal ASCII field (NUL or space
+   terminated/padded, as USTAR writes it) starting at ptr, into a
+   genuine LONGINT (lo/hi WORD pair, RETURNed as DX:AX -- register-pair
+   convention, DOCS/SPHINX.MD S11). Stops at the first non-octal-digit
+   byte or after len bytes, whichever comes first. Shifting a lo/hi
+   pair left by 3 bits (SHL 3) each digit: the 3 bits shifted OUT of
+   lo's own top become lo's own current top 3 bits shifted right by
+   13 (WORD-lo SHR (16-3)) into hi's own bottom, same "carry via a
+   second shift the opposite direction" idiom LZSSLIB.SMD's own
+   register-pair helpers already use elsewhere in this tree. *)
+PROCEDURE ParseOctal*(ptr : WORD; len : WORD) : LONGINT; NEAR;
+USES SI;
+VAR i, digit, nLo, nHi, carry : WORD; c : BYTE;
+BEGIN
+  SI := ptr;
+  i := 0;
+  nLo := 0; nHi := 0;
+  WHILE i < len DO
+    c := [DS:SI];
+    IF c < '0' THEN BREAK END;
+    IF c > '7' THEN BREAK END;
+    digit := c;
+    DEC(digit, '0');
+    AX := nLo;
+    CL := 13;
+    AX := AX SHR CL;
+    carry := AX;
+    CL := 3;
+    nLo := nLo SHL CL;
+    nHi := nHi SHL CL;
+    INC(nHi, carry);
+    INC(nLo, digit);
+    INC(SI);
+    INC(i)
+  END;
+  AX := nLo; DX := nHi;
+  RETURN DX:AX
+END ParseOctal;
+
+(* FormatOctal*: write val (a genuine LONGINT lo/hi pair) as an
+   (len-1)-digit zero-padded octal field at ptr, followed by a
+   trailing NUL in the field's own last byte (matching how GNU/POSIX
+   tar itself terminates the size field) -- len is the field's own
+   full width (e.g. 12 for the size field), so len-1 octal digits are
+   actually written. Shifting the lo/hi pair right by 3 bits each
+   digit: hi's own bottom 3 bits shifted out become lo's own new top 3
+   bits (via hi SHL 13, the opposite-direction counterpart to
+   ParseOctal's own carry above), same register-pair SHR idiom. *)
+PROCEDURE FormatOctal*(ptr : WORD; len : WORD; valLo, valHi : WORD); NEAR;
+USES SI;
+VAR i, ndigits, pos, carry : WORD; digit : BYTE;
+BEGIN
+  ndigits := len;
+  DEC(ndigits);
+  SI := ptr;
+  INC(SI, ndigits);
+  AL := 0;
+  [DS:SI] := AL;
+  pos := ndigits;
+  WHILE pos > 0 DO
+    DEC(pos);
+    digit := valLo;
+    digit := digit & 7;
+    AL := digit;
+    INC(AL, '0');
+    SI := ptr;
+    INC(SI, pos);
+    [DS:SI] := AL;
+    AX := valHi;
+    CL := 13;
+    AX := AX SHL CL;
+    carry := AX;
+    CL := 3;
+    valLo := valLo SHR CL;
+    valHi := valHi SHR CL;
+    valLo := valLo OR carry
+  END
+END FormatOctal;
+
+(* HeaderChecksum*: sum of all 512 header bytes, with the chksum field
+   itself (8 bytes) treated as ASCII spaces for the purpose of the sum
+   (USTAR's own defined algorithm) -- returned as a plain WORD (the
+   real sum never exceeds 512*255=130560, but only the low 16 bits are
+   ever compared/stored here, matching every other WORD-only value in
+   this file; TarHeader.chksum's own 6-digit octal field can represent
+   up to 262143 unsigned, well past what a real 512-byte header sums
+   to, so the WORD truncation never actually loses information for a
+   genuine header). *)
+PROCEDURE HeaderChecksum*(hdrPtr : WORD) : WORD; NEAR;
+USES SI;
+VAR i, sum, chkEnd : WORD; c : BYTE;
+BEGIN
+  chkEnd := ChksumOfs;
+  INC(chkEnd, 8);
+  sum := 0;
+  SI := hdrPtr;
+  i := 0;
+  WHILE i < BlockSize DO
+    IF i >= ChksumOfs THEN
+      IF i < chkEnd THEN
+        INC(sum, 32)   (* ' ' *)
+      ELSE
+        c := [DS:SI];
+        INC(sum, c)
+      END
+    ELSE
+      c := [DS:SI];
+      INC(sum, c)
+    END;
+    INC(SI);
+    INC(i)
+  END;
+  RETURN sum
+END HeaderChecksum;
+
+END TARLIB.

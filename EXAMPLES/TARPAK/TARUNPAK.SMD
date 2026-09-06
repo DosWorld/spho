@@ -1,0 +1,268 @@
+(* TARUNPAK - inverse of TARPAK.SMD: read a tar file whose regular-file
+   members were compressed by TARPAK (via LZPLIB.SMD's own LZP format),
+   write a structurally similar tar file with each such member's
+   content decompressed back via lzp_decompress_fp*. Non-regular
+   entries and zero-length regular files pass through byte-for-byte
+   unchanged, same as TARPAK's own pass-through path.
+
+   Usage: TARUNPAK in.tar out.tar
+
+   Same header-size-known-only-after-the-fact problem as TARPAK, same
+   fix: write a placeholder header, decompress straight into the
+   output (advancing its cursor), then Seek back to patch size+chksum
+   with the real (decompressed) values, then Seek forward again.
+
+   Same genuine LONGINT (lo/hi WORD pair) member-size tracking as
+   TARPAK.SMD/TARLIB.SMD -- see their own header comments (DOCS/
+   TRBUG.MD). Output is written to a NEW file (outName) -- only that
+   file is ever created. *)
+
+MODULE TARUNPAK;
+
+IMPORT SYSTEM, FILES, OUT, TARLIB, LZPLIB;
+
+CONST
+  MaxName = 128;
+  CopyChunk = 512;
+
+VAR
+  inName, outName : BYTE[MaxName];
+  cmdIdx, cmdTailLen : INTEGER;
+
+  inF, outF : File;
+  hdr : TarHeader;
+  zeroBlock : BYTE[512];
+  copyBuf : BYTE[CopyChunk];
+
+  n : WORD;
+  typeflag : BYTE;
+  isRegular : BOOLEAN;
+  done : BOOLEAN;
+  storedLo, storedHi, realLo, realHi : WORD;
+  curLo, curHi, chk : WORD;
+  headerPos, curPos : LONGINT;
+  ok : BOOLEAN;
+  outFp : WORD;
+
+PROCEDURE SkipBlanks(); NEAR;
+BEGIN
+  WHILE cmdIdx <= cmdTailLen DO
+    BX := 80H + cmdIdx;
+    AL := [ES:BX];
+    IF AL = Space THEN INC(cmdIdx)
+    ELSIF AL = Tab THEN INC(cmdIdx)
+    ELSE BREAK END
+  END
+END SkipBlanks;
+
+PROCEDURE GetToken(dst : INTEGER) : BOOLEAN; NEAR;
+VAR cnt : INTEGER; c : BYTE; maxNameM1 : INTEGER;
+BEGIN
+  maxNameM1 := MaxName - 1;
+  IF cmdIdx > cmdTailLen THEN RETURN FALSE END;
+  BX := 80H + cmdIdx;
+  c := [ES:BX];
+  IF c = CR THEN RETURN FALSE END;
+  cnt := 0;
+  WHILE cmdIdx <= cmdTailLen DO
+    BX := 80H + cmdIdx;
+    c := [ES:BX];
+    IF c = Space THEN BREAK END;
+    IF c = Tab THEN BREAK END;
+    IF c = CR THEN BREAK END;
+    IF cnt < maxNameM1 THEN
+      SI := dst; INC(SI, cnt); [DS:SI] := c; INC(cnt)
+    END;
+    INC(cmdIdx)
+  END;
+  SI := dst; INC(SI, cnt); AL := 0; [DS:SI] := AL;
+  RETURN cnt > 0
+END GetToken;
+
+PROCEDURE ParseCmdLine() : BOOLEAN; NEAR;
+USES ES;
+BEGIN
+  GetPSP();
+  ES := AX;
+  BX := 80H;
+  AL := [ES:BX];
+  cmdTailLen := AL;
+  cmdIdx := 1;
+  SkipBlanks();
+  IF ~GetToken(ADR(inName)) THEN RETURN FALSE END;
+  SkipBlanks();
+  IF ~GetToken(ADR(outName)) THEN RETURN FALSE END;
+  RETURN TRUE
+END ParseCmdLine;
+
+PROCEDURE Error(msg : WORD); NEAR;
+BEGIN
+  Out_String(msg); Out_Ln; Halt(1)
+END Error;
+
+(* Same "only the low 9 bits of len matter" note as TARPAK.SMD's own
+   PadTo512 -- lenHi taken only for a uniform lo/hi call signature. *)
+PROCEDURE PadTo512(fp : WORD; lenLo, lenHi : WORD); NEAR;
+VAR rem, need : WORD;
+BEGIN
+  rem := lenLo;
+  rem := rem & 511;
+  IF rem = 0 THEN RETURN END;
+  need := 512;
+  DEC(need, rem);
+  BlockWrite(fp, ADR(zeroBlock), need)
+END PadTo512;
+
+PROCEDURE SkipTo512(fp : WORD; lenLo, lenHi : WORD); NEAR;
+VAR rem, need, newLo, newHi : WORD; newPos : LONGINT;
+BEGIN
+  rem := lenLo;
+  rem := rem & 511;
+  IF rem = 0 THEN RETURN END;
+  need := 512;
+  DEC(need, rem);
+  FilePos(fp);
+  newLo := AX; newHi := DX;
+  INC(newLo, need);
+  IF CFLAG THEN INC(newHi) END;
+  AX := newLo; DX := newHi;
+  newPos := DX:AX;
+  DX:AX := newPos;
+  Seek(fp, DX:AX)
+END SkipTo512;
+
+(* CopyRaw: same genuine-LONGINT-len, borrow-decrement pattern as
+   TARPAK.SMD's own CopyRaw (DOCS/TRBUG.MD). *)
+PROCEDURE CopyRaw(lenLo, lenHi : WORD); NEAR;
+VAR remLo, remHi, want, got : WORD; remZero : BOOLEAN;
+BEGIN
+  remLo := lenLo; remHi := lenHi;
+  remZero := FALSE;
+  IF remLo = 0 THEN
+    IF remHi = 0 THEN remZero := TRUE END
+  END;
+  WHILE ~remZero DO
+    want := CopyChunk;
+    IF remHi = 0 THEN
+      IF want > remLo THEN want := remLo END
+    END;
+    got := BlockRead(ADR(inF), ADR(copyBuf), want);
+    IF got = 0 THEN RETURN END;
+    BlockWrite(ADR(outF), ADR(copyBuf), got);
+    AX := remLo;
+    DEC(AX, got);
+    IF CFLAG THEN DEC(remHi) END;
+    remLo := AX;
+    remZero := FALSE;
+    IF remLo = 0 THEN
+      IF remHi = 0 THEN remZero := TRUE END
+    END
+  END
+END CopyRaw;
+
+(* IsLongZero: same helper as TARPAK.SMD's own (DOCS/SPHINX.MD S7.4:
+   no assignable &/OR boolean expression, so this nested-IF form is the
+   idiom, not a one-liner). *)
+PROCEDURE IsLongZero(lo, hi : WORD) : BOOLEAN; NEAR;
+BEGIN
+  IF lo = 0 THEN
+    IF hi = 0 THEN RETURN TRUE END
+  END;
+  RETURN FALSE
+END IsLongZero;
+
+PROCEDURE ClearChksumField(); NEAR;
+VAR i : WORD;
+BEGIN
+  BX := ADR(hdr);
+  SI := ADR([DS:BX].TarHeader.chksum);
+  i := 0;
+  WHILE i < 8 DO
+    AL := 32;
+    [DS:SI] := AL;
+    INC(SI);
+    INC(i)
+  END
+END ClearChksumField;
+
+BEGIN
+  IF ~ParseCmdLine() THEN Error("usage: TARUNPAK in.tar out.tar") END;
+  IF ~Reset(ADR(inF), ADR(inName)) THEN Error("cannot open input tar") END;
+  IF ~ReWrite(ADR(outF), ADR(outName)) THEN Error("cannot create output tar") END;
+
+  AL := 0;
+  DI := ADR(zeroBlock);
+  CX := 512;
+  PUSH(DS);
+  POP(ES);
+  ASM
+    cld
+    rep stosb
+  END;
+
+  done := FALSE;
+  WHILE ~done DO
+    n := BlockRead(ADR(inF), ADR(hdr), 512);
+    IF n < 512 THEN done := TRUE; BREAK END;
+    IF IsZeroBlock(ADR(hdr)) THEN done := TRUE; BREAK END;
+
+    BX := ADR(hdr);
+    typeflag := [DS:BX].TarHeader.typeflag;
+    BX := ADR(hdr);
+    DX:AX := ParseOctal(ADR([DS:BX].TarHeader.size), 12);
+    storedLo := AX; storedHi := DX;
+
+    headerPos := FilePos(ADR(outF));
+    BlockWrite(ADR(outF), ADR(hdr), 512);
+
+    isRegular := FALSE;
+    IF typeflag = 0 THEN isRegular := TRUE END;
+    IF typeflag = '0' THEN isRegular := TRUE END;
+
+    IF isRegular THEN
+      IF ~IsLongZero(storedLo, storedHi) THEN
+        curPos := FilePos(ADR(outF));
+        curLo := AX; curHi := DX;
+        ok := lzp_decompress_fp(ADR(inF), ADR(outF));
+        IF ~ok THEN Error("corrupt LZP stream in tar member") END;
+        curPos := FilePos(ADR(outF));
+        realLo := AX; realHi := DX;
+        AX := realLo; DEC(AX, curLo);
+        IF CFLAG THEN DEC(realHi) END;
+        realLo := AX;
+        DEC(realHi, curHi);
+        PadTo512(ADR(outF), realLo, realHi);
+
+        curPos := FilePos(ADR(outF));
+
+        outFp := ADR(outF);
+        DX:AX := headerPos;
+        Seek(outFp, DX:AX);
+        BX := ADR(hdr);
+        FormatOctal(ADR([DS:BX].TarHeader.size), 12, realLo, realHi);
+        ClearChksumField();
+        chk := HeaderChecksum(ADR(hdr));
+        BX := ADR(hdr);
+        FormatOctal(ADR([DS:BX].TarHeader.chksum), 8, chk, 0);
+        BlockWrite(ADR(outF), ADR(hdr), 512);
+
+        DX:AX := curPos;
+        Seek(outFp, DX:AX);
+        SkipTo512(ADR(inF), storedLo, storedHi)
+      END
+    ELSE
+      IF ~IsLongZero(storedLo, storedHi) THEN
+        CopyRaw(storedLo, storedHi);
+        PadTo512(ADR(outF), storedLo, storedHi);
+        SkipTo512(ADR(inF), storedLo, storedHi)
+      END
+    END
+  END;
+
+  BlockWrite(ADR(outF), ADR(zeroBlock), 512);
+  BlockWrite(ADR(outF), ADR(zeroBlock), 512);
+
+  Close(ADR(inF));
+  Close(ADR(outF));
+  Halt(0)
+END TARUNPAK.

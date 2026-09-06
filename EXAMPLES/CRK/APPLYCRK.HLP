@@ -1,0 +1,10 @@
+APPLYCRK - apply patches from a .CRK file.
+DosWorld 2026, https://github.com/DosWorld/
+
+  usage:
+
+  APPLYCRK file.crk     list crk patches from file
+  APPLYCRK file.crk +N  apply patch N (write the cracked byte)
+  APPLYCRK file.crk -N  revert patch N to its original bytes
+
+

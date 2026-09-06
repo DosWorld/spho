@@ -1,0 +1,870 @@
+MODULE SMDFMT;
+
+(* smdfmt -- comment stripper / re-indenter for SPHINX Oberon source
+   files. Usage (translate with SPHO.EXE SMDFMT.SMD -> SMDFMT.ASM,
+   assemble/link into SMDFMT.EXE): "SMDFMT.EXE IN.SMD OUT.SMD".
+
+   Streams the input file byte-by-byte via LIB/READER.SMD's own buffered
+   ReadByte (inReader, a BufferedFile -- ReadOneByte below is a thin
+   shim over it, keeping its own "0 means EOF" contract for the rest of
+   this file's callers unchanged even though ReadByte's own EOF signal
+   is -1) and writes formatted output byte-by-byte the same way, via
+   READER's WriteByte (outWriter, another BufferedFile) directly at
+   every call site -- both replace this file's former standalone
+   inChunkBuf/outChunkBuf pair and their own BlockRead/BlockWrite calls,
+   the same buffered-I/O plumbing LCOUNT.SMD and the CRK tools now
+   share too. No buffer ever holds the whole file: comment-stripping and
+   re-indenting run as ONE pass over the input's own token stream,
+   each token classified and re-emitted (with fresh whitespace/
+   indentation) as soon as it's known, not after building up a
+   full-file copy first. The only "lookahead" state is a short
+   fixed-size word buffer (wordBuf, MaxWord bytes) used to accumulate
+   one identifier/keyword at a time for keyword matching, plus a small
+   number of BOOLEAN/INTEGER flags (nesting depth, are we inside a
+   "..."/'...' literal or a comment, etc.) -- none of it proportional
+   to the file's own size, so there is no cap on how large a file this
+   tool can format.
+
+   NextByte() is the single byte source everything else reads from: it
+   pulls raw bytes off the input stream via ReadOneByte and transparently
+   skips comment spans (paren-star block comments -- non-nesting, closes
+   on the first star-paren exactly like SPHO.MOD's own scanner,
+   DOCS/SPHINX.MD's own "Few notes" -- and // line comments), while
+   protecting "..."/'...' string/char literal spans (a "//" or "(*"
+   appearing inside literal text is just literal content, never a
+   comment opener -- mirroring DOCS/SPHINX.MD S3.3's own literal rules:
+   a '...' literal is always exactly one character, so it can't itself
+   contain an unescaped closing quote; a "..." literal can't contain
+   '"'; neither has an escape mechanism, so watching for the matching
+   delimiter is exact, not a heuristic). Every caller downstream (the
+   main Format loop) only ever sees already-comment-free bytes.
+
+   Format (the main loop) classifies each byte NextByte() returns the
+   same way the old buffer-based version did -- '"'/"'" start a literal
+   copied verbatim to its own close quote, whitespace collapses to at
+   most one space between tokens (or is dropped outright right after a
+   fresh indent), an identifier/keyword accumulates into wordBuf and is
+   matched against the keyword table, ';' starts a fresh output line --
+   but every decision that used to peek at a fixed buffer offset now
+   either consumes NextByte() on the spot or defers via a small piece
+   of state carried forward to the next iteration. The trickiest of
+   these is END's own glue-vs-break decision (DOCS/SPHINX.MD S8: "END;"/
+   "END."/"END Name;"/"END Name." must always stay on one line; a bare
+   END with a genuinely new statement after it, e.g. LCOUNT.SMD's own
+   "...BREAK END\n INC(BX);", must not) -- this used to peek forward
+   past whitespace to the next real character in the old buffer-based
+   version; streamed, EmitEnd does the same peek directly against
+   GetByte itself (consuming whitespace as it goes -- costs nothing,
+   since it would only ever have collapsed to a single separator
+   either way) and decides the moment the next non-whitespace byte's
+   own class is known: ';'/'.' always glue, so does a bare
+   procBodyDepth-closing END regardless of what follows (a PROCEDURE/
+   MODULE close is always Name;/Name. in real SPHINX source), everything
+   else forces the fresh line.
+
+   ASM...END (DOCS/SPHINX.MD S12) is handled by a dedicated verbatim
+   copy loop (CopyAsmBody) that reads NextByte() and writes it straight
+   through unchanged (own newlines preserved -- real NASM syntax, not
+   reflowable SPHINX structure) until a line whose first word is END,
+   mirroring SPHO.PAS's OWN ParseAsm (SRC/SPHO.PAS) doing the same raw
+   copy-until-END-line for the identical reason.
+
+   This is a line-based approximation, not a real parser: it gets
+   ordinary SPHINX Oberon source (as everything under EXAMPLES/ and
+   TESTS/ already looks) right, not every conceivable layout. *)
+
+IMPORT SYSTEM, FILES, OUT;
+
+CONST
+  IndentStep = 2;        (* spaces per indent level -- the tool's one
+                             internal formatting knob *)
+  MaxName  = 128;
+  MaxWord  = 32;          (* longest identifier/keyword prefix tracked
+                              for keyword matching -- comfortably longer
+                              than "PROCEDURE" (9), the longest keyword
+                              this tool matches; a longer real
+                              identifier just streams its own extra
+                              bytes straight through once MaxWord is
+                              reached (see Format's own wordOverflowed
+                              handling) *)
+  Quote  = 22H;           (* " *)
+  Apos   = 27H;           (* ' *)
+  Semi   = 3BH;           (* ; *)
+  Dot    = 2EH;           (* . *)
+
+VAR
+  inName  : BYTE[MaxName];
+  outName : BYTE[MaxName];
+
+  inReader  : File;            (* READER's own buffered-read state,
+                                  replacing this file's former standalone
+                                  inChunkBuf/inChunkLen/inChunkPos *)
+  outWriter : File;            (* READER's own buffered-write state,
+                                  replacing this file's former standalone
+                                  outChunkBuf/outChunkLen *)
+
+  wordBuf : BYTE[MaxWord];
+  wordLen : INTEGER;
+
+  _kwEND   : BYTE[] = "END";
+  _kwELSE  : BYTE[] = "ELSE";
+  _kwELSIF : BYTE[] = "ELSIF";
+  _kwBEGIN : BYTE[] = "BEGIN";
+  _kwRECORD: BYTE[] = "RECORD";
+  _kwTHEN  : BYTE[] = "THEN";
+  _kwDO    : BYTE[] = "DO";
+  _kwASM   : BYTE[] = "ASM";
+  _kwMODULE: BYTE[] = "MODULE";
+  _kwIMPORT: BYTE[] = "IMPORT";
+  _kwPROC  : BYTE[] = "PROCEDURE";
+  _kwCONST : BYTE[] = "CONST";
+  _kwTYPE  : BYTE[] = "TYPE";
+  _kwVAR   : BYTE[] = "VAR";
+
+  (* NextByte's own comment/literal-tracking state, module-level since
+     both NextByte and CopyAsmBody's own raw reads share the same
+     underlying byte source. *)
+  inString : BOOLEAN;
+  inChar   : BOOLEAN;
+  inBlock  : BOOLEAN;
+  inLine   : BOOLEAN;
+  pushedBack : BOOLEAN;
+  pushback   : BYTE;
+
+  (* Format's own formatting state -- see Format's own header comment. *)
+  depth : INTEGER;
+  atLineStart : BOOLEAN;
+  pendingSpace : BOOLEAN;
+  pendingBlank : BOOLEAN;
+  procBodyDepth : INTEGER;
+  justClosedProc : BOOLEAN;
+  inProcHeader : BOOLEAN;
+  lastWasBlank : BOOLEAN;  (* TRUE right after a blank output line was
+                              actually written -- guards every
+                              pendingBlank-setting site so two
+                              independent rules wanting a blank line at
+                              the same spot (e.g. IMPORT's own trailing
+                              blank and CONST's own leading blank)
+                              still produce only ONE. *)
+
+  (* GetByte's own pushback queue -- a small FIFO (front-to-back drain
+     via ungetPos) big enough to hold one whole re-queued keyword
+     (CopyAsmBody's own use, handing "END" back in full once matched).
+     ungetLen is how many bytes are queued; ungetPos is how many of
+     those have already been drained. *)
+  ungetBuf : BYTE[MaxWord];
+  ungetLen : INTEGER;
+  ungetPos : INTEGER;
+
+(* ---- small char classifiers, own copies (STRINGS.SMD is known to
+   fail translation, DOCS/SPHO.MD -- kept independent, same as
+   LCOUNT.SMD's own IsBlank/IsNameEnd do) ---- *)
+
+PROCEDURE IsSpaceOrTab(c : BYTE) : BOOLEAN; NEAR;
+BEGIN
+  IF c = Space THEN AL := TRUE
+  ELSIF c = Tab THEN AL := TRUE
+  ELSE AL := FALSE
+  END
+END IsSpaceOrTab;
+
+PROCEDURE IsIdentChar(c : BYTE) : BOOLEAN; NEAR;
+BEGIN
+  IF c = 95 THEN RETURN TRUE END;                   (* '_' *)
+  IF c >= 30H THEN
+    IF c <= 39H THEN RETURN TRUE END                (* '0'..'9' *)
+  END;
+  IF c >= 41H THEN
+    IF c <= 5AH THEN RETURN TRUE END                (* 'A'..'Z' *)
+  END;
+  IF c >= 61H THEN
+    IF c <= 7AH THEN RETURN TRUE END                (* 'a'..'z' *)
+  END;
+  RETURN FALSE
+END IsIdentChar;
+
+(* ---- streaming input ---- *)
+
+(* ReadOneByte: next raw byte off inReader, via READER.SMD's own
+   buffered ReadByte (replacing this file's former standalone
+   inChunkBuf/inChunkLen/inChunkPos and the BlockRead call here). Keeps
+   this procedure's own external contract unchanged -- 0 at EOF, same
+   convention every caller below (RawNextByte, NextByte, CopyAsmBody)
+   already assumes -- since ReadByte's own EOF signal is -1 (WORD,
+   AH<>0 once zero-extended), not 0, and real source text never
+   contains a literal NUL either way. *)
+PROCEDURE ReadOneByte(): BYTE; NEAR;
+BEGIN
+  ReadByte(ADR(inReader));
+  IF AH # 0 THEN RETURN 0 END
+END ReadOneByte;
+
+(* RawNextByte: ReadOneByte, but first drains a single pushed-back byte
+   if NextByte's own 2-char comment-opener/closer lookahead (paren-star,
+   slash-slash, or star-paren) peeked one byte too far and needs to
+   hand it back. *)
+PROCEDURE RawNextByte(): BYTE; NEAR;
+BEGIN
+  IF pushedBack THEN
+    pushedBack := FALSE;
+    RETURN pushback
+  END;
+  RETURN ReadOneByte()
+END RawNextByte;
+
+(* NextByte: the single comment-free byte source everything else reads
+   from. Tracks inString/inChar/inBlock/inLine exactly like the old
+   buffer-based StripComments did, but pulls one raw byte at a time via
+   RawNextByte instead of indexing a full-file copy; a comment span
+   (block or line) is silently consumed and skipped -- NextByte loops
+   internally until it has a real byte to return (or EOF, 0). Each
+   2-char opener/closer (paren-star, star-paren, slash-slash) is
+   detected via one byte of pushback (RawNextByte/pushedBack) so a
+   lone '(' or '*' or '/' that ISN'T followed by its own pairing byte
+   is still returned as itself, unconsumed by the (failed) lookahead. *)
+PROCEDURE NextByte(): BYTE; NEAR;
+VAR c : BYTE; c2 : BYTE; looping : BOOLEAN;
+BEGIN
+  looping := TRUE;
+  WHILE looping DO
+    c := RawNextByte();
+    IF c = 0 THEN RETURN 0 END;
+
+    IF inLine THEN
+      IF c = LF THEN inLine := FALSE; RETURN c END
+
+    ELSIF inBlock THEN
+      IF c = 42 THEN                       (* '*' -- maybe closes the block *)
+        c2 := RawNextByte();
+        IF c2 = 41 THEN                    (* ')' -- star-paren closes *)
+          inBlock := FALSE
+        ELSIF c2 # 0 THEN
+          pushback := c2; pushedBack := TRUE
+        END
+      END
+
+    ELSIF inString THEN
+      IF c = Quote THEN inString := FALSE END;
+      RETURN c
+
+    ELSIF inChar THEN
+      IF c = Apos THEN inChar := FALSE END;
+      RETURN c
+
+    ELSE
+      IF c = Quote THEN
+        inString := TRUE; RETURN c
+      ELSIF c = Apos THEN
+        inChar := TRUE; RETURN c
+      ELSIF c = 40 THEN                    (* '(' -- maybe opens a block comment *)
+        c2 := RawNextByte();
+        IF c2 = 42 THEN                    (* '*' -- "(*" opens *)
+          inBlock := TRUE
+        ELSE
+          IF c2 # 0 THEN pushback := c2; pushedBack := TRUE END;
+          RETURN c
+        END
+      ELSIF c = 47 THEN                    (* '/' -- maybe opens a line comment *)
+        c2 := RawNextByte();
+        IF c2 = 47 THEN                    (* '/' -- "//" opens *)
+          inLine := TRUE
+        ELSE
+          IF c2 # 0 THEN pushback := c2; pushedBack := TRUE END;
+          RETURN c
+        END
+      ELSE
+        RETURN c
+      END
+    END
+  END
+END NextByte;
+
+(* ---- streaming output ---- *)
+
+(* byte output now goes straight through READER.SMD's own WriteByte
+   (ADR(outWriter), b) at every call site below -- outWriter's own
+   buffered write-through/flush-on-close replaces this file's former
+   standalone outChunkBuf/outChunkLen/WriteOneByte/FlushOut. *)
+
+PROCEDURE WriteWord(kw : INTEGER; kwLen : INTEGER); NEAR;
+VAR j : INTEGER; c : BYTE;
+BEGIN
+  j := 0;
+  WHILE j < kwLen DO
+    SI := kw; INC(SI, j);
+    c := [DS:SI];
+    WriteByte(ADR(outWriter),c);
+    INC(j)
+  END
+END WriteWord;
+
+PROCEDURE EmitIndent(d : INTEGER); NEAR;
+VAR n : INTEGER;
+BEGIN
+  n := d * IndentStep;
+  WHILE n > 0 DO
+    WriteByte(ADR(outWriter),Space);
+    DEC(n)
+  END
+END EmitIndent;
+
+(* ---- keyword matching against wordBuf ---- *)
+
+(* WordIs: TRUE if wordBuf[0..wordLen) is exactly the given keyword
+   (case-sensitive, matching this codebase's own all-uppercase keyword
+   style -- SPHO.PAS's own keyword table is case-insensitive, but every
+   real .SMD file here already writes keywords uppercase, so an exact
+   match is enough and avoids needing a case-fold helper). *)
+PROCEDURE WordIs(kw : INTEGER; kwLen : INTEGER) : BOOLEAN; NEAR;
+VAR j : INTEGER; a : BYTE; b : BYTE;
+BEGIN
+  IF wordLen # kwLen THEN RETURN FALSE END;
+  j := 0;
+  WHILE j < kwLen DO
+    SI := ADR(wordBuf); INC(SI, j);
+    a := [DS:SI];
+    SI := kw; INC(SI, j);
+    b := [DS:SI];
+    IF a # b THEN RETURN FALSE END;
+    INC(j)
+  END;
+  RETURN TRUE
+END WordIs;
+
+(* ---- ASM...END verbatim copy ---- *)
+
+(* PushBackWord: re-queue buf[0..len) so the next len GetByte() calls
+   return exactly those bytes, in order, before any fresh byte from
+   NextByte. Used by CopyAsmBody to hand a fully-scanned "END" back to
+   the caller's own normal word-scan once matched, since a keyword's
+   full text (not just one byte) needs handing back -- an ordinary
+   1-byte pushback can't do that. *)
+PROCEDURE PushBackWord(buf : INTEGER; len : INTEGER); NEAR;
+VAR j : INTEGER; c : BYTE;
+BEGIN
+  j := 0;
+  WHILE j < len DO
+    SI := buf; INC(SI, j);
+    c := [DS:SI];
+    SI := ADR(ungetBuf); INC(SI, j);
+    [DS:SI] := c;
+    INC(j)
+  END;
+  ungetLen := len;
+  ungetPos := 0
+END PushBackWord;
+
+(* CopyAsmBody: copy NextByte()'s own raw stream straight through,
+   unchanged (own newlines preserved), until a line whose first word
+   is END -- mirrors SRC/SPHO.PAS's own ParseAsm exactly (same
+   "verbatim until an END-led line" rule). Once matched, re-queues
+   "END" in full via PushBackWord so the caller's normal token dispatch
+   reads it the ordinary way on its very next GetByte()-driven word
+   scan, the same as any other identifier. *)
+PROCEDURE CopyAsmBody(); NEAR;
+VAR c : BYTE; atBOL : BOOLEAN; scanLen : INTEGER; scanBuf : BYTE[MaxWord];
+    j : INTEGER; isEnd : BOOLEAN; looping : BOOLEAN;
+BEGIN
+  atBOL := TRUE;
+  looping := TRUE;
+  WHILE looping DO
+    c := NextByte();
+    IF c = 0 THEN RETURN END;
+    IF atBOL THEN
+      IF IsIdentChar(c) THEN
+        (* own small local word scan (mirrors WordIs's own compare, but
+           against a scratch buffer -- can't reuse wordBuf/wordLen here,
+           Format's own copy of those is still live one call frame up) *)
+        scanLen := 0;
+        WHILE IsIdentChar(c) DO
+          IF scanLen < MaxWord THEN
+            SI := ADR(scanBuf); INC(SI, scanLen);
+            [DS:SI] := c;
+            INC(scanLen)
+          END;
+          c := NextByte();
+          IF c = 0 THEN BREAK END
+        END;
+        isEnd := FALSE;
+        IF scanLen = 3 THEN
+          SI := ADR(scanBuf); AL := [DS:SI];
+          IF AL = 69 THEN
+            INC(SI); AL := [DS:SI];
+            IF AL = 78 THEN
+              INC(SI); AL := [DS:SI];
+              IF AL = 68 THEN isEnd := TRUE END
+            END
+          END
+        END;
+        IF isEnd THEN
+          (* the inner WHILE IsIdentChar(c) DO loop above always reads
+             one byte PAST "END" itself to confirm the word doesn't
+             continue (ruling out e.g. "ENDX") -- that trailing byte is
+             sitting in c right now, already consumed from the real
+             stream, and MUST be handed back too (as scanBuf's own 4th
+             byte) or it's permanently lost, corrupting everything
+             downstream by one byte. Skipped only at real EOF (c = 0
+             here means NextByte itself returned 0, nothing to hand
+             back -- the caller's own GetByte will see EOF naturally
+             once "END" itself is drained). *)
+          IF c # 0 THEN
+            SI := ADR(scanBuf); INC(SI, 3);
+            [DS:SI] := c;
+            PushBackWord(ADR(scanBuf), 4)
+          ELSE
+            PushBackWord(ADR(scanBuf), 3)
+          END;
+          RETURN
+        END;
+        (* not END -- flush the scanned word as real ASM body text,
+           then fall through to handle the byte that stopped it (c, or
+           EOF) the normal way below. *)
+        j := 0;
+        WHILE j < scanLen DO
+          SI := ADR(scanBuf); INC(SI, j);
+          WriteByte(ADR(outWriter),[DS:SI]);
+          INC(j)
+        END;
+        atBOL := FALSE;
+        IF c = 0 THEN RETURN END
+      END
+    END;
+    WriteByte(ADR(outWriter),c);
+    IF c = LF THEN
+      atBOL := TRUE
+    ELSIF IsSpaceOrTab(c) THEN
+      (* leading indentation before the line's own first real character
+         -- must NOT clear atBOL, or an indented "END" (the normal
+         style, e.g. "  END") would never be recognized as the line's
+         own first word at all (the actual bug this fixes: atBOL was
+         going FALSE on the first indent space, so "END" fell through
+         to the verbatim body-text path below instead of ever reaching
+         the identifier-scan-and-match code above). *)
+    ELSIF c = CR THEN
+      (* same as a space -- part of the line ending, not real content *)
+    ELSE
+      atBOL := FALSE
+    END
+  END
+END CopyAsmBody;
+
+(* ---- main formatting loop ---- *)
+
+(* GetByte: the token-level byte source Format itself reads -- drains
+   ungetBuf (CopyAsmBody's own re-queued "END", see PushBackWord, or a
+   single over-read lookahead byte, see PushBackByte) before falling
+   back to NextByte for a fresh byte. *)
+PROCEDURE GetByte(): BYTE; NEAR;
+BEGIN
+  IF ungetPos < ungetLen THEN
+    SI := ADR(ungetBuf); INC(SI, ungetPos);
+    AL := [DS:SI];
+    INC(ungetPos);
+    RETURN AL
+  END;
+  RETURN NextByte()
+END GetByte;
+
+(* PushBackByte: re-queue a single over-read lookahead byte so the
+   next GetByte() call returns it. *)
+PROCEDURE PushBackByte(c : BYTE); NEAR;
+BEGIN
+  SI := ADR(ungetBuf);
+  [DS:SI] := c;
+  ungetLen := 1;
+  ungetPos := 0
+END PushBackByte;
+
+(* EmitEnd: print "END" at the correct (already-decremented) depth,
+   then decide glue (no forced newline -- required for "END;"/"END."/
+   "END Name;"/"END Name.", DOCS/SPHINX.MD S8) vs. break (force a
+   fresh line -- a bare END, e.g. LCOUNT.SMD's own "...BREAK END\n
+   INC(BX);", where a genuinely new statement follows with no ';' at
+   all). Reads ahead itself (through GetByte, so CopyAsmBody-primed
+   bytes are respected) past any whitespace to find the next real
+   byte's own class -- ';'/'.' always glue; otherwise glue only when
+   this END closes the CURRENT PROCEDURE/MODULE's own outer BEGIN
+   (depth = procBodyDepth, checked by the caller and passed in as
+   isProcClose) -- an "END Name" where something other than ';'/'.'
+   follows Name is not a real SPHINX shape, so reaching this branch
+   with isProcClose FALSE always means a genuine bare block-closing
+   END with a new statement directly after it. Whitespace consumed
+   during the lookahead is simply dropped -- it would only ever have
+   collapsed to at most one separator either way, which the normal
+   next-token handling supplies on its own once GetByte hands back the
+   real next byte via PushBackByte. *)
+PROCEDURE EmitEnd(isProcClose : BOOLEAN); NEAR;
+VAR c : BYTE; glues : BOOLEAN;
+BEGIN
+  WriteWord(ADR(_kwEND), 3);
+  lastWasBlank := FALSE;
+  c := GetByte();
+  WHILE IsSpaceOrTab(c) DO c := GetByte() END;
+  WHILE c = CR DO c := GetByte() END;
+  WHILE c = LF DO c := GetByte() END;
+  glues := isProcClose;
+  IF c = Semi THEN glues := TRUE
+  ELSIF c = Dot THEN glues := TRUE
+  END;
+  PushBackByte(c);
+  IF glues THEN
+    (* whitespace between END and whatever follows (its own closing
+       Name, or a bare ';'/'.') was consumed above and must still
+       collapse to a single space the normal way -- pendingSpace TRUE
+       reproduces that; the generic next-token handling then decides
+       whether a space is actually needed (e.g. none before ';'/'.'
+       themselves, since those aren't identifier/word tokens). *)
+    atLineStart := FALSE; pendingSpace := TRUE;
+    IF isProcClose THEN justClosedProc := TRUE END
+  ELSE
+    WriteByte(ADR(outWriter),LF); atLineStart := TRUE; pendingSpace := FALSE
+  END
+END EmitEnd;
+
+(* Format: the whole translate: read one classified token at a time
+   via GetByte/wordBuf, format and write it immediately, keep only the
+   small O(1) state below across iterations. Runs of whitespace
+   (outside "..."/'...' spans, already stripped of comments by
+   NextByte) collapse to a single space between tokens, dropped
+   entirely right after a fresh indent; 2+ consecutive newlines in the
+   original still produce exactly one blank output line. depth is a
+   single running nesting counter, updated exactly at the keywords
+   (BEGIN/THEN/DO/RECORD/ASM open, END/ELSE/ELSIF close) that also
+   trigger a fresh output line -- so a whole compound statement
+   written on one source line (e.g. "IF x THEN y ELSE z END") comes
+   back out as several properly indented lines instead of skewing
+   indentation for everything after it. procBodyDepth/inProcHeader/
+   justClosedProc drive the blank-line and END-glue rules documented
+   at EmitEnd and at each of their own call sites below. *)
+PROCEDURE Format(); NEAR;
+VAR c : BYTE; nlCount : INTEGER; j : INTEGER;
+    wroteAny : BOOLEAN; wordOverflowed : BOOLEAN; isProcClose : BOOLEAN;
+    collapsing : BOOLEAN;
+BEGIN
+  depth := 0; procBodyDepth := 0;
+  atLineStart := TRUE; pendingSpace := FALSE; pendingBlank := FALSE;
+  justClosedProc := FALSE; inProcHeader := FALSE;
+  wroteAny := FALSE;
+  lastWasBlank := TRUE;  (* no leading blank at the very top of the file *)
+  ungetLen := 0; ungetPos := 0;
+
+  c := GetByte();
+  WHILE c # 0 DO
+
+    IF c = Quote THEN
+      IF atLineStart THEN EmitIndent(depth); atLineStart := FALSE; pendingSpace := FALSE
+      ELSIF pendingSpace THEN WriteByte(ADR(outWriter),Space); pendingSpace := FALSE END;
+      WriteByte(ADR(outWriter),c); wroteAny := TRUE; lastWasBlank := FALSE;
+      c := GetByte();
+      WHILE c # 0 DO
+        WriteByte(ADR(outWriter),c);
+        IF c = Quote THEN BREAK END;
+        c := GetByte()
+      END;
+      c := GetByte()
+
+    ELSIF c = Apos THEN
+      IF atLineStart THEN EmitIndent(depth); atLineStart := FALSE; pendingSpace := FALSE
+      ELSIF pendingSpace THEN WriteByte(ADR(outWriter),Space); pendingSpace := FALSE END;
+      WriteByte(ADR(outWriter),c); wroteAny := TRUE; lastWasBlank := FALSE;
+      c := GetByte();
+      WHILE c # 0 DO
+        WriteByte(ADR(outWriter),c);
+        IF c = Apos THEN BREAK END;
+        c := GetByte()
+      END;
+      c := GetByte()
+
+    ELSIF IsSpaceOrTab(c) THEN
+      pendingSpace := TRUE;
+      c := GetByte()
+
+    ELSIF c = CR THEN
+      c := GetByte()
+
+    ELSIF c = LF THEN
+      nlCount := 1;
+      c := GetByte();
+      collapsing := TRUE;
+      WHILE collapsing DO
+        IF c = LF THEN INC(nlCount); c := GetByte()
+        ELSIF IsSpaceOrTab(c) THEN c := GetByte()
+        ELSIF c = CR THEN c := GetByte()
+        ELSE collapsing := FALSE END
+      END;
+      IF nlCount >= 2 THEN
+        IF ~atLineStart THEN
+          IF ~lastWasBlank THEN pendingBlank := TRUE END
+        END
+      END;
+      pendingSpace := TRUE
+
+    ELSIF c = Semi THEN
+      WriteByte(ADR(outWriter),c); wroteAny := TRUE; lastWasBlank := FALSE;
+      WriteByte(ADR(outWriter),LF); atLineStart := TRUE; pendingSpace := FALSE;
+      IF justClosedProc THEN
+        IF ~lastWasBlank THEN pendingBlank := TRUE END;
+        justClosedProc := FALSE
+      END;
+      c := GetByte()
+
+    ELSIF c = Dot THEN
+      (* never a space before '.' (closing "END ModuleName."), same as
+         ';' just above -- pendingSpace (any whitespace collapsed away
+         between the name and its own '.') is simply dropped. *)
+      WriteByte(ADR(outWriter),c); wroteAny := TRUE; lastWasBlank := FALSE; pendingSpace := FALSE;
+      c := GetByte()
+
+    ELSIF IsIdentChar(c) THEN
+      wordLen := 0;
+      wordOverflowed := FALSE;
+      WHILE IsIdentChar(c) DO
+        IF wordLen < MaxWord THEN
+          SI := ADR(wordBuf); INC(SI, wordLen);
+          [DS:SI] := c;
+          INC(wordLen)
+        ELSE
+          (* longer than any real keyword this tool matches (the
+             longest, "PROCEDURE", is 9 chars) -- no keyword-match
+             branch below can ever fire for this word once overflowed,
+             so print it as an ordinary identifier right now (same
+             indent/space handling the "ELSE" ordinary-word branch
+             below would do) and stream every further character
+             straight to output, unbuffered, instead of losing them --
+             a real identifier this long is unlikely but not illegal
+             (DOCS/SPHINX.MD imposes no name-length limit), and
+             silently truncating output would be a correctness bug. *)
+          IF ~wordOverflowed THEN
+            wordOverflowed := TRUE;
+            IF atLineStart THEN EmitIndent(depth); atLineStart := FALSE; pendingSpace := FALSE
+            ELSIF pendingSpace THEN WriteByte(ADR(outWriter),Space) END;
+            pendingSpace := FALSE;
+            j := 0;
+            WHILE j < wordLen DO
+              SI := ADR(wordBuf); INC(SI, j);
+              WriteByte(ADR(outWriter),[DS:SI]);
+              INC(j)
+            END;
+            wroteAny := TRUE; lastWasBlank := FALSE
+          END;
+          WriteByte(ADR(outWriter),c)
+        END;
+        c := GetByte()
+      END;
+      IF wordOverflowed THEN
+        (* already fully printed above (streamed as it was read) --
+           nothing left to match against a keyword table. *)
+      ELSE
+      PushBackByte(c);
+
+      IF WordIs(ADR(_kwEND), 3) THEN
+        IF ~atLineStart THEN WriteByte(ADR(outWriter),LF) END;
+        IF depth > 0 THEN DEC(depth) END;
+        EmitIndent(depth);
+        wroteAny := TRUE; lastWasBlank := FALSE;
+        IF depth = procBodyDepth THEN isProcClose := TRUE ELSE isProcClose := FALSE END;
+        EmitEnd(isProcClose)
+
+      ELSIF WordIs(ADR(_kwELSE), 4) THEN
+        IF ~atLineStart THEN WriteByte(ADR(outWriter),LF) END;
+        IF depth > 0 THEN DEC(depth) END;
+        EmitIndent(depth);
+        WriteWord(ADR(_kwELSE), 4); wroteAny := TRUE; lastWasBlank := FALSE;
+        WriteByte(ADR(outWriter),LF); INC(depth); atLineStart := TRUE; pendingSpace := FALSE
+
+      ELSIF WordIs(ADR(_kwELSIF), 5) THEN
+        IF ~atLineStart THEN WriteByte(ADR(outWriter),LF) END;
+        IF depth > 0 THEN DEC(depth) END;
+        EmitIndent(depth);
+        WriteWord(ADR(_kwELSIF), 5); wroteAny := TRUE; lastWasBlank := FALSE;
+        atLineStart := FALSE; pendingSpace := TRUE
+
+      ELSE
+        (* CONST/TYPE/VAR/PROCEDURE: a blank line separates each
+           MODULE-LEVEL section from whatever came before it, gated on
+           ~inProcHeader for CONST/TYPE/VAR (a PROCEDURE's own LOCAL
+           VAR section, DOCS/SPHINX.MD S5.2, must stay tight against
+           its own header instead), on wroteAny (the very first
+           declaration in the file gets no leading blank), and on
+           ~lastWasBlank -- a blank line may already have been placed
+           here by an earlier, independent rule (e.g. IMPORT's own
+           trailing blank, or the between-PROCEDUREs blank after
+           "END Name;"); without this check both rules would each add
+           their own blank line, producing two. *)
+        IF atLineStart THEN
+          IF wroteAny THEN
+            IF ~lastWasBlank THEN
+              IF ~inProcHeader THEN
+                IF WordIs(ADR(_kwCONST), 5) THEN pendingBlank := TRUE
+                ELSIF WordIs(ADR(_kwTYPE), 4) THEN pendingBlank := TRUE
+                ELSIF WordIs(ADR(_kwVAR), 3) THEN pendingBlank := TRUE
+                END
+              END;
+              IF WordIs(ADR(_kwPROC), 9) THEN pendingBlank := TRUE END
+            END
+          END;
+          IF pendingBlank THEN
+            WriteByte(ADR(outWriter),LF); pendingBlank := FALSE; lastWasBlank := TRUE
+          END
+        END;
+        IF atLineStart THEN EmitIndent(depth); atLineStart := FALSE; pendingSpace := FALSE
+        ELSIF pendingSpace THEN WriteByte(ADR(outWriter),Space) END;
+        pendingSpace := FALSE;
+        j := 0;
+        WHILE j < wordLen DO
+          SI := ADR(wordBuf); INC(SI, j);
+          WriteByte(ADR(outWriter),[DS:SI]);
+          INC(j)
+        END;
+        wroteAny := TRUE; lastWasBlank := FALSE;
+
+        IF WordIs(ADR(_kwMODULE), 6) THEN
+          justClosedProc := TRUE
+        ELSIF WordIs(ADR(_kwIMPORT), 6) THEN
+          justClosedProc := TRUE
+        ELSIF WordIs(ADR(_kwPROC), 9) THEN
+          inProcHeader := TRUE
+        END;
+
+        IF WordIs(ADR(_kwBEGIN), 5) THEN
+          WriteByte(ADR(outWriter),LF);
+          procBodyDepth := depth;
+          inProcHeader := FALSE;
+          INC(depth); atLineStart := TRUE
+        ELSIF WordIs(ADR(_kwRECORD), 6) THEN
+          WriteByte(ADR(outWriter),LF); INC(depth); atLineStart := TRUE
+        ELSIF WordIs(ADR(_kwTHEN), 4) THEN
+          WriteByte(ADR(outWriter),LF); INC(depth); atLineStart := TRUE
+        ELSIF WordIs(ADR(_kwDO), 2) THEN
+          WriteByte(ADR(outWriter),LF); INC(depth); atLineStart := TRUE
+        ELSIF WordIs(ADR(_kwASM), 3) THEN
+          WriteByte(ADR(outWriter),LF); INC(depth); atLineStart := TRUE; pendingSpace := FALSE;
+          CopyAsmBody()
+          (* CopyAsmBody re-queues the matching END in full (via
+             PushBackWord) before returning -- the "c := GetByte()"
+             just below the whole keyword-dispatch chain (at this
+             branch's own end) picks up 'E' from that queue and the
+             outer WHILE loop's own next iteration re-enters the
+             IsIdentChar branch for it completely normally, reading
+             "END" and calling EmitEnd exactly like any other END. No
+             special handling needed here at all. *)
+        END
+      END
+      END;
+      c := GetByte()
+
+    ELSE
+      IF atLineStart THEN EmitIndent(depth); atLineStart := FALSE; pendingSpace := FALSE
+      ELSIF pendingSpace THEN WriteByte(ADR(outWriter),Space); pendingSpace := FALSE END;
+      WriteByte(ADR(outWriter),c); wroteAny := TRUE; lastWasBlank := FALSE;
+      c := GetByte()
+    END;
+
+    IF atLineStart THEN
+      IF pendingBlank THEN
+        WriteByte(ADR(outWriter),LF);
+        pendingBlank := FALSE;
+        lastWasBlank := TRUE
+      END
+    END
+  END
+END Format;
+
+(* GetTwoArgs: split the DOS command tail into two whitespace-separated
+   tokens (input filename, output filename), NUL-terminating each into
+   inName/outName. Same PSP-reading approach as LCOUNT.SMD's own
+   GetCmdLine (AH=62h for the PSP segment, PSP offset 80h = tail
+   length, 81h.. = raw text). Returns FALSE if either token is
+   missing. *)
+PROCEDURE GetTwoArgs() : BOOLEAN; NEAR;
+VAR tailLen : INTEGER;
+    i : INTEGER;
+    n : INTEGER;
+    c : BYTE;
+    psp : INTEGER;
+    maxNameM1 : INTEGER;
+BEGIN
+  maxNameM1 := MaxName - 1;
+  GetPSP();
+  psp := AX;
+  ES := psp;
+  BX := 80H;
+  AL := [ES:BX];
+  tailLen := AL;
+  i := 1;
+
+  (* skip leading blanks *)
+  WHILE i <= tailLen DO
+    BX := 80H + i;
+    c := [ES:BX];
+    IF IsSpaceOrTab(c) THEN INC(i) ELSE BREAK END
+  END;
+  IF i > tailLen THEN RETURN FALSE END;
+
+  (* copy first token into inName *)
+  n := 0;
+  WHILE i <= tailLen DO
+    BX := 80H + i;
+    c := [ES:BX];
+    IF IsSpaceOrTab(c) THEN BREAK END;
+    IF c = CR THEN BREAK END;
+    IF n >= maxNameM1 THEN BREAK END;
+    SI := ADR(inName); INC(SI, n);
+    [DS:SI] := c;
+    INC(n); INC(i)
+  END;
+  SI := ADR(inName); INC(SI, n);
+  AL := 0; [DS:SI] := AL;
+  IF n = 0 THEN RETURN FALSE END;
+
+  (* skip blanks between tokens *)
+  WHILE i <= tailLen DO
+    BX := 80H + i;
+    c := [ES:BX];
+    IF IsSpaceOrTab(c) THEN INC(i) ELSE BREAK END
+  END;
+  IF i > tailLen THEN RETURN FALSE END;
+
+  (* copy second token into outName *)
+  n := 0;
+  WHILE i <= tailLen DO
+    BX := 80H + i;
+    c := [ES:BX];
+    IF IsSpaceOrTab(c) THEN BREAK END;
+    IF c = CR THEN BREAK END;
+    IF n >= maxNameM1 THEN BREAK END;
+    SI := ADR(outName); INC(SI, n);
+    [DS:SI] := c;
+    INC(n); INC(i)
+  END;
+  SI := ADR(outName); INC(SI, n);
+  AL := 0; [DS:SI] := AL;
+  RETURN n > 0
+END GetTwoArgs;
+
+BEGIN
+  IF ~GetTwoArgs() THEN
+    Out_String("usage: SMDFMT infile outfile"); Out_Ln;
+    Halt(2)
+  END;
+
+  IF ~Reset(ADR(inReader), ADR(inName)) THEN
+    Out_String("Cannot open input file"); Out_Ln;
+    Halt(1)
+  END;
+  inString := FALSE; inChar := FALSE; inBlock := FALSE; inLine := FALSE;
+  pushedBack := FALSE;
+
+  IF ~ReWrite(ADR(outWriter), ADR(outName)) THEN
+    Out_String("Cannot create output file"); Out_Ln;
+    Close(ADR(inReader));
+    Halt(1)
+  END;
+
+  Format();
+
+  Close(ADR(inReader));
+  Close(ADR(outWriter));
+
+  Halt(0)
+END SMDFMT.
