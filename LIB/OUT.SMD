@@ -1,0 +1,59 @@
+MODULE OUT;
+
+PROCEDURE Out_Char*(c : BYTE); NEAR;
+BEGIN
+  DL := c;
+  AH := 2;
+  INT(21H)
+END Out_Char;
+
+PROCEDURE Out_Ln*; NEAR;
+BEGIN
+  DL := 0DH; AH := 2; INT(21H);
+  DL := 0AH; AH := 2; INT(21H)
+END Out_Ln;
+
+PROCEDURE Out_String*(buf : INTEGER); NEAR;
+BEGIN
+  SI := buf;
+  ASM
+  cld
+  lodsb
+  END;
+  WHILE AL # 0 DO
+    DL := AL;
+    AH := 2; INT(21H);
+    ASM
+      lodsb
+    END;
+  END
+END Out_String;
+
+PROCEDURE Out_Word*(n : WORD); NEAR;
+USES DX;
+BEGIN
+  AX := n;
+  DX := 0;
+  BX := 10;
+  ASM
+    DIV BX
+  END;
+  IF AX # 0 THEN Out_Word(AX) END;
+  AX := DX;
+  INC(AL, 30H);
+  Out_Char(AX)
+END Out_Word;
+
+PROCEDURE Out_Int*(n : INTEGER); NEAR;
+BEGIN
+  AX := n;
+  IF AX.INTEGER < 0 THEN
+    PUSH(AX);
+    Out_Char('-');
+    POP(AX);
+    AX := -AX
+  END;
+  Out_Word(AX)
+END Out_Int;
+
+END OUT.

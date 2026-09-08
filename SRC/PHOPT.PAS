@@ -207,34 +207,11 @@ begin
   until not Advance(c, k, endChunk, endSlot)
 end;
 
-{ ConstOrCond: sibling of ConstCond above for the OTHER shape a bare-
-  literal BOOLEAN condition compiles to -- "mov reg, LIT" immediately
-  followed by "or reg, reg" (EmitCondJump's own bare-condition path,
-  SPHO.PAS: a literal operand can't be CMP'd/OR'd directly at all, not
-  valid 8086 with two bare immediates -- TASM confirmed rejecting
-  "cmp 1, 0" outright, "register or memory operand required" -- so it's
-  loaded into a register first, then OR'd against itself the same way
-  an already-register operand already was) immediately followed by a
-  Jcc. "or reg,reg" sets ZF exactly as "cmp reg,0" would (EmitCondJump's
-  own comment on that equivalence), so the fold here is the same
-  EvalJcc(mn, LIT, 0) check ConstCond already does for a real cmp, just
-  reading the literal from the preceding mov's own op2 instead of a
-  cmp's own op1/op2 pair. Same never/always-taken outcome and same
-  ordering rationale as ConstCond (run before DeadCode so an
-  always-taken fold's own fresh dead code gets swept in the same
-  Optimize call) -- kept as a separate procedure rather than folded
-  into ConstCond itself since the two source shapes (cmp vs mov+or) are
-  different enough in what they match against that combining them
-  would make either one harder to read for no real sharing benefit
-  (each is already a short, self-contained 3-line body). Only nops the
-  mov+or, never the Jcc's own PRIOR instruction (whatever set reg's
-  value before the mov this rule matched) -- reg's own prior value is
-  simply overwritten by the literal mov, no different from any other
-  dead-store case DeadCode/this codebase's own existing rules don't
-  attempt to chase. }
+{ Fold only the branch. MOV and OR may leave live register/flag values
+  consumed after the branch, so neither instruction is dead by this match. }
 procedure ConstOrCond(startChunk: POpChunk; startSlot: integer;
                        endChunk: POpChunk; endSlot: integer);
-  var c, nc, jc: POpChunk; k, nk, jk: integer; reg, reg2, litTxt: string; litVal: word;
+  var c, nc, jc: POpChunk; k, nk, jk: integer; reg, reg2, rhs, litTxt: string; litVal: word;
 begin
   c := startChunk; k := startSlot;
   repeat
@@ -246,16 +223,15 @@ begin
         if NextReal(nc, nk, endChunk, endSlot) and (nc^.ops[nk].kind = TOpInstr)
            and (nc^.ops[nk].mnemonic = MnOr) then begin
           StrTab.Get(nc^.ops[nk].op1, reg2);
-          if reg = reg2 then begin
+          StrTab.Get(nc^.ops[nk].op2, rhs);
+          if (reg = reg2) and (reg = rhs) then begin
             jc := nc; jk := nk;
             if NextReal(jc, jk, endChunk, endSlot) and (jc^.ops[jk].kind = TOpInstr)
                and IsJump(jc^.ops[jk].mnemonic) and (jc^.ops[jk].mnemonic <> MnJmp) then begin
               if EvalJcc(jc^.ops[jk].mnemonic, litVal, 0) then
                 jc^.ops[jk].mnemonic := MnJmp
               else
-                jc^.ops[jk].mnemonic := MnNop;
-              c^.ops[k].mnemonic := MnNop;
-              nc^.ops[nk].mnemonic := MnNop
+                jc^.ops[jk].mnemonic := MnNop
             end
           end
         end
@@ -487,48 +463,147 @@ begin
   until not Advance(c, k, endChunk, endSlot)
 end;
 
-{ NoOpArith: "add reg, 0" or "sub reg, 0" never changes reg's own
-  value -- pure no-op arithmetic, safe to delete on its own machine-
-  state grounds regardless of WHY the source wrote it that way (found
-  via TESTS/BYTEVAR.SMD's own "IF b > 100 THEN r := r + 0 END", a
-  deliberately-written +0 there to exercise a different codegen path --
-  its own comment says so -- but the "add ax, 0" it compiles to is
-  still genuinely dead weight at the machine level, independent of the
-  source's own reason for writing it). Only the VALUE is provably
-  unchanged, though -- add/sub also set flags (CF/ZF/SF/OF/PF), and a
-  deleted "add reg,0"/"sub reg,0" would otherwise leave whatever
-  instruction comes before it as the real flags source instead, which
-  usually still happens to agree (an add/sub-by-0 sets flags purely
-  from reg's own value: ZF=reg=0, SF=reg's sign bit, CF=OF=false,
-  same as a "cmp reg,0"/"or reg,reg" would) but this rule does not
-  attempt to prove that in general for whatever instruction the flags
-  might silently be relied on further down the line -- so it only
-  fires when the very next real operation is NOT itself a Jcc (IsJump
-  minus MnJmp, i.e. a genuine conditional branch that would read those
-  flags) or the flags-testing MnOr/MnCmp/MnTest family; a following
-  MOV/PUSH/CALL/etc never reads flags at all (8086 has no flags-
-  reading instruction outside a Jcc and the handful of explicit
-  compare/test mnemonics themselves), so this stays conservative
-  without needing real data-flow analysis. }
-function ReadsFlags(mn: word): boolean;
+{ IsFlagReader: TRUE for a mnemonic that consumes flags left AMBIENT by
+  an earlier instruction, rather than computing its own fresh flags
+  from its own operands -- only a bare Jcc (IsJump) qualifies. MnOr/
+  MnCmp/MnTest do NOT belong here even though they're commonly followed
+  by a Jcc in codegen: all three compute and overwrite CF/ZF/SF/OF/PF
+  from their OWN two operands, exactly like ADD/SUB/AND/etc -- they
+  never read a PRECEDING instruction's flags, only ever set their own
+  (IsFlagSetter below already covers this; DOCS/TRBUG.MD's own
+  NoOpArith writeup, confirmed via TESTS/NOOPAR.SMD's own
+  AddZeroBeforeJump: "add ax, 0" immediately followed (through a label)
+  by "cmp ax, 5" is safe to fold THROUGH the cmp, since the cmp's own
+  fresh comparison is what the following Jcc actually reads, not the
+  add's). A bare Jcc with no CMP/TEST/OR immediately before it (SPHINX's
+  own CFLAG/ZFLAG syntax, FlagJumps -- confirmed via TESTS/RVFLAGS.SMD)
+  is the one real case that DOES read ambient flags left by whatever
+  instruction actually precedes it, which is exactly what NoOpArithSafe
+  below must not fold an add/sub's own flags out from under. }
+function IsFlagReader(kind: byte; mn: word): boolean;
 begin
-  ReadsFlags := IsJump(mn) or (mn = MnOr) or (mn = MnCmp) or (mn = MnTest)
+  IsFlagReader := (kind = TOpInstr) and IsJump(mn)
 end;
 
+{ IsFlagSetter: TRUE for a mnemonic that overwrites CF/ZF/SF/OF/PF with
+  a fresh result of its own -- every arithmetic/logic mnemonic this
+  codegen emits (ADD/SUB/CMP/TEST/XOR/OR/AND/SHL/SHR/NEG/INC/DEC/MUL/
+  IMUL/DIV/IDIV). Used by NoOpArithSafe's own forward scan to know when
+  it can stop looking: once a flag-setter is reached, the original add/
+  sub's own flags are already gone regardless of whether this rule
+  deletes it, so anything past this point is safe no matter what. }
+function IsFlagSetter(kind: byte; mn: word): boolean;
+begin
+  IsFlagSetter := (kind = TOpInstr)
+    and ((mn = MnAdd) or (mn = MnSub) or (mn = MnCmp) or (mn = MnTest)
+      or (mn = MnXor) or (mn = MnOr) or (mn = MnAnd) or (mn = MnShl)
+      or (mn = MnShr) or (mn = MnNeg) or (mn = MnInc) or (mn = MnDec)
+      or (mn = MnMul) or (mn = MnImul) or (mn = MnDiv) or (mn = MnIdiv))
+end;
+
+{ IsFlagPreserving: TRUE for a mnemonic safe for NoOpArithSafe's own
+  scan to skip straight past without stopping -- either because it
+  PROVABLY does not touch CF/ZF/SF/OF/PF at all on 8086 (MOV/PUSH/POP/
+  LEA/LES/LDS/CALL/CALLFAR/CWD), or because it unconditionally leaves
+  the instruction stream right where it is (MnJmp/MnRetn/MnRetf/
+  MnIret, same IsUncondTransfer set DeadCode already uses -- whatever
+  flags exist after one of these is never reached by falling through
+  from here, so the op-list slot immediately following it is either
+  genuinely unreachable this way, or a jump target from somewhere else
+  entirely; either way, scanning one step further and re-evaluating
+  THAT slot on its own merits is still correct, just possibly more
+  conservative than strictly necessary -- never unsound). Deliberately
+  a narrow whitelist, not "everything NoOpArithSafe doesn't otherwise
+  recognize": MnPopf genuinely overwrites flags (restoring them from
+  the stack -- the entire point of the instruction), and MnInt crosses
+  into interrupt-handler code this translator has no visibility into,
+  so both must fall through to NoOpArithSafe's own conservative
+  default (treat as unsafe, stop the scan) rather than being silently
+  skipped past. }
+function IsFlagPreserving(kind: byte; mn: word): boolean;
+begin
+  IsFlagPreserving := (kind = TOpInstr)
+    and ((mn = MnMov) or (mn = MnPush) or (mn = MnPop) or (mn = MnLea)
+      or (mn = MnLes) or (mn = MnLds) or (mn = MnCall) or (mn = MnCallFar)
+      or (mn = MnCwd) or (mn = MnJmp) or (mn = MnRetn) or (mn = MnRetf)
+      or (mn = MnIret))
+end;
+
+{ NoOpArithSafe: TRUE iff scanning forward from (right after) an add/
+  sub's own slot never reaches a flag-reader (IsFlagReader) before
+  either a flag-setter (IsFlagSetter -- flags already fresh again from
+  there, so the original add/sub's own contribution is moot regardless)
+  or the end of range. Only a narrow whitelist of mnemonics PROVABLY
+  flag-preserving (IsFlagPreserving) is skipped over rather than
+  stopping the scan -- anything not on that whitelist (a Jcc/OR/CMP/
+  TEST via IsFlagReader, a flag-setter via IsFlagSetter, or anything
+  else entirely -- MnPopf/MnInt/MnIret/MnPushf/MnRetn/MnRetf included,
+  none of them provably flag-neutral) conservatively stops the scan as
+  unsafe by default, matching every other rule's own "no data-flow
+  analysis, stay conservative" bias -- TOpAsm (raw inline ASM...END
+  text) is included in that conservative default: its own content is
+  opaque to this pass, so it stops the scan rather than being assumed
+  flag-neutral. A TOpLabel is the one exception that does NOT stop the
+  scan (something could legitimately fall through it from right where
+  this scan already is -- SPHO.PAS's own codegen never jumps INTO the
+  middle of a flag-dependent sequence from elsewhere, same assumption
+  DeadCode's own header comment already relies on for TOpAsm blocks'
+  OWN internal safety, a separate question from this scan's), so the
+  scan continues straight through a label to whatever real operation
+  actually follows. This is what NextReal's own single-hop "next real operation"
+  check got wrong (DOCS/TRBUG.MD's own regression, confirmed via
+  TESTS/RVFLAGS.SMD: "AX := AX + 0" followed by "BX := 5" (a MOV,
+  flag-preserving but NOT the flag consumer) followed by "IF ZFLAG" (a
+  bare JZ/JNZ, no CMP needed, FlagJumps) -- the old single-hop check
+  saw the intervening MOV as "not a flag reader" and deleted the add,
+  leaving the JZ/JNZ silently test flags left over from the wrong
+  earlier instruction instead). }
+function NoOpArithSafe(c: POpChunk; k: integer; endChunk: POpChunk; endSlot: integer): boolean;
+begin
+  while Advance(c, k, endChunk, endSlot) do begin
+    if (c^.ops[k].kind = TOpInstr) and (c^.ops[k].mnemonic = MnNop) then
+      { deleted -- transparent, keep scanning }
+    else if c^.ops[k].kind = TOpAsm then begin
+      { raw inline ASM...END text -- opaque, could do anything to
+        flags; conservatively stop rather than assume it's safe to
+        skip past. }
+      NoOpArithSafe := false; exit
+    end else if IsFlagReader(c^.ops[k].kind, c^.ops[k].mnemonic) then begin
+      NoOpArithSafe := false; exit
+    end else if IsFlagSetter(c^.ops[k].kind, c^.ops[k].mnemonic) then begin
+      NoOpArithSafe := true; exit
+    end else if (c^.ops[k].kind = TOpInstr)
+                and not IsFlagPreserving(c^.ops[k].kind, c^.ops[k].mnemonic) then begin
+      NoOpArithSafe := false; exit   { conservative default: anything not
+        provably safe to skip past stops the scan as unsafe. }
+    end
+    { else: TOpLabel, or a whitelisted flag-preserving TOpInstr -- keep
+      scanning. }
+  end;
+  NoOpArithSafe := true   { end of range reached with no flag-reader found }
+end;
+
+{ NoOpArith: "add reg, N"/"sub reg, N" where N is the literal "0" never
+  changes reg's own value -- pure no-op arithmetic, deletable purely on
+  machine-state grounds regardless of why the source happened to
+  compute a +0/-0 (DOCS/TRBUG.MD's own writeup: found via a test
+  fixture's own byte-widening codegen path, deliberately written as
+  "r + 0" to trigger it). Guarded against the one real risk ADD/SUB
+  carries that a plain MOV doesn't: both also write flags, so this only
+  fires when NoOpArithSafe's own forward scan confirms nothing
+  downstream actually reads THIS add/sub's own flags before they'd be
+  overwritten anyway. }
 procedure NoOpArith(startChunk: POpChunk; startSlot: integer;
                      endChunk: POpChunk; endSlot: integer);
-  var c, nc: POpChunk; k, nk: integer; opnd2: string; val: word;
+  var c: POpChunk; k: integer; opnd2: string;
 begin
   c := startChunk; k := startSlot;
   repeat
-    if (c^.ops[k].kind = TOpInstr) and ((c^.ops[k].mnemonic = MnAdd) or (c^.ops[k].mnemonic = MnSub)) then begin
+    if (c^.ops[k].kind = TOpInstr)
+       and ((c^.ops[k].mnemonic = MnAdd) or (c^.ops[k].mnemonic = MnSub)) then begin
       StrTab.Get(c^.ops[k].op2, opnd2);
-      if ParseDecimalLiteral(opnd2, val) and (val = 0) then begin
-        nc := c; nk := k;
-        if (not NextReal(nc, nk, endChunk, endSlot)) or (nc^.ops[nk].kind <> TOpInstr)
-           or not ReadsFlags(nc^.ops[nk].mnemonic) then
-          c^.ops[k].mnemonic := MnNop
-      end
+      if (opnd2 = '0') and NoOpArithSafe(c, k, endChunk, endSlot) then
+        c^.ops[k].mnemonic := MnNop
     end
   until not Advance(c, k, endChunk, endSlot)
 end;

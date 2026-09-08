@@ -208,28 +208,11 @@ type
     nParams:      array[1..Chunk] of integer;
     paramIsReg:   array[1..Chunk] of array[0..MaxParams-1] of boolean;
     paramRegId:   array[1..Chunk] of array[0..MaxParams-1] of integer;
-    { paramNameId/paramTy: each formal parameter's own name (StrTab-
-      interned, same reason externName below is: ParseProcedure's own
-      SymTab.LexTruncate at the end of every procedure discards that
-      procedure's own param names from LexTab, so a bare si captured
-      here instead -- SymName(si, ...) -- would fail to resolve once
-      EmitSHD (Spho.pas) runs much later, after every procedure in the
-      module has already been parsed and truncated) and scalar type,
-      captured eagerly in ProcSetParams while the names/types are
-      still live, so EmitSHD can reconstruct a full
-      'PROCEDURE Name(a: WORD; ...): RetTy; NEAR; EXTERNAL;' .SHD line
-      long after parsing is done. paramTy mirrors SymTy(si)'s own
-      result at ProcSetParams time (TyRec never occurs here -- by-value
-      RECORD parameters are rejected elsewhere, RejectRecordParams). }
+    { Persist names and complete types before local lexemes are discarded.
+      Array formals retain their RECORD identity for generated headers. }
     paramNameId:  array[1..Chunk] of array[0..MaxParams-1] of StrTab.TStrTabId;
-    paramTy:      array[1..Chunk] of array[0..MaxParams-1] of integer;
-    { paramIsLong: TRUE for a non-register LONGINT-typed parameter --
-      EmitCall's own call site needs this to know a plain numeric-
-      literal argument must be widened to a real 4-byte push (DX:AX,
-      zero/sign-extended) instead of the ordinary 2-byte push every
-      other parameter type gets; a LONGINT VAR/expression argument
-      already produces its own DX:AX pair some other way and doesn't
-      consult this. }
+    paramTy:      array[1..Chunk] of array[0..MaxParams-1] of TTypeInfo;
+    { ABI width: LONGINT values use four bytes; array offsets use two. }
     paramIsLong:  array[1..Chunk] of array[0..MaxParams-1] of boolean;
     { paramIsArr: TRUE for a formal parameter declared 'name: T[N]' or
       'name: T[]' (SOPLAN.MD's own Phase 7 item 3, "array parameter
@@ -444,7 +427,7 @@ procedure ProcName(pi: integer; var dst: string);
 function ProcIsFar(pi: integer): boolean;
 function ProcNParams(pi: integer): integer;
 procedure ProcParamName(pi, i: integer; var dst: string);
-function ProcParamTy(pi, i: integer): integer;
+procedure ProcParamType(pi, i: integer; var typ: TTypeInfo);
 function ProcRetTy(pi: integer): integer;
 function ProcSigHasRetTy(pi: integer): boolean;
 function TypeCount: integer;
@@ -847,7 +830,7 @@ begin
 end;
 
 procedure ProcSetParams(pi: integer; var regFlags: array of boolean; var sis: array of integer; n: integer);
-  var c: PProcChunk; k, i: integer; nm: string;
+  var c: PProcChunk; sc: PSymChunk; k, i, sk: integer; nm: string;
 begin
   ProcChunkFor(pi, c, k);
   c^.nParams[k] := n;
@@ -855,7 +838,11 @@ begin
   while i < n do begin
     SymName(sis[i], nm);
     c^.paramNameId[k][i] := StrTab.Put(nm);
-    c^.paramTy[k][i] := SymTy(sis[i]);
+    SymChunkFor(sis[i], sc, sk);
+    c^.paramTy[k][i].ty := sc^.ty[sk];
+    c^.paramTy[k][i].recIdx := sc^.recIdx[sk];
+    c^.paramIsLong[k][i] := false;
+    c^.paramIsArr[k][i] := false;
     c^.paramIsReg[k][i] := regFlags[i];
     if regFlags[i] then begin
       c^.paramRegId[k][i] := Regs86.LookupReg(Util.UpStr(nm))
@@ -938,9 +925,9 @@ procedure ProcParamName(pi, i: integer; var dst: string);
   var c: PProcChunk; k: integer;
 begin ProcChunkFor(pi, c, k); StrTab.Get(c^.paramNameId[k][i], dst) end;
 
-function ProcParamTy(pi, i: integer): integer;
+procedure ProcParamType(pi, i: integer; var typ: TTypeInfo);
   var c: PProcChunk; k: integer;
-begin ProcChunkFor(pi, c, k); ProcParamTy := c^.paramTy[k][i] end;
+begin ProcChunkFor(pi, c, k); typ := c^.paramTy[k][i] end;
 
 function ProcRetTy(pi: integer): integer;
   var c: PProcChunk; k: integer;
@@ -1163,16 +1150,19 @@ begin
   end
 end;
 
-{ IsRegName: delegates to LexTab (kind = LexReg). }
+{ Register classification must survive a register-named formal shadowing
+  its builtin lexeme. Hardware names are independent of lexical scope. }
 function IsRegName(const s: string): boolean;
-  var kind, id: integer;
 begin
-  IsRegName := LexTab.Find(UpStr(s), kind, id) and (kind = LexReg)
+  IsRegName := Regs86.LookupReg(UpStr(s)) <> Regs86.LNone
 end;
 
 { CurTokIsReg: TRUE if the CURRENT token's own text names a register. }
 function CurTokIsReg: boolean;
-begin CurTokIsReg := (gCurKind = LexReg) end;
+begin
+  CurTokIsReg := (gCurKind = LexReg) or
+    ((gCurKind = LexVar) and SymIsReg(gCurId))
+end;
 
 { ---------------- driver-facing setup/reset ---------------- }
 

@@ -18,7 +18,7 @@
 program Spho;
 
 uses
-  SymTab, Regs86, Scan, LogErr, StrTab, LexTab, Util, Emits, Types, PHOpt;
+  SymTab, Regs86, Scan, LogErr, StrTab, LexTab, Util, Emits, Types, PHOpt, RecTypes, ShdWrt, GlobVar;
 
 const
   ExitOk = 0; ExitUsage = 2; ExitIo = 3; ExitAsm = 4;
@@ -160,7 +160,6 @@ type
     litHead, litTail: PLitChunk;
     nLits: integer;
     pendingHead, pendingTail: PPendingChunk;
-    nPending: integer;
     curSect: integer;
     loopExitStack: array[0..63] of word;
     loopContStack: array[0..63] of word;
@@ -224,9 +223,10 @@ procedure ParseStmtList; forward;
 procedure EmitCall(const name: string); forward;
 function TryParseRegPair(var seg, offReg, consumedReg: string): boolean; forward;
 procedure LoadIfMem(const opnd, scratchReg: string; isByteVar, needWord: boolean; var dst: string); forward;
-procedure ParseVarSection(isGlobal: boolean); forward;
-procedure ParseBaseType(var typ: SymTab.TTypeInfo); forward;
-function ParseArrayBound: integer; forward;
+{ far: passed as a procedural value to RecTypes.ParseTypeSection/
+  ParseRecordType, see Emit/Emit2/EnsureSection's own far comment above
+  for why. }
+function ParseArrayBound: integer; far; forward;
 procedure EmitAdrOperand(const arg: string; si: integer; var dst: string); forward;
 procedure OperandText(var dst: string); forward;
 function PeekOperandIsByte(const nm: string): boolean; forward;
@@ -289,7 +289,7 @@ end;
 { LitAppend: record a newly-seen literal's StrTab id at the end of the
   list, returning its 0-based slot index (== its label's own number). }
 function LitAppend(id: StrTab.TStrTabId): integer;
-  var last: PLitChunk; li, k: integer;
+  var last: PLitChunk; k: integer;
 begin
   if (comp.litTail = nil) or (comp.litTail^.count >= Chunk) then begin
     New(last);
@@ -297,10 +297,9 @@ begin
     if comp.litHead = nil then comp.litHead := last else comp.litTail^.next := last;
     comp.litTail := last
   end;
-  li := comp.nLits; Inc(comp.nLits);
+  Inc(comp.nLits);
   last := comp.litTail;
-  while li >= Chunk do begin last := last^.next; Dec(li, Chunk) end;
-  k := li + 1;
+  k := last^.count + 1;
   last^.id[k] := id;
   last^.count := k;
   LitAppend := comp.nLits - 1
@@ -312,7 +311,7 @@ end;
   far', per EmitCall/EmitCallNoArgs), for CheckPendingCalls to re-
   resolve and patch once the whole file has been parsed. }
 procedure PendingAppend(id: StrTab.TStrTabId; ln: integer; opChunk: POpChunk; opSlot: integer);
-  var last: PPendingChunk; pi, k: integer; sp: string;
+  var last: PPendingChunk; k: integer; sp: string;
 begin
   if (comp.pendingTail = nil) or (comp.pendingTail^.count >= Chunk) then begin
     New(last);
@@ -320,10 +319,8 @@ begin
     if comp.pendingHead = nil then comp.pendingHead := last else comp.pendingTail^.next := last;
     comp.pendingTail := last
   end;
-  pi := comp.nPending; Inc(comp.nPending);
   last := comp.pendingTail;
-  while pi >= Chunk do begin last := last^.next; Dec(pi, Chunk) end;
-  k := pi + 1;
+  k := last^.count + 1;
   Scan.SrcPath(sp);
   last^.id[k] := id; last^.line[k] := ln; last^.fname[k] := StrTab.Put(sp);
   last^.opChunk[k] := opChunk; last^.opSlot[k] := opSlot;
@@ -576,10 +573,15 @@ end;
 
 { ---------------- output ---------------- }
 
-procedure Emit(const s: string);
+{ Emit/Emit2/EnsureSection are `far`, against this file's own project-
+  wide near-call default (FLAGS.INC's own F-minus state) -- RecTypes.
+  ParseTypeSection/ParseRecordType take them as procedural-value
+  parameters (RecTypes can't call back into this file, circular uses),
+  and TP7 requires a routine assigned to a procedural value to be far. }
+procedure Emit(const s: string); far;
 begin AppendAsmLine(s, false) end;
 
-procedure Emit2(const a, b: string);
+procedure Emit2(const a, b: string); far;
 begin AppendAsmLine(a + b, false) end;
 
 { EnsureSection: record sect (SectData/SectBss/SectCode/SectStruc) as
@@ -590,7 +592,7 @@ begin AppendAsmLine(a + b, false) end;
   per section, synthesizing exactly one "section ..." header per
   non-empty group there, rather than one appended inline wherever the
   source happened to switch sections). }
-procedure EnsureSection(sect: integer);
+procedure EnsureSection(sect: integer); far;
 begin
   comp.curSect := sect
 end;
@@ -628,233 +630,14 @@ begin
                 or (s[i] = 'B') or (s[i] = 'b')
 end;
 
-{ TySize: byte size of typ.ty (typ.recIdx meaningful only for TyRec).
-  The TyRec case must mirror ParseRecordType's own field-alignment
-  padding (SPHINX.MD §3.2) exactly, byte for byte, or callers relying on
-  TySize for a RECORD's total size (an array-of-RECORD's resb count, or
-  this same function applied to a RECORD-typed field nested inside
-  another RECORD) would silently disagree with what NASM's struc
-  actually laid out. }
-function TySize(typ: SymTab.TTypeInfo): integer;
-  var i, sum, fsz: integer; fnm: string; ftyp: SymTab.TTypeInfo; fcnt: word;
-begin
-  case typ.ty of
-    TyByte, TyBool: begin TySize := 1; exit end;
-    TyWord, TyInt:  begin TySize := 2; exit end;
-    TyLong:         begin TySize := 4; exit end;
-    TyRec: begin
-      if typ.recIdx < 0 then begin TySize := 2; exit end;
-      sum := 0; i := 0;
-      while i < SymTab.TypeNFields(typ.recIdx) do begin
-        SymTab.TypeField(typ.recIdx, i, fnm, ftyp, fcnt);
-        fsz := TySize(ftyp) * integer(fcnt);
-        if (fsz >= 2) and Odd(sum) then Inc(sum);
-        sum := sum + fsz;
-        Inc(i)
-      end;
-      TySize := sum; exit
-    end
-  else TySize := 2
-  end
-end;
-
-{ SizeHintFor: "byte"/"word" size-prefix hint for ty. }
-procedure SizeHintFor(ty: integer; var hint: string);
-begin
-  case ty of
-    TyByte, TyBool: hint := 'byte';
-    TyWord, TyInt:  hint := 'word';
-  else hint := ''
-  end
-end;
-
-{ ---------------- type parsing (TYPE section: RECORD) ---------------- }
-
-{ ScalarKwTy: ty for the scalar-type keyword (SymTab.LexKw, kwId) pair,
-  or -1 if kwId doesn't name a scalar type -- the one keyword-id-to-ty
-  mapping ParseBaseType, ParseBaseTypeName, and ParseProcedure's own
-  ': RetTy' all need, kept in exactly one place so they can never drift
-  apart on which spellings count. CHAR is a plain synonym for BYTE;
-  POINTER a plain synonym for LONGINT -- neither is a distinct ty. }
-function ScalarKwTy(kwId: integer): integer;
-begin
-  case kwId of
-    SymTab.KwByte, SymTab.KwChar: ScalarKwTy := TyByte;
-    SymTab.KwBoolean: ScalarKwTy := TyBool;
-    SymTab.KwWord:    ScalarKwTy := TyWord;
-    SymTab.KwInteger: ScalarKwTy := TyInt;
-    SymTab.KwLongint, SymTab.KwPointer: ScalarKwTy := TyLong;
-  else ScalarKwTy := -1
-  end
-end;
-
-{ ParseBaseType: a bare TYPE-section identifier can name either a real
-  RECORD type (typ.ty := TyRec, typ.recIdx set) or a non-RECORD alias.
-  Stays a procedure with a var TTypeInfo output, not a function
-  returning one -- TP7 function results are limited to ordinal/real/
-  pointer/string types, not an arbitrary record (same reason
-  SymTab.CurLexMark is a procedure, not a function; see its own header
-  comment). }
-procedure ParseBaseType(var typ: SymTab.TTypeInfo);
-  var ti, aliasTy, kwTy: integer; nm: string;
-begin
-  typ.recIdx := -1;
-  kwTy := -1;
-  if SymTab.CurTokKind = SymTab.LexKw then kwTy := ScalarKwTy(SymTab.CurTokId);
-  if kwTy >= 0 then begin typ.ty := kwTy; SymTab.Next end
-  else if Scan.CurTokKind = TIdent then begin
-    Scan.CurTokText(nm);
-    ti := SymTab.FindType(nm);
-    if ti >= 0 then begin
-      aliasTy := SymTab.TypeAliasTy(ti);
-      if aliasTy = TyRec then begin typ.ty := TyRec; typ.recIdx := ti end
-      else typ.ty := aliasTy
-    end else
-      typ.ty := TyWord;
-    SymTab.Next
-  end else begin
-    typ.ty := TyWord; SymTab.Next
-  end
-end;
-
-{ ParseBaseTypeName: like ParseBaseType's own scalar-keyword matching
-  (same ScalarKwTy table), but resolves an already-read, already-
-  consumed name string via a plain LexTab lookup instead of the current
-  token's own resolved (kind,id) -- used by SIZE(T), where nm's token
-  is already behind us by the time the type name must be classified. }
-procedure ParseBaseTypeName(const nm: string; var typ: SymTab.TTypeInfo);
-  var lkKind, lkId, kwTy: integer; msg: string;
-begin
-  typ.recIdx := -1;
-  kwTy := -1;
-  if LexTab.Find(nm, lkKind, lkId) and (lkKind = SymTab.LexKw) then
-    kwTy := ScalarKwTy(lkId);
-  if kwTy >= 0 then typ.ty := kwTy
-  else begin
-    msg := 'unknown type name in SIZE(): ' + nm;
-    Scan.ReportError(msg); typ.ty := TyWord
-  end
-end;
-
-procedure ResSuffix(ty: integer; var dst: string);
-begin
-  case ty of
-    TyByte, TyBool: dst := 'resb';
-    TyWord, TyInt:  dst := 'resw';
-    TyLong:         dst := 'resd';
-  else dst := 'resw'
-  end
-end;
-
-{ DeclMnemonic: db/dw/dd for ty -- same ty-to-mnemonic shape as
-  ResSuffix above, for an initialized (not reserved-space) declaration. }
-procedure DeclMnemonic(ty: integer; var dst: string);
-begin
-  case ty of
-    TyByte, TyBool: dst := 'db';
-    TyWord, TyInt:  dst := 'dw';
-    TyLong:         dst := 'dd';
-  else dst := 'dw'
-  end
-end;
-
-{ ParseRecordType: 'RECORD' already consumed by caller. Emits struc..endstruc.
-  A field may carry an array bound ('name : T[N];'), same '[N]' syntax
-  and ParseArrayBound as ParseVarSection's own global/local arrays -- the
-  struc line becomes 'resb/resw/resd N' instead of the scalar '... 1',
-  and the field's own total size (elemSz * cnt) is what advances ofs and
-  is stored via TypeAddField's cnt, not just the one-element size.
-  Fields are aligned to their own natural boundary (SPHINX.MD §3.2): a
-  BYTE/BOOLEAN field needs none, but a WORD/INTEGER/LONGINT/RECORD field
-  whose own size is >= 2 must start on an even offset -- an unnamed
-  "resb 1" pad byte is inserted right before it when the running offset
-  is currently odd. ofs tracks that running byte offset by hand (struc's
-  own internal offset isn't queryable from here), so it must stay exactly
-  in sync with what NASM itself computes from the emitted resb/resw/resd
-  lines below. }
-procedure ParseRecordType(const nm: string; exported: boolean);
-  var ti, elemSz, fsz, ofs: integer; typ: SymTab.TTypeInfo; cnt: word; fieldName: string;
-      buf, sfx: string; more: boolean;
-begin
-  ti := SymTab.TypeAppend(nm, TyRec);
-  SymTab.TypeSetExported(ti, exported);
-  EnsureSection(SectStruc);
-  Emit2('struc ', nm);
-  more := true; ofs := 0;
-  while more and (Scan.CurTokKind = TIdent) do begin
-    Scan.CurTokText(fieldName); SymTab.Next;
-    SymTab.Expect(SymTab.SyColon);
-    ParseBaseType(typ);
-    cnt := 1;
-    if SymTab.IsLexSym(SymTab.SyLBrack) then begin
-      cnt := word(ParseArrayBound);
-      SymTab.Expect(SymTab.SyRBrack)
-    end;
-    SymTab.TypeAddField(ti, fieldName, typ, cnt);
-    elemSz := TySize(typ);
-    fsz := elemSz * integer(cnt);
-    if (elemSz >= 2) and (Odd(ofs)) then begin
-      { TASM's struc requires every member line to have its own label
-        (a bare unlabeled 'resb 1', legal in .bss, is rejected inside
-        struc..endstruc with "expected RESB/RESW/RESD") -- .__pad<ofs>
-        is unique within this one struc (ofs is this pad's own byte
-        offset, never repeated by a real field). A user field literally
-        named "__pad4" etc. would collide, but that's a TASM duplicate-
-        label error at assemble time, not silent corruption -- and
-        SPHINX identifiers starting with '_' are legal but not an
-        established naming style anywhere in this codebase. }
-      buf := '    .__pad' + IntStr(longint(ofs)) + ': resb 1';
-      Emit(buf);
-      Inc(ofs)
-    end;
-    if typ.ty = TyRec then
-      { A RECORD-typed field (nested record, scalar or array-of-record)
-        must reserve its own true byte count -- ResSuffix has no TyRec
-        case (falls through to its 'resw' default, 2 bytes, wrong for
-        any RECORD bigger than a WORD) since it's shared with the
-        scalar-field path below. Same 'resb <TySize*cnt>' shape already
-        used for a global RECORD VAR (ParseVarSection, both the array-
-        of-RECORD and single-instance cases). }
-      buf := '    .' + fieldName + ': resb ' + IntStr(longint(fsz))
-    else begin
-      ResSuffix(typ.ty, sfx);
-      buf := '    .' + fieldName + ': ' + sfx + ' ' + IntStr(longint(cnt))
-    end;
-    Emit(buf);
-    ofs := ofs + fsz;
-    more := SymTab.IsLexSym(SymTab.SySemi)
-  end;
-  SymTab.ExpectKw(SymTab.KwEnd);
-  Emit('endstruc')
-end;
-
-procedure ParseTypeSection;
-  var nm: string; msg: string; typ: SymTab.TTypeInfo; exported: boolean; ti: integer;
-begin
-  while (Scan.CurTokKind = TIdent) and not SymTab.IsKw(SymTab.KwConst) and not SymTab.IsKw(SymTab.KwType)
-        and not SymTab.IsKw(SymTab.KwVar)
-        and not SymTab.IsKw(SymTab.KwProcedure)
-        and not SymTab.IsKw(SymTab.KwBegin) and not SymTab.IsKw(SymTab.KwEnd) do begin
-    Scan.CurTokText(nm); SymTab.Next;
-    exported := false;
-    if SymTab.IsLexSym(SymTab.SyStar) then exported := true;
-    SymTab.Expect(SymTab.SyEq);
-    if SymTab.IsLexKw(SymTab.KwRecord) then ParseRecordType(nm, exported)
-    else begin
-      { non-RECORD alias (TYPE Foo = LONGINT;): registered with its real
-        base type so a later VAR of this type gets correctly sized. }
-      ParseBaseType(typ);
-      if typ.ty = TyRec then begin
-        msg := 'TYPE alias of a RECORD type not supported: ' + nm;
-        Scan.ReportError(msg)
-      end else begin
-        ti := SymTab.TypeAppend(nm, typ.ty);
-        SymTab.TypeSetExported(ti, exported)
-      end
-    end;
-    SymTab.Expect(SymTab.SySemi)
-  end
-end;
+{ ---------------- type parsing (TYPE section: RECORD) ----------------
+  TySize/SizeHintFor/ScalarKwTy/ParseBaseType/ParseBaseTypeName/
+  ResSuffix/DeclMnemonic/ParseRecordType/ParseTypeSection now live in
+  unit RecTypes (SRC/RECTYPES.PAS) -- see that unit's own header
+  comment for why this section, and only this section, could split out
+  cleanly. Called here as RecTypes.X; ParseRecordType/ParseTypeSection
+  take Emit/Emit2/EnsureSection/ParseArrayBound as explicit parameters
+  since RecTypes can't call back into this file (circular uses). }
 
 { ParseConstDecl: 'name = numericLiteral;' -- named INTEGER/WORD/BYTE/
   LONGINT values, no storage allocated. }
@@ -879,27 +662,14 @@ begin
   SymTab.Expect(SymTab.SySemi)
 end;
 
-{ ---------------- VAR section (global) ---------------- }
-
-{ EmitVarDecl: a global scalar VAR. hasInit=TRUE ("= value" given, a real
-  stored value) belongs in .data; hasInit=FALSE is zero-filled reserved
-  space and belongs in .bss instead. }
-procedure EmitVarDecl(si: integer; hasInit: boolean; initVal: longint);
-  var buf, nm, mn, rsfx: string; ty: integer;
-begin
-  SymTab.SymName(si, nm); ty := SymTab.SymTy(si);
-  if hasInit then begin
-    EnsureSection(SectData);
-    DeclMnemonic(ty, mn);
-    buf := nm + ' ' + mn + ' ' + IntStr(initVal);
-    Emit(buf)
-  end else begin
-    EnsureSection(SectBss);
-    ResSuffix(ty, rsfx);
-    buf := nm + ': ' + rsfx + ' 1';
-    Emit(buf)
-  end
-end;
+{ ---------------- VAR section (global) ----------------
+  EmitVarDecl/ParseArrayLitInit/ParseArrayStrLitInit/ParseVarSection
+  now live in unit GlobVar (SRC/GLOBVAR.PAS) -- see that unit's own
+  header comment for why. Called here as GlobVar.ParseVarSection.
+  ParseArrayBound stays here (not moved into GlobVar): RecTypes.
+  ParseRecordType also calls it directly for a RECORD field's own
+  '[N]' bound, so it's passed as a procedural-value parameter to BOTH
+  RecTypes and GlobVar rather than living in either. }
 
 { ParseArrayBound: 'N' in 'NAME: T[N]' -- a numeric literal, or a CONST
   identifier. }
@@ -918,222 +688,6 @@ begin
     Scan.ReportError(msg); ParseArrayBound := 1
   end else begin
     Scan.ReportError('expected array bound'); ParseArrayBound := 1
-  end
-end;
-
-{ ParseArrayLitInit: 'NAME: T[] = BASE64("...")' / '= FILE("...")' --
-  already past 'T[]' and '='; the current token is the BASE64/FILE
-  identifier itself (already peeked by the caller via
-  Scan.TokTextEqICase, not yet consumed). Streams the literal straight
-  to outF as hex "db" lines as it's decoded/read (Util.B64Feed/B64Flush
-  for BASE64, Util.StreamFileBytes for FILE -- EnsureSection(SectData)
-  first, since this form is ALWAYS a real stored value, unlike an
-  ordinary uninitialized array, which is .bss), never materializing the
-  whole decoded blob (or, for BASE64, the raw source text either -- see
-  Scan.SetB64Sink) in memory at once. Returns the decoded byte count so
-  the caller can SymSetVal(si, ...) it for SIZE(v) to find later
-  (DOCS/SPHO.MD's own "array literal" entry has the full reasoning for
-  reusing SymVal here). On any decode/read failure, reports a translator
-  error -- the caller still needs a byte count back (0) so it can decide
-  whether to touch .bss/.data at all for this declaration. }
-function ParseArrayLitInit(const nm: string): word;
-  var isFile: boolean; text, path, dir, msg: string;
-      ok: boolean; outLen: word; st: Util.TB64State; c: char;
-begin
-  ParseArrayLitInit := 0;
-  isFile := Scan.TokTextEqICase('FILE');
-  SymTab.Next;   { consume BASE64/FILE identifier }
-  if isFile then begin
-    SymTab.Expect(SymTab.SyLParen);
-    if Scan.CurTokKind <> TStr then begin
-      Scan.ReportError('expected a "..." string literal in BASE64()/FILE()');
-      SymTab.Expect(SymTab.SyRParen); exit
-    end;
-    { FILE()'s own argument is a short filename/path, never a long
-      encoded blob, so the ordinary CurTokText/`string` path is fine
-      here -- only BASE64()'s own text (below) needs streaming. }
-    Scan.CurTokText(text); SymTab.Next;
-    SymTab.Expect(SymTab.SyRParen);
-    Scan.SrcPath(path); dir := Util.ExtractDir(path);
-    EnsureSection(SectData);
-    Emits.Emit(es, false, 'section .data');
-    ok := Util.StreamFileBytes(es.f, nm, dir + text, MaxArrayLit, outLen);
-    if not ok then begin
-      msg := 'FILE(): cannot read file, or file exceeds ' + IntStr(MaxArrayLit) + ' bytes: ' + dir + text;
-      Scan.ReportError(msg); exit
-    end
-  end else begin
-    { BASE64()'s own text can be far longer than a TP7 `string` (255
-      chars) can hold -- e.g. 230 raw bytes encodes to 308 base64 chars
-      -- and this translator is one-token-lookahead (SymTab.Next always
-      prefetches the token AFTER the one it returns), so by the time
-      ordinary code could inspect "the next token is a string", it
-      would already be fully scanned. Scan.ArmRawStringNext defeats
-      that prefetch specifically for the '"' that Expect(SyLParen)'s
-      own internal lookahead would otherwise scan -- called BEFORE
-      Expect so the '"' is left unconsumed (Scan.CurTokKind reads as a
-      deferred, empty TStr placeholder afterward), then
-      Scan.RawStrOpen/RawStrNextCh pull the literal's raw characters
-      directly, feeding Util.B64Feed as they're read and writing "db"
-      lines to outF on the fly -- the source text is never copied into
-      a buffer at all. SymTab.Next afterward resumes ordinary lookahead
-      on whatever token follows the closing quote. }
-    EnsureSection(SectData);
-    Emits.Emit(es, false, 'section .data');
-    Util.B64Init(st, es.f, nm, MaxArrayLit);
-    Scan.ArmRawStringNext;
-    SymTab.Expect(SymTab.SyLParen);
-    if Scan.CurTokKind <> TStr then begin
-      Scan.ReportError('expected a "..." string literal in BASE64()/FILE()');
-      SymTab.Expect(SymTab.SyRParen); exit
-    end;
-    Scan.RawStrOpen;
-    while Scan.RawStrNextCh(c) do Util.B64Feed(st, c);
-    SymTab.Next;   { resume ordinary lookahead past the closing quote }
-    SymTab.Expect(SymTab.SyRParen);
-    ok := Util.B64Flush(st);
-    outLen := Util.B64OutLen(st);
-    if not ok then begin
-      Scan.ReportError('BASE64(): invalid base64 text, or decoded data exceeds ' + IntStr(MaxArrayLit) + ' bytes');
-      exit
-    end
-  end;
-  ParseArrayLitInit := outLen
-end;
-
-{ ParseArrayStrLitInit: 'NAME: T[] = "text"' -- current token is already
-  a TStr; encodes its raw bytes plus a trailing zero (ASCIIZ) into a
-  .data 'db' block under nm, same hex-byte emission Util.StreamFileBytes/
-  B64Feed already use for BASE64()/FILE(). }
-function ParseArrayStrLitInit(const nm: string): word;
-  var text: string; outLen: word; ok: boolean; msg: string;
-begin
-  ParseArrayStrLitInit := 0;
-  Scan.CurTokText(text); SymTab.Next;
-  EnsureSection(SectData);
-  Emits.Emit(es, false, 'section .data');
-  ok := Util.StreamStrBytes(es.f, nm, text, MaxArrayLit, outLen);
-  if not ok then begin
-    msg := '"..." array initializer exceeds ' + IntStr(MaxArrayLit) + ' bytes: ' + nm;
-    Scan.ReportError(msg); exit
-  end;
-  ParseArrayStrLitInit := outLen
-end;
-
-{ 'NAME: T[N]' -- array of N elements of T.
-  'NAME: T[] = BASE64("...")' / '= FILE("...")' -- array literal, sized
-  from the decoded data itself, always a real .data value (DOCS/SPHO.MD's
-  own new "array literal" entry has the full grammar/emission notes). }
-procedure ParseVarSection(isGlobal: boolean);
-  var nm: string; si, cnt, elemSz: integer; typ: SymTab.TTypeInfo; litLen: word;
-      hasInit, isEmptyArr, isLitInit: boolean; initVal: longint; buf, rsfx: string;
-      isArr: boolean;
-      names: array[1..MaxVarNames] of string[MaxName]; nNames, ni: integer;
-begin
-  while (Scan.CurTokKind = TIdent) and not SymTab.IsKw(SymTab.KwConst) and not SymTab.IsKw(SymTab.KwType)
-        and not SymTab.IsKw(SymTab.KwVar)
-        and not SymTab.IsKw(SymTab.KwProcedure) and not SymTab.IsKw(SymTab.KwBegin)
-        and not SymTab.IsKw(SymTab.KwEnd) do begin
-    nNames := 0;
-    repeat
-      Scan.CurTokText(nm); SymTab.Next;
-      if nNames >= MaxVarNames then
-        Scan.ReportError('too many names in one VAR group')
-      else begin
-        nNames := nNames + 1;
-        names[nNames] := nm
-      end
-    until not SymTab.IsLexSym(SymTab.SyComma);
-    SymTab.Expect(SymTab.SyColon);
-    ParseBaseType(typ);
-    isArr := false; isEmptyArr := false; cnt := 1;
-    if SymTab.IsLexSym(SymTab.SyLBrack) then begin
-      if SymTab.IsSym(SymTab.SyRBrack) then begin
-        { 'T[]' -- empty bound, only legal with a BASE64()/FILE()
-          initializer right after; SyRBrack is only peeked here (IsSym,
-          not IsLexSym), consumed by the Expect below like the [N] path. }
-        isEmptyArr := true
-      end else begin
-        isArr := true;
-        cnt := ParseArrayBound
-      end;
-      SymTab.Expect(SymTab.SyRBrack)
-    end;
-    hasInit := false; initVal := 0; isLitInit := false; litLen := 0;
-    if SymTab.IsLexSym(SymTab.SyEq) then begin
-      if (nNames > 1) then
-        Scan.ReportError('a comma-separated group of VAR names may not share an initializer');
-      if (Scan.CurTokKind = TIdent)
-         and (Scan.TokTextEqICase('BASE64') or Scan.TokTextEqICase('FILE')) then begin
-        if not isEmptyArr then begin
-          Scan.ReportError('BASE64()/FILE() initializer requires an empty array bound ''[]'', not an explicit N');
-          SymTab.Next   { consume the BASE64/FILE identifier so parsing can continue }
-        end else if not isGlobal then begin
-          Scan.ReportError('BASE64()/FILE() array initializer is only supported for a global VAR');
-          SymTab.Next
-        end else begin
-          litLen := ParseArrayLitInit(names[1]); isLitInit := true
-        end
-      end else if (Scan.CurTokKind = TStr) and isEmptyArr and isGlobal then begin
-        litLen := ParseArrayStrLitInit(names[1]); isLitInit := true
-      end else if (Scan.CurTokKind = TStr) and isEmptyArr and not isGlobal then begin
-        Scan.ReportError('"..." array initializer is only supported for a global VAR');
-        SymTab.Next
-      end else begin
-        hasInit := true; initVal := Scan.CurTokVal; SymTab.Next
-      end
-    end else if isEmptyArr then begin
-      Scan.ReportError('empty array bound ''[]'' requires a BASE64() or FILE() initializer')
-    end;
-    for ni := 1 to nNames do begin
-      nm := names[ni];
-      si := SymTab.SymAppend(nm, SymVar);
-      SymTab.SymSetTy(si, typ.ty, typ.recIdx); SymTab.SymSetIsLocal(si, not isGlobal);
-      { SymSetIsArr: persists this VAR's own array-ness (SOPLAN.MD's own
-        Phase 7 item 3) -- EmitCall's own call-site argument parser
-        needs to know a plain VAR NAME used as a call argument is
-        itself array-typed, to decide whether to auto-ADR() it against
-        an array-typed formal parameter. isArr here is TRUE for both
-        the 'T[N]' and empty-bound 'T[]' forms (isEmptyArr), matching
-        ParseParams' own identical isArr flag for a formal parameter. }
-      if isArr or isEmptyArr then SymTab.SymSetIsArr(si, true);
-      if isLitInit then
-        SymTab.SymSetVal(si, litLen)
-      else if isGlobal then begin
-        if isArr and (typ.ty = TyRec) then begin
-          { array of RECORD: reserve the true byte count directly. }
-          EnsureSection(SectBss);
-          buf := nm + ': resb ' + IntStr(longint(TySize(typ)) * longint(cnt));
-          Emit(buf)
-        end else if isArr then begin
-          EnsureSection(SectBss);
-          ResSuffix(typ.ty, rsfx);
-          buf := nm + ': ' + rsfx + ' ' + IntStr(longint(cnt));
-          Emit(buf)
-        end else if typ.ty = TyRec then begin
-          { a single RECORD instance, no field values ever written into it
-            at declaration time -- zero-filled reserved space. }
-          EnsureSection(SectBss);
-          buf := nm + ': resb ' + IntStr(longint(TySize(typ)));
-          Emit(buf)
-        end else
-          EmitVarDecl(si, hasInit, initVal)
-      end else begin
-        { local: reserve frame space, offset assigned by caller via
-          frameOfs. A local whose own element type is word-sized or
-          larger (TySize >= 2, checked BEFORE the isArr multiply so a
-          packed BYTE array isn't forced to align) must start on an even
-          [bp-N] offset -- bump frameOfs by one pad byte first when the
-          running total is currently odd, mirroring ParseRecordType's
-          own field-alignment padding. }
-        elemSz := TySize(typ);
-        if (elemSz >= 2) and Odd(ctx.frameOfs) then Inc(ctx.frameOfs);
-        if isArr then elemSz := elemSz * cnt;
-        ctx.frameOfs := ctx.frameOfs + elemSz;
-        SymTab.SymSetOfs(si, ctx.frameOfs)
-      end
-    end;
-    SymTab.Expect(SymTab.SySemi)
   end
 end;
 
@@ -1233,8 +787,8 @@ begin
     SymTab.Expect(SymTab.SyRBrack); exit
   end;
   typ.ty := elemTy; typ.recIdx := -1;
-  elemSz := TySize(typ);
-  SizeHintFor(elemTy, sizeHint);
+  elemSz := RecTypes.TySize(typ);
+  RecTypes.SizeHintFor(elemTy, sizeHint);
 
   { Peek: a numeric literal or a CONST name is a compile-time-constant
     index, same grammar ParseArrayBound already accepts for a declared
@@ -1370,7 +924,7 @@ begin
       SymTab.TypeName(ti, recTyName);
       dst := dst + recTyName + '.' + fieldName;
       if SymTab.TypeFindFieldTy(ti, fieldName, ftyp, fcnt) then begin
-        SizeHintFor(ftyp.ty, sizeHint);
+        RecTypes.SizeHintFor(ftyp.ty, sizeHint);
         if (fcnt <> 1) and not forAddress then begin
           msg := 'array field used as a scalar operand (only ADR() can address it): ' + recTyName + '.' + fieldName;
           Scan.ReportError(msg)
@@ -1470,7 +1024,7 @@ begin
       Scan.CurTokText(nm); SymTab.Next;
       ti := SymTab.FindType(nm);
       si := SymTab.FindSym(nm);
-      if ti >= 0 then begin typ.ty := TyRec; typ.recIdx := ti; dst := IntStr(longint(TySize(typ))) end
+      if ti >= 0 then begin typ.ty := TyRec; typ.recIdx := ti; dst := IntStr(longint(RecTypes.TySize(typ))) end
       else if (si >= 0) and (SymTab.SymKind(si) = SymVar) and (SymTab.SymVal(si) > 0) then
         { a VAR declared via a BASE64()/FILE() array literal (the only
           path that ever calls SymSetVal on a SymVar row, DOCS/SPHO.MD's
@@ -1480,8 +1034,8 @@ begin
           falls through to the type-name path below exactly as before. }
         dst := IntStr(SymTab.SymVal(si))
       else begin
-        ParseBaseTypeName(nm, typ);
-        dst := IntStr(longint(TySize(typ)))
+        RecTypes.ParseBaseTypeName(nm, typ);
+        dst := IntStr(longint(RecTypes.TySize(typ)))
       end
     end else begin
       Scan.ReportError('expected a type name in SIZE()'); SymTab.Next; dst := '0'
@@ -2513,15 +2067,6 @@ begin
   end
 end;
 
-{ EmitExprAssign: like EmitExpr but the destination is a memory operand
-  text rather than a register -- loads through AX first since x86 has no
-  mem,mem forms, then stores via MoveAxToDest. }
-procedure EmitExprAssign(const destMem, destSize: string);
-begin
-  EmitExpr('ax');
-  MoveAxToDest(destMem, true, destSize)
-end;
-
 { IsChainOp: TRUE if tok is an operator EmitExprTail would consume. }
 function IsChainOp: boolean;
 begin
@@ -2533,22 +2078,27 @@ begin
        or SymTab.IsKw(SymTab.KwOr)
 end;
 
-{ ExtractRegArg: after ALL arguments have been pushed, one argument
-  turned out to belong to a register-named formal parameter and must be
-  moved from its stack slot into that register, without disturbing the
-  relative stack order of any other still-stack-bound arguments. }
+{ Extract one staged word without clobbering already loaded registers.
+  Keep the selected value below BP while AX compacts the remaining words. }
 procedure ExtractRegArg(const regName: string; depthBytes: integer);
-  var d, bpDepth: integer;
+  var d: integer;
 begin
   AppendInstr1(MnPush, 'bp');
   AppendInstr2(MnMov, 'bp', 'sp');
-  bpDepth := depthBytes + 2;
-  AppendInstr2(MnMov, regName, '[bp+' + IntStr(longint(bpDepth)) + ']');
-  d := bpDepth;
+  d := depthBytes + 2;
+  AppendInstr1(MnPush, 'word [bp+' + IntStr(longint(d)) + ']');
+  AppendInstr1(MnPush, 'ax');
   while d > 2 do begin
     AppendInstr2(MnMov, 'ax', '[bp+' + IntStr(longint(d - 2)) + ']');
     AppendInstr2(MnMov, '[bp+' + IntStr(longint(d)) + ']', 'ax');
     Dec(d, 2)
+  end;
+  AppendInstr1(MnPop, 'ax');
+  if EqualICase(regName, 'BP') then
+    AppendInstr1(MnPop, 'word [bp]')
+  else begin
+    AppendInstr2(MnMov, regName, '[bp-2]');
+    AppendInstr2(MnAdd, 'sp', '2')
   end;
   AppendInstr1(MnPop, 'bp');
   AppendInstr2(MnAdd, 'sp', '2')
@@ -2559,32 +2109,12 @@ end;
   register-named formal parameter. Then `call`/`call far Name` depending
   on the callee's own FAR-ness. }
 procedure EmitCall(const name: string);
-  var opnd, nm, regNameTmp, callTarget: string; buf: word; isFar: boolean; si, ty, pi, argIdx, nArgs: integer;
-      isByteVar, wasValid, isLongLiteralArg, isRegPairArg: boolean;
-      pairSeg, pairOff, pairConsumed: string;
+  var opnd, nm, regNameTmp, callTarget: string; buf: word; isFar: boolean; si, ty, pi, argIdx, nArgs, depthBytes, j: integer;
+      isByteVar, wasValid, isLongArg, isRegPairArg, isLongVar, isLongCall: boolean;
+      pairSeg, pairOff, pairConsumed, hiWord: string;
+      argBytes: array[0..MaxParams-1] of integer;
       opRef: POpChunk; slotRef: integer;
       argIsReg: array[0..MaxParams-1] of boolean;
-      { SymTab.TRegName (string[3]), not a plain `string`: every
-        register name is at most 2 characters (AX, BX, ..., AL, AH,
-        ...) -- a plain `string` here (256 bytes each, TP7 ShortString)
-        made this ONE local array alone 8192 bytes on the stack
-        (MaxParams=32), a real contributor to a genuine TP7-only
-        stack-corruption bug this project's own stack-overflow-
-        checking-disabled directive (top of this file) let through
-        silently instead of raising a clean runtime error -- found via
-        a from-scratch debug-print investigation, not something fpc's
-        own much larger host stack ever reproduced. string[3] is 4
-        bytes each (1 length byte + 3 chars), 128 bytes total, matching
-        SymTab.RegList's own array[0..MaxUses-1] of SymTab.TRegName
-        shape. regNameTmp (a plain `string` local) is the go-between:
-        SymTab.ProcParamIsReg's own `var regName: string` parameter
-        must stay a plain `string` (it forwards straight into
-        LexTab.FindText's own `var dst: string`, general-purpose,
-        used for keywords/symbols too, which CAN be longer than 3
-        chars) -- TP7 requires an exact type match for a `var`
-        parameter, so ProcParamIsReg can't be called with a TRegName
-        actual argument directly; the result is copied into the
-        TRegName-typed array slot right after instead. }
       argRegName: array[0..MaxParams-1] of SymTab.TRegName;
 begin
   pi := SymTab.ProcFindAny(name, wasValid);
@@ -2606,66 +2136,36 @@ begin
     never had this protection. }
   if not SymTab.IsLexSym(SymTab.SyRParen) then begin
     repeat
-      isByteVar := false;
+      if argIdx >= MaxParams then begin
+        Scan.ReportError('too many call arguments'); exit
+      end;
+      argBytes[argIdx] := 2;
+      isByteVar := false; isLongVar := false; isLongCall := false;
+      si := -1;
       Scan.CurTokText(nm);
       if (Scan.CurTokKind = TIdent) and not SymTab.IsRegName(nm) then begin
         si := SymTab.FindSym(nm);
         if (si >= 0) and (SymTab.SymKind(si) = SymVar) then begin
           ty := SymTab.SymTy(si);
-          isByteVar := (ty = TyByte) or (ty = TyBool)
-        end
+          isByteVar := (ty = TyByte) or (ty = TyBool);
+          isLongVar := (ty = TyLong) and not SymTab.SymIsArr(si)
+        end else if SymTab.ProcFindRetTy(nm, ty) then
+          isLongCall := ty = TyLong
       end;
       argIsReg[argIdx] := SymTab.ProcParamIsReg(pi, argIdx, regNameTmp);
       argRegName[argIdx] := regNameTmp;
+      isLongArg := SymTab.ProcParamIsLong(pi, argIdx);
       isRegPairArg := false;
-      if SymTab.ProcParamIsLong(pi, argIdx) and (Scan.CurTokKind = TRegPair) then begin
-        { Tightly-spelled "DX:AX" argument -- TryParseRegPair's own
-          fast path (see that function's comment) consumes it directly;
-          the (Scan.CurTokKind = TIdent) guard below never sees this
-          case at all since the scanner already fused it into one
-          token, so this arm exists purely to route control into the
-          exact same TryParseRegPair call the TIdent arm below makes. }
+      if isLongArg and ((Scan.CurTokKind = TRegPair) or
+         ((Scan.CurTokKind = TIdent) and SymTab.IsRegName(nm))) then begin
         if TryParseRegPair(pairSeg, pairOff, pairConsumed) then begin
-          AppendInstr1(MnPush, pairSeg);
-          AppendInstr1(MnPush, pairOff);
-          isRegPairArg := true
-        end
-      end
-      else if SymTab.ProcParamIsLong(pi, argIdx) and (Scan.CurTokKind = TIdent) and SymTab.IsRegName(nm) then begin
-        if TryParseRegPair(pairSeg, pairOff, pairConsumed) then begin
-          { 'Foo(..., SEGREG:REG)' / 'Foo(..., REG:REG)' -- a register-
-            pair argument passed directly where the callee's own
-            parameter is declared LONGINT (DOCS/SPHINX.MD S11's own
-            register-pair syntax, general operand position, not just
-            assignment RHS). Pascal calling convention pushes left-to-
-            right and the callee reads the LOW word first at [bp+ofs]
-            (see AssignParamOffsets/Seek's own 'CX:DX := pos'
-            precedent) -- so the low half (the register AFTER the ':')
-            must be pushed LAST (ends up at the lower address / first
-            read), the high half (before the ':') pushed first.
-
-            Pushes the LIVE registers directly, no snapshot/protection
-            against an earlier argument's own evaluation clobbering
-            them first -- deliberately consistent with how a PLAIN bare
-            register argument (e.g. 'Foo(Earlier(), AX)') already
-            behaves with no protection at all: if an earlier argument's
-            evaluation clobbers AX before a later bare-AX argument is
-            reached, that argument silently reads whatever AX now holds
-            -- accepted, expected caller-sequencing behavior, not a bug
-            this translator guards against. A register PAIR argument
-            after an earlier one is the exact same class of hazard and
-            is treated the same way now, not specially protected. }
+          { High word first, low word last, from live argument registers. }
           AppendInstr1(MnPush, pairSeg);
           AppendInstr1(MnPush, pairOff);
           isRegPairArg := true
         end else begin
-          { TryParseRegPair consumed a lone register with no following
-            ':' (an ordinary single-register operand, e.g. 'Foo(AX)',
-            for a LONGINT parameter -- unusual but not this branch's
-            concern to reject) -- finish it the same way OperandText's
-            own register branch would, including the .INTEGER/.WORD
-            cast peek, since that token is already consumed and
-            OperandText can't be called again to re-read it. }
+          { A lone register is consumed here, then rejected as a partial
+          LONGINT argument below. Consume its optional cast as well. }
           opnd := pairConsumed;
           lastOperandWasIntReg := false;
           if SymTab.IsLexSym(SymTab.SyDot) then begin
@@ -2680,26 +2180,29 @@ begin
           end
         end
       end else if SymTab.ProcParamIsArray(pi, argIdx) and (si >= 0) and SymTab.SymIsArr(si) then begin
-        { Array-parameter auto-ADR() (SOPLAN.MD's own Phase 7 item 3):
-          the callee's own formal at this position is array-typed
-          (ProcParamIsArray) and the argument token itself is an array-
-          typed VAR (SymIsArr, pre-peeked into si/nm above, same pattern
-          isByteVar already uses) -- push its ADDRESS, exactly as if the
-          caller had written ADR(arr) explicitly (EmitAdrOperand, the
-          same helper the real ADR() builtin uses: a no-op label lookup
-          for a global array, 'lea ax, [bp+-N]' for a local one). The
-          identifier itself hasn't been consumed yet (only peeked, same
-          as isByteVar's own si lookup above) -- SymTab.Next consumes it
-          here, mirroring what OperandText would otherwise have done. }
+        { Array storage needs its address; a formal already stores one. }
         SymTab.Next;
-        EmitAdrOperand(nm, si, opnd)
+        if SymTab.SymIsParam(si) then SymOperandText(si, nm, opnd)
+        else EmitAdrOperand(nm, si, opnd)
       end else
         OperandText(opnd);
-      isLongLiteralArg := (not isRegPairArg) and (Scan.CurTokKind <> TIdent) and not SymTab.IsRegName(opnd)
-                          and not isByteVar and SymTab.ProcParamIsLong(pi, argIdx);
+      if isLongArg and not isRegPairArg then begin
+        if IsChainOp or isByteVar or
+           (SymTab.IsRegName(opnd) and not isLongCall) then begin
+          Scan.ReportError('LONGINT argument requires a full-width value or literal'); exit
+        end
+      end;
       if isRegPairArg then begin
-        { the register-pair branch above already emitted its own
-          push(es) -- nothing left to do for this argument. }
+        argBytes[argIdx] := 4
+      end else if isLongArg and (isLongVar or isLongCall) then begin
+        if isLongCall then begin
+          AppendInstr1(MnPush, 'dx'); AppendInstr1(MnPush, 'ax')
+        end else begin
+          SpliceOffset(opnd, 2, hiWord);
+          AppendInstr1(MnPush, 'word ' + hiWord);
+          AppendInstr1(MnPush, 'word ' + opnd)
+        end;
+        argBytes[argIdx] := 4
       end else if IsChainOp then begin
         EmitExprFrom(opnd, 'ax');
         AppendInstr1(MnPush, 'ax')
@@ -2713,34 +2216,9 @@ begin
         AppendInstr2(MnMov, 'al', 'byte ' + opnd);
         AppendInstr2(MnMov, 'ah', '0');
         AppendInstr1(MnPush, 'ax')
-      end else if isLongLiteralArg then begin
-        { A plain numeric-literal argument passed where the callee's
-          own parameter is declared LONGINT (DOCS/SPHINX.MD S14: a
-          LONGINT value never comes from a literal directly -- the
-          language has no such literal form) must still push a real
-          4-byte value: the Pascal calling convention's own callee-
-          side `retn N` (EmitProcedureEpilogue) already counts this
-          parameter as 4 bytes, so pushing only 2 (the ordinary literal
-          path below) desyncs the stack on return. SPHINX has no
-          negative-LONGINT-literal syntax either, so zero-extending
-          (push a 0 high word, then the literal itself) is always
-          correct here, mirroring the xor-ax,ax zero-literal
-          optimization just below for the ordinary 2-byte case.
-
-          Real bug fixed here (DOCS/TRBUG.MD): the two pushes used to
-          run in the WRONG order -- opnd (the low/offset half) pushed
-          FIRST, then the 0 high word SECOND -- the exact opposite of
-          what this comment already said should happen and of what the
-          callee actually expects (the low word must be pushed LAST, so
-          it lands at the lower stack address / [bp+N] read first, same
-          convention TryParseRegPair's own pairSeg/pairOff push order
-          above already documents and follows correctly). A string
-          literal passed directly to a POINTER-typed parameter hits
-          this exact branch (isLongLiteralArg's own "not TIdent, not a
-          register" condition) -- confirmed the hard way:
-          lzp_compress("A.TXT", "B.LZP") always returned FALSE (Reset
-          silently failed on a garbage pointer), while the equivalent
-          DS:SI/DS:DI register-pair form worked correctly. }
+      end else if isLongArg then begin
+        { Literal/address arguments are zero-extended to two stack words. }
+        argBytes[argIdx] := 4;
         AppendInstr2(MnXor, 'ax', 'ax');
         AppendInstr1(MnPush, 'ax');
         AppendInstr2(MnMov, 'ax', opnd);
@@ -2775,10 +2253,17 @@ begin
     SymTab.Expect(SymTab.SyRParen)
   end;
   nArgs := argIdx;
+  if (pi >= 0) and (nArgs <> SymTab.ProcNParams(pi)) then begin
+    Scan.ReportError('call argument count differs from declaration'); exit
+  end;
   argIdx := 0;
   while argIdx < nArgs do begin
-    if argIsReg[argIdx] then
-      ExtractRegArg(argRegName[argIdx], 2 * (nArgs - 1 - argIdx));
+    if argIsReg[argIdx] then begin
+      depthBytes := 0;
+      j := argIdx + 1;
+      while j < nArgs do begin Inc(depthBytes, argBytes[j]); Inc(j) end;
+      ExtractRegArg(argRegName[argIdx], depthBytes)
+    end;
     Inc(argIdx)
   end;
   if not SymTab.ProcFindIsFar(name, isFar) then isFar := true;
@@ -2791,8 +2276,13 @@ end;
 
 { EmitCallNoArgs: 'Name' already consumed, no '(' at all. }
 procedure EmitCallNoArgs(const name: string);
-  var callTarget: string; buf: word; isFar: boolean; opRef: POpChunk; slotRef: integer;
+  var callTarget: string; buf: word; isFar, wasValid: boolean; pi: integer;
+      opRef: POpChunk; slotRef: integer;
 begin
+  pi := SymTab.ProcFindAny(name, wasValid);
+  if (pi >= 0) and (SymTab.ProcNParams(pi) <> 0) then begin
+    Scan.ReportError('call argument count differs from declaration'); exit
+  end;
   if not SymTab.ProcFindIsFar(name, isFar) then isFar := true;
   if isFar then buf := MnCallFar else buf := MnCall;
   if not SymTab.ProcFindExternal(name, callTarget) then callTarget := name;
@@ -2955,14 +2445,19 @@ end;
   declared storage size when known. Also handles the reverse LONGINT
   register-pair direction: the RHS -- checked first -- may itself be a
   bare 'SEG:REG' register pair. }
-procedure EmitAssignRhs(const destReg: string; destIsMem: boolean; const destSize: string);
+procedure EmitAssignRhs(const destReg: string; destIsMem: boolean; const destSize: string; saveBase: boolean);
   var nm, opnd, sfx, srcSeg, srcOff, consumedReg: string;
       regId, si, ty: integer; gotReg, freshIsReg: boolean;
+  procedure RestoreBase;
+  begin
+    if saveBase then AppendInstr1(MnPop, 'bx')
+  end;
 begin
+  if saveBase then AppendInstr1(MnPush, 'bx');
   gotReg := false;
   if destIsMem then begin
     if TryParseRegPair(srcSeg, srcOff, consumedReg) then begin
-      EmitLongVarFromRegPair(destReg, srcSeg, srcOff); exit
+      RestoreBase; EmitLongVarFromRegPair(destReg, srcSeg, srcOff); exit
     end else if consumedReg <> '' then begin
       nm := consumedReg; gotReg := true
     end
@@ -3006,17 +2501,17 @@ begin
           through to the general EmitExprFrom/MoveAxToDest path instead,
           which already correctly narrows via AL when destSize='byte'. }
       end else begin
-        AppendInstr2(MnMov, sfx + destReg, nm);
+        RestoreBase; AppendInstr2(MnMov, sfx + destReg, nm);
         exit
       end
     end;
     EmitExprFrom(nm, 'ax');
-    MoveAxToDest(destReg, destIsMem, destSize);
+    RestoreBase; MoveAxToDest(destReg, destIsMem, destSize);
     exit
   end;
   Scan.CurTokText(nm);
   if (Scan.CurTokKind = TIdent) and IsBuiltinName(nm) then begin
-    if destIsMem then begin EmitExpr('ax'); MoveAxToDest(destReg, destIsMem, destSize) end
+    if destIsMem then begin EmitExpr('ax'); RestoreBase; MoveAxToDest(destReg, destIsMem, destSize) end
     else EmitExpr(destReg);
     exit
   end;
@@ -3032,19 +2527,21 @@ begin
           IdentOperandText(nm, opnd);
           if (opnd <> '') and (opnd[1] = '[') then begin
             AppendInstr2(MnMov, 'al', 'byte ' + opnd);
-            AppendInstr2(MnMov, 'byte ' + destReg, 'al')
+            RestoreBase; AppendInstr2(MnMov, 'byte ' + destReg, 'al')
           end else begin
-            AppendInstr2(MnMov, 'byte ' + destReg, opnd)
+            RestoreBase; AppendInstr2(MnMov, 'byte ' + destReg, opnd)
           end;
           exit
         end;
         EmitExprFrom(nm, 'ax');
-        AppendInstr2(MnMov, 'byte ' + destReg, 'al');
+        RestoreBase; AppendInstr2(MnMov, 'byte ' + destReg, 'al');
         exit
       end
     end
   end;
-  if destIsMem then EmitExprAssign(destReg, destSize) else EmitExpr(destReg)
+  if destIsMem then begin
+    EmitExpr('ax'); RestoreBase; MoveAxToDest(destReg, true, destSize)
+  end else EmitExpr(destReg)
 end;
 
 { EmitLongVarFromCallIfMatch: if the CURRENT token is 'name(' where name
@@ -3102,7 +2599,7 @@ begin
   if SymTab.IsSym(SymTab.SyLBrack) then begin
     SymTab.Next; ParseMemOperand(buf, destSize, false);
     SymTab.Expect(SymTab.SyAssign);
-    EmitAssignRhs(buf, true, destSize)
+    EmitAssignRhs(buf, true, destSize, false)
   end else if Scan.CurTokKind = TRegPair then begin
     { A tightly-spelled register pair ("DX:AX", no whitespace inside
       it) as the assignment TARGET -- the scanner already recognized
@@ -3121,13 +2618,13 @@ begin
         for the full design). }
       EmitIndexedOperand(si, lhs, buf, destSize);
       SymTab.Expect(SymTab.SyAssign);
-      EmitAssignRhs(buf, true, destSize)
+      EmitAssignRhs(buf, true, destSize, Copy(buf, 1, 3) = '[bx')
     end
     else if SymTab.IsRegName(lhs) and SymTab.IsLexSym(SymTab.SyColon) then
       ParseRegPairAssign(lhs)
     else if SymTab.IsLexSym(SymTab.SyAssign) then begin
       if SymTab.IsRegName(lhs) then
-        EmitAssignRhs(lhs, false, '')
+        EmitAssignRhs(lhs, false, '', false)
       else begin
         si := SymTab.FindSym(lhs);
         if (si >= 0) and (SymTab.SymKind(si) = SymConst) then begin
@@ -3135,7 +2632,7 @@ begin
           Scan.ReportError(msg)
         end;
         SymOperandText(si, lhs, buf);
-        if (si >= 0) and (SymTab.SymKind(si) = SymVar) then SizeHintFor(SymTab.SymTy(si), destSize)
+        if (si >= 0) and (SymTab.SymKind(si) = SymVar) then RecTypes.SizeHintFor(SymTab.SymTy(si), destSize)
         else destSize := '';
         if (si >= 0) and (SymTab.SymKind(si) = SymVar) and (SymTab.SymTy(si) = TyLong)
            and not SymTab.SymIsReg(si) and (Scan.CurTokKind = TNum) then begin
@@ -3168,8 +2665,8 @@ begin
             ever move the LOW word AX -- a LONGINT-returning call's own
             DX half would otherwise be silently dropped). }
         end
-        else if (si >= 0) and SymTab.SymIsReg(si) then EmitAssignRhs(buf, false, '')
-        else EmitAssignRhs(buf, true, destSize)
+        else if (si >= 0) and SymTab.SymIsReg(si) then EmitAssignRhs(buf, false, '', false)
+        else EmitAssignRhs(buf, true, destSize, false)
       end
     end else if SymTab.IsLexSym(SymTab.SyLParen) then
       EmitCall(lhs)
@@ -3584,7 +3081,7 @@ begin
         end
       end;
       if not SymTab.IsLexSym(SymTab.SyColon) then begin typ.ty := TyInt; typ.recIdx := -1 end
-      else ParseBaseType(typ);
+      else RecTypes.ParseBaseType(typ);
       { Optional 'T[N]'/'T[]' array-parameter syntax (SOPLAN.MD's own
         Phase 7 item 3, "array parameter syntax... typed address/
         length convention") -- address-only sugar: N itself (if given)
@@ -3790,7 +3287,7 @@ begin
   ctx.procRetTy := TyWord; ctx.hasRetTy := false;
   if SymTab.IsLexSym(SymTab.SyColon) then begin
     kwTy := -1;
-    if SymTab.CurTokKind = SymTab.LexKw then kwTy := ScalarKwTy(SymTab.CurTokId);
+    if SymTab.CurTokKind = SymTab.LexKw then kwTy := RecTypes.ScalarKwTy(SymTab.CurTokId);
     if kwTy >= 0 then begin ctx.procRetTy := kwTy; ctx.hasRetTy := true; SymTab.Next end
   end;
   isFar := exported; isInterrupt := false;
@@ -3877,7 +3374,8 @@ begin
     procedure's body is fully parsed, below. }
   bodyStartChunk := comp.opTail; bodyStartSlot := comp.opTail^.count;
   ctx.frameOfs := 0;
-  if SymTab.IsLexKw(SymTab.KwVar) then ParseVarSection(false);
+  if SymTab.IsLexKw(SymTab.KwVar) then
+    GlobVar.ParseVarSection(false, ctx.frameOfs, es, SectData, SectBss, Emit, EnsureSection, ParseArrayBound);
   needsFrame := (nStack > 0) or (ctx.frameOfs > 0);
   if needsFrame then begin
     AppendInstr1(MnPush, 'bp');
@@ -3990,9 +3488,13 @@ begin
             and not SymTab.IsKw(SymTab.KwBegin)
             and not SymTab.IsKw(SymTab.KwEnd) do ParseConstDecl
     end else if SymTab.IsLexKw(SymTab.KwType) then
-      ParseTypeSection
+      RecTypes.ParseTypeSection(SectStruc, Emit, Emit2, EnsureSection, ParseArrayBound)
     else if SymTab.IsLexKw(SymTab.KwVar) then
-      ParseVarSection(true)
+      { frameOfs (ctx.frameOfs here) is a required var parameter but
+        never touched by ParseVarSection's own isGlobal=true path --
+        no live procedure context exists at this call site anyway
+        (module-level VAR section, not inside a PROCEDURE body). }
+      GlobVar.ParseVarSection(true, ctx.frameOfs, es, SectData, SectBss, Emit, EnsureSection, ParseArrayBound)
     else if SymTab.IsLexKw(SymTab.KwProcedure) then
       ParseProcedure
   end;
@@ -4104,163 +3606,11 @@ begin
   SymTab.FreeChunks
 end;
 
-{ TySphinxName: the SPHINX-source keyword spelling for a SymTab.Ty*
-  scalar id -- the reverse of ScalarKwTy's own mapping (that one goes
-  keyword -> ty; EmitSHD needs ty -> keyword text to print a
-  reconstructed CONST/field/parameter/return type). CHAR is BYTE's own
-  synonym (DOCS/SPHINX.MD S3.1/S6.4) and POINTER is LONGINT's
-  (S3.1) -- both fold to the same ty id as their base type, so this
-  always emits the base spelling (BYTE/LONGINT), never the synonym;
-  a real RECORD type (ty = TyRec) is named via TypeName(recIdx, ...)
-  at the call site instead, since only the caller has recIdx at hand. }
-procedure TySphinxName(ty: integer; var dst: string);
-begin
-  case ty of
-    TyByte: dst := 'BYTE';
-    TyBool: dst := 'BOOLEAN';
-    TyWord: dst := 'WORD';
-    TyInt:  dst := 'INTEGER';
-    TyLong: dst := 'LONGINT';
-  else dst := 'WORD'
-  end
-end;
-
-{ EmitFieldType: 'BYTE'/'aRecordTypeName', plus a '[N]' array-bound
-  suffix when cnt > 1 -- shared by EmitSHD's own RECORD-field and
-  PROCEDURE-parameter printing, since both are (name, TTypeInfo, cnt)
-  triples underneath (FieldDef and a parameter's own si, respectively). }
-procedure EmitFieldType(typ: SymTab.TTypeInfo; cnt: word; var dst: string);
-  var tn: string;
-begin
-  if typ.ty = TyRec then SymTab.TypeName(typ.recIdx, dst)
-  else TySphinxName(typ.ty, dst);
-  if cnt > 1 then dst := dst + '[' + IntStr(cnt) + ']'
-end;
-
-{ EmitSHD: after a full top-level translation, regenerate outPath's
-  own .SHD sibling -- every CONST and TYPE declaration this module
-  parsed (verbatim value/shape, not just names), plus one
-  'PROCEDURE Name(params): RetTy; NEAR; EXTERNAL;' line per '*'-
-  exported PROCEDURE (SOPLAN.MD-adjacent request: "imported module
-  must have .SHD extension... generate text file .SHD" -- IMPORT
-  itself now resolves to .SHD, Scan.OpenInclude). No VAR globals ever
-  appear (a caller only reaches another module's own state through
-  its exported procedures, never a shared global) and non-exported/
-  FORWARD-only PROCEDUREs are skipped, matching LIB/FILES.SHD's own
-  hand-written shape exactly (the model this was built to match). }
-procedure EmitSHD(const srcPath, modName: string);
-  var shdEs: Emits.TEmitState; shdPath: string;
-      i, fi, pi, nf, np: integer;
-      nm, fnm, tnm, line, retNm: string;
-      typ: SymTab.TTypeInfo; cnt: word; any: boolean;
-begin
-  shdPath := ReplaceExt(srcPath, '.SHD');
-  if not Emits.open(shdEs, shdPath) then exit;
-  Emits.Emit(shdEs, false, 'MODULE ' + modName + ';');
-  Emits.Emit(shdEs, false, '');
-
-  { CONST: only '*'-exported CONSTs this module declared (SymIsExported
-    -- same '*' marker PROCEDURE already has), its own final (already-
-    folded) value -- SymTab has no "declared as CONST X" text left by
-    this point, only the numeric result (SymVal), so a negative
-    source literal like 'CONST Foo* = -1;' round-trips as the same
-    value via a plain 'Foo = -1;' line either way. }
-  any := false;
-  for i := SymTab.BuiltinSymCount to SymTab.SymCount - 1 do
-    if (SymTab.SymKind(i) = SymConst) and SymTab.SymIsExported(i) then any := true;
-  if any then begin
-    Emits.Emit(shdEs, false, 'CONST');
-    for i := SymTab.BuiltinSymCount to SymTab.SymCount - 1 do begin
-      if (SymTab.SymKind(i) = SymConst) and SymTab.SymIsExported(i) then begin
-        SymTab.SymName(i, nm);
-        line := '  ' + nm + ' = ' + IntStr(SymTab.SymVal(i)) + ';';
-        Emits.Emit(shdEs, false, line)
-      end
-    end;
-    Emits.Emit(shdEs, false, '')
-  end;
-
-  { TYPE: only '*'-exported RECORDs this module declared (the only TYPE
-    shape DOCS/SPHINX.MD supports -- ParseBaseType's own "aliasTy =
-    TyRec" check elsewhere in this file is the only real TYPE-section
-    form parsed anywhere in this translator), fields in their own
-    original declaration order (TypeField's own 0-based fi). }
-  any := false;
-  for i := 0 to SymTab.TypeCount - 1 do
-    if SymTab.TypeIsExported(i) then any := true;
-  if any then begin
-    Emits.Emit(shdEs, false, 'TYPE');
-    for i := 0 to SymTab.TypeCount - 1 do begin
-      if not SymTab.TypeIsExported(i) then continue;
-      SymTab.TypeName(i, nm);
-      Emits.Emit(shdEs, false, '  ' + nm + ' = RECORD');
-      nf := SymTab.TypeNFields(i);
-      for fi := 0 to nf - 1 do begin
-        SymTab.TypeField(i, fi, fnm, typ, cnt);
-        EmitFieldType(typ, cnt, tnm);
-        line := '    ' + fnm + ' : ' + tnm;
-        if fi < nf - 1 then line := line + ';';
-        Emits.Emit(shdEs, false, line)
-      end;
-      Emits.Emit(shdEs, false, '  END;')
-    end;
-    Emits.Emit(shdEs, false, '')
-  end;
-
-  { PROCEDURE ... EXTERNAL: only '*'-exported rows (ProcIsExported),
-    verbatim parameter list (name : Type, register-named formals
-    included as an ordinary WORD-shaped param here -- EXTERNAL's own
-    caller-side codegen (EmitCall) only ever consults ProcParamIsReg/
-    IsLong/IsArray freshly parsed from ITS OWN call site's actual
-    argument syntax, never the callee's .SHD text, so a register-
-    named formal's own .SHD spelling is cosmetic only). }
-  for pi := 0 to SymTab.ProcCount - 1 do begin
-    if not SymTab.ProcIsExported(pi) then continue;
-    SymTab.ProcName(pi, nm);
-    np := SymTab.ProcNParams(pi);
-    line := 'PROCEDURE ' + nm + '(';
-    for i := 0 to np - 1 do begin
-      SymTab.ProcParamName(pi, i, fnm);
-      { By-value RECORD parameters are already rejected elsewhere
-        (RejectRecordParams, DOCS/SPHINX.MD S6.6) -- ProcParamTy here
-        is always a plain scalar, never TyRec, so recIdx is never read. }
-      typ.ty := SymTab.ProcParamTy(pi, i); typ.recIdx := -1;
-      cnt := 1;
-      if SymTab.ProcParamIsArray(pi, i) then cnt := 2;   { any bound > 1
-        alone is enough to print a '[...]' suffix; the real element
-        count isn't tracked per-parameter (only per-RECORD-field), and
-        EXTERNAL's own caller-side codegen never consults .SHD text
-        anyway (see this procedure's own header comment) -- cosmetic
-        only. }
-      EmitFieldType(typ, cnt, tnm);
-      line := line + fnm + ' : ' + tnm;
-      if i < np - 1 then line := line + '; '
-    end;
-    line := line + ')';
-    if SymTab.ProcSigHasRetTy(pi) then begin
-      TySphinxName(SymTab.ProcRetTy(pi), retNm);
-      line := line + ' : ' + retNm
-    end;
-    { NEAR vs FAR must match the real procedure, not be hardcoded to
-      NEAR -- DOCS/SPHINX.MD: an exported ('*') PROCEDURE defaults to
-      FAR unless explicitly marked NEAR (ParseProcedure's own
-      "isFar := exported" default). A caller re-parsing this .SHD
-      (SymTab.OpenInclude) trusts this text's own NEAR/FAR keyword to
-      decide EmitCall's own "call" vs "call far" -- printing NEAR here
-      for a real FAR procedure previously made a cross-module call
-      site emit a plain "call" against a callee whose own "retf"
-      epilogue pops one extra segment word the "call" never pushed,
-      corrupting the caller's own return address at runtime. }
-    if SymTab.ProcIsFar(pi) then line := line + '; FAR; EXTERNAL;'
-    else line := line + '; NEAR; EXTERNAL;';
-    Emits.Emit(shdEs, false, line)
-  end;
-
-  Emits.Emit(shdEs, false, '');
-  Emits.Emit(shdEs, false, 'END ' + modName + '.');
-  Emits.close(shdEs);
-  LogErr.Info2('wrote ', shdPath)
-end;
+{ TySphinxName/EmitFieldType/EmitSHD now live in unit ShdWrt
+  (SRC/SHDWRT.PAS) -- see that unit's own header comment for why
+  this cluster split out even more cleanly than RecTypes did (no
+  comp/ctx/es dependency at all, so no procedural-parameter hooks
+  needed). Called here as ShdWrt.EmitSHD. }
 
 function FileExistsLocal(const path: string): boolean;
   var f: file; i : integer;
@@ -4285,7 +3635,6 @@ begin
     LogErr.Error2('no such file: ', srcPath); RunBody := ExitIo; exit
   end;
   comp.nLits := 0;
-  comp.nPending := 0;
   comp.nOps := 0;
   ctx.labelCnt := 0; comp.loopDepth := -1;
   comp.curSect := SectNone;
@@ -4323,7 +3672,7 @@ begin
   Scan.CloseSource;
   Emits.close(es);
   LogErr.Info2('wrote ', outPath);
-  if not topHasBegin then EmitSHD(srcPath, topModName);
+  if not topHasBegin then ShdWrt.EmitSHD(srcPath, topModName);
   FreeChunks;
   RunBody := ExitOk
 end;
