@@ -22,8 +22,13 @@ LIB = SPHO.LIB
 # its own top-level file (no BEGIN...END in any of them), so each also
 # gets its own NAME.SHD alongside NAME.ASM (DOCS/SPHINX.MD's own
 # auto-generation rule) -- that's what every example's own IMPORT
-# resolves against via the LIB\ fallback search path.
-MODULES = ALLOC CHARS FILES KBD LZPLIB LZSSLIB OUT STRINGS SYSTEM
+# resolves against via the LIB\ fallback search path. Listed in
+# DEPENDENCY order, not alphabetical: a module's own IMPORT needs its
+# dependency's .SHD to already exist on disk by the time THIS Makefile
+# gets to it (SYSTEM before CMDLINE, FILES before LZPLIB/LZSSLIB --
+# the latter two already happened to sort alphabetically right, CMDLINE
+# does not).
+MODULES = SYSTEM ALLOC CHARS CMDLINE FILES KBD LZPLIB LZSSLIB OUT STRINGS
 
 RDFS = $(addsuffix .RDF,$(MODULES))
 

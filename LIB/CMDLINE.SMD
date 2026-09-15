@@ -1,0 +1,194 @@
+(* CMDLINE - shared DOS PSP command-tail scanning helpers, factored out
+   of EXAMPLES/CRK/MKCRK.SMD, EXAMPLES/CRK/APPLYCRK.SMD,
+   EXAMPLES/LZSS/LZSS.SMD, EXAMPLES/LZSS/LZP.SMD, and
+   EXAMPLES/MIME/MIME.SMD, which all carried byte-for-byte-identical
+   copies of IsBlank/IsSep/SkipBlanks and a quote-aware GetToken. A code
+   review flagged this duplication as a real risk, not just repetition:
+   EXAMPLES/LCOUNT/LCOUNT.SMD's own separate, hand-tuned command-tail
+   parser (a genuinely different design, not built on this shared
+   shape, and kept that way -- see its own header comment) had silently
+   drifted to carry a real bug (a stale-SI NUL-terminator write) that
+   the copies sharing THIS shape never had, simply because each copy
+   was independently maintained. Consolidating the ones that truly are
+   the same shape removes that drift risk for future changes.
+
+   cmdTailLen/cmdIdx are NOT module-level VARs here, and this dialect
+   has no VAR/by-reference parameter keyword at all (every other module
+   in this codebase mutates caller-owned state via an explicit address
+   parameter, e.g. LIB/FILES.SMD's own `Reset*(fp: WORD; ...)`, `fp`
+   being ADR(someFileRecord) dereferenced inside via `[DS:BX]...`, never
+   a `VAR fp` parameter -- README.MD's own documented `.SHD` contract is
+   also explicit that "VAR globals are never included" in a module's
+   own exported header, ruling out module-level shared state too).
+   Every exported procedure below instead takes pcs: WORD, the caller's
+   own ADR(...) of a small two-WORD record holding cmdTailLen/cmdIdx
+   (CmdState, below) -- a drop-in replacement for the original five
+   copies' own identically-named locals, just threaded through an
+   explicit pointer now instead of implicit shared file-scope state.
+   Named "pcs", not "cs" -- "cs" collides with the real CS segment
+   register, a reserved identifier in this dialect (found the hard way:
+   an earlier draft named it "cs", which compiled without error but
+   silently generated "MOV CS, [bp-2]"-style garbage code instead of an
+   ordinary parameter read, hanging the very first caller that used it).
+
+   GetToken here is the QUOTE-AWARE variant (a `"..."` token reads
+   through to the matching closing quote or CR, `"`-literal, never
+   treated as an ordinary separator) -- the version every one of the
+   five original copies already had, a strict superset of behavior,
+   safe to share without changing anything any of them could already
+   do. EXAMPLES/TARPAK/TARPAK.SMD and EXAMPLES/TARPAK/TARUNPAK.SMD have
+   their own separate, genuinely simpler NO-QUOTE GetToken (space/tab/
+   CR terminate a token, nothing else) -- kept as TARLIB.SMD's own
+   GetTokenPlain instead of forcing quote support neither program ever
+   asked for onto them. *)
+MODULE CMDLINE;
+
+IMPORT SYSTEM;
+
+TYPE
+  CmdState* = RECORD
+    tailLen : WORD;   (* raw command-tail length, PSP offset 80H *)
+    idx     : WORD    (* 1-based scan cursor into the tail, PSP 81H+ *)
+  END;
+
+(* StartCmdLine: read the DOS PSP's own command-tail length (a single
+   BYTE at PSP offset 80H, NOT a WORD -- a bare "[ES:BX]" with no
+   declared-field size hint defaults to a word-sized read, which would
+   read this length byte AND the very first tail character packed
+   together as one 16-bit value instead of just the length) into
+   pcs^.tailLen, and resets pcs^.idx to 1 (PSP offset 81H, the tail's
+   own first real character) ready for SkipBlanks/GetToken. Every
+   original caller's own copy of this exact five-line boilerplate
+   (GetPSP; ES:=AX; BX:=80H; AL:=[ES:BX]; cmdTailLen:=AL; cmdIdx:=1) is
+   now just this one call -- ES itself is also left set on return (USES
+   omits it deliberately), matching every original caller's own
+   convention of leaving ES pointing at the PSP segment for
+   SkipBlanks/GetToken's own later "[ES:BX]" reads, which never reload
+   ES themselves. *)
+PROCEDURE StartCmdLine*(pcs : WORD); NEAR;
+BEGIN
+  GetPSP();
+  ES := AX;
+  BX := 80H;
+  AL := [ES:BX];
+  BX := pcs;
+  [DS:BX].CmdState.tailLen := AL;
+  [DS:BX].CmdState.idx := 1
+END StartCmdLine;
+
+PROCEDURE IsBlank*(AL) : BOOLEAN; NEAR;
+BEGIN
+  IF AL = Space THEN
+    AL := TRUE
+  ELSIF AL = Tab THEN
+    AL := TRUE
+  ELSE
+    AL := FALSE
+  END
+END IsBlank;
+
+PROCEDURE IsSep*(c : BYTE) : BOOLEAN; NEAR;
+BEGIN
+  IF IsBlank(c) THEN
+    AL := TRUE
+  ELSIF c = CR THEN
+    AL := TRUE
+  ELSE
+    AL := FALSE
+  END
+END IsSep;
+
+PROCEDURE SkipBlanks*(pcs : WORD); NEAR;
+VAR c : BYTE; tailLen, idx : WORD;
+BEGIN
+  BX := pcs;
+  tailLen := [DS:BX].CmdState.tailLen;
+  idx := [DS:BX].CmdState.idx;
+  WHILE idx <= tailLen DO
+    BX := 80H + idx;
+    c := [ES:BX];
+    IF IsBlank(c) THEN
+      INC(idx)
+    ELSE
+      BREAK
+    END
+  END;
+  BX := pcs;
+  [DS:BX].CmdState.idx := idx
+END SkipBlanks;
+
+(* GetToken: copies the next command-tail token into dst (NUL-
+   terminated, at most maxLen-1 real bytes copied, matching every
+   original copy's own "MaxName-1" convention -- the caller passes its
+   own buffer's real declared size here instead of this module naming
+   one particular constant). A token starting with a '"' reads through
+   to the matching closing '"' (consumed, not copied) or CR (left
+   in place, unconsumed, matching a malformed/unterminated quoted
+   token the same way every original copy already did); otherwise a
+   plain token ends at the first IsSep byte (blank or CR), which is
+   left unconsumed for the caller's own next SkipBlanks/GetToken call
+   (or NextLine-style CR handling) to see. Returns FALSE (dst still
+   written, NUL-terminated, empty) if the tail is already exhausted, or
+   the tail's own very next byte is CR (nothing left to read at all) --
+   both are "no token here" the same way every original copy already
+   distinguished it from "an empty quoted token was read", i.e.
+   RETURN's own boolean is "was ANY byte consumed", not "is dst
+   non-empty". *)
+PROCEDURE GetToken*(pcs : WORD; dst : INTEGER; maxLen : INTEGER) : BOOLEAN; NEAR;
+VAR n : INTEGER;
+    c : BYTE;
+    quoted : BOOLEAN;
+    maxLenM1 : INTEGER;
+    tailLen, idx : WORD;
+BEGIN
+  maxLenM1 := maxLen - 1;
+  BX := pcs;
+  tailLen := [DS:BX].CmdState.tailLen;
+  idx := [DS:BX].CmdState.idx;
+  IF idx > tailLen THEN
+    RETURN FALSE
+  END;
+  BX := 80H + idx;
+  c := [ES:BX];
+  IF c = CR THEN
+    RETURN FALSE
+  END;
+  quoted := FALSE;
+  IF c = 22H THEN
+    quoted := TRUE;
+    INC(idx)
+  END;
+  n := 0;
+  WHILE idx <= tailLen DO
+    BX := 80H + idx;
+    c := [ES:BX];
+    IF quoted THEN
+      IF c = 22H THEN
+        INC(idx);
+        BREAK
+      END;
+      IF c = CR THEN
+        BREAK
+      END
+    ELSE
+      IF IsSep(c) THEN
+        BREAK
+      END
+    END;
+    IF n < maxLenM1 THEN
+      SI := dst;
+      INC(SI, n);
+      [DS:SI] := c;
+      INC(n)
+    END;
+    INC(idx)
+  END;
+  SI := dst;
+  INC(SI, n);
+  [DS:SI].BYTE := 0;
+  BX := pcs;
+  [DS:BX].CmdState.idx := idx;
+  AL := n > 0
+END GetToken;
+
+END CMDLINE.
