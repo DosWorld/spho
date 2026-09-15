@@ -1,7 +1,38 @@
 (* USTAR tar header parsing/building, shared by TARPAK.SMD/TARUNPAK.SMD.
-   No IMPORT of its own, same convention as EXAMPLES/LZSS/LZPLIB.SMD:
-   relies on the caller already having IMPORTed SYSTEM/FILES/OUT ahead
-   of TARLIB in its own IMPORT list.
+   IMPORTs SYSTEM/FILES/OUT directly (unlike EXAMPLES/LZSS/LZPLIB.SMD,
+   whose own procedures never call anything outside pure computation) --
+   this module's own Error*/PadTo512*/SkipTo512*/CopyRaw*/
+   ClearChksumField* additions (moved here from TARPAK.SMD/TARUNPAK.SMD
+   to remove real duplication between the two, see each addition's own
+   header comment) genuinely need Out_String/Halt/BlockRead/
+   BlockWrite/FilePos/Seek, which the original IsZeroBlock*/
+   ParseOctal*/FormatOctal*/HeaderChecksum* never did (all four are
+   pure computation over an already-in-memory buffer). This module is
+   compiled STANDALONE by its own Makefile rule (TARLIB.SHD:
+   TARLIB.SMD $(SPHO), no caller IMPORT chain involved), so it needs
+   this IMPORT of its own now, not a "caller already imported it"
+   assumption -- TARPAK.SMD/TARUNPAK.SMD both already import
+   SYSTEM/FILES/OUT/TARLIB themselves regardless, so nothing about
+   their own IMPORT lists needs to change for THIS reason (though both
+   also now IMPORT CMDLINE directly, see below).
+
+   Command-line parsing (SkipBlanks/GetToken/the PSP-tail-setup
+   boilerplate) does NOT live here -- an earlier draft added a
+   TARLIB-local GetTokenPlain/SkipBlanksPlain/StartTarCmdLine/
+   TarCmdState (a second, no-quote-support command-line module,
+   parallel to and separate from EXAMPLES/LIB/CMDLINE.SMD's own
+   quote-aware equivalents), reasoning that TARPAK/TARUNPAK's own
+   former token scanner had no quote support and neither program's
+   real usage (a bare input/output filename) ever needed it. That
+   reasoning was sound on its own terms, but keeping a SECOND
+   command-line module around, distinct from the one every other
+   EXAMPLES/ program uses, was exactly the kind of duplication this
+   whole consolidation effort exists to remove -- TARPAK.SMD/
+   TARUNPAK.SMD now IMPORT CMDLINE directly and use its own CmdState/
+   StartCmdLine/SkipBlanks/GetToken instead, same as every other
+   migrated example. CMDLINE.GetToken's own quote support is a strict
+   superset of what TARPAK/TARUNPAK ever needed, so nothing about
+   their own observable behavior changes.
 
    USTAR header layout (DOCS -- POSIX ustar, 512 bytes total):
      name[100] mode[8] uid[8] gid[8] size[12] mtime[12] chksum[8]
@@ -21,6 +52,8 @@
    piece at a time either way -- only the per-member TOTAL size
    tracking is now a real 32-bit value, not truncated to 16 bits. *)
 MODULE TARLIB;
+
+IMPORT SYSTEM, FILES, OUT;
 
 CONST
   BlockSize = 512;
@@ -149,6 +182,134 @@ BEGIN
     valLo := valLo OR carry
   END
 END FormatOctal;
+
+(* Error*: TARPAK.SMD's/TARUNPAK.SMD's own former identical usage-error
+   reporter. *)
+PROCEDURE Error*(msg : WORD); NEAR;
+BEGIN
+  Out_String(msg); Out_Ln; Halt(1)
+END Error;
+
+(* PadTo512*: write (512 - (len MOD 512)) MOD 512 zero bytes to fp --
+   rounds fp's own cursor up to the next 512-byte boundary, assuming it
+   currently sits exactly len bytes past the last boundary (the
+   caller's own responsibility to track). len is a genuine LONGINT
+   (lo/hi pair, DOCS/TRBUG.MD) but only its own low 9 bits (& 511) are
+   ever needed here -- lenHi never affects the result, taken as a
+   parameter only so every call site can pass the same lo/hi pair
+   uniformly. A no-op if len is already a multiple of 512. zeroBlockPtr
+   is the caller's own ADR(zeroBlock) (a 512-byte all-zero buffer) --
+   kept as a parameter rather than a TARLIB-owned buffer since both
+   TARPAK.SMD and TARUNPAK.SMD also use their own zeroBlock directly
+   elsewhere (writing the archive's own trailing two all-zero blocks),
+   so it has to stay a caller-owned VAR either way. *)
+PROCEDURE PadTo512*(fp : WORD; lenLo, lenHi : WORD; zeroBlockPtr : WORD); NEAR;
+VAR rem, need : WORD;
+BEGIN
+  rem := lenLo;
+  rem := rem & 511;
+  IF rem = 0 THEN RETURN END;
+  need := 512;
+  DEC(need, rem);
+  BlockWrite(fp, zeroBlockPtr, need)
+END PadTo512;
+
+(* SkipTo512*: like PadTo512*, but SEEKS fp forward instead of writing
+   -- used to skip a member's own trailing pad bytes without copying
+   them. Same "only the low 9 bits of len matter" note as PadTo512*
+   above -- lenHi taken only for a uniform lo/hi call signature. No
+   caller-owned buffer needed here (unlike PadTo512, above), so no
+   extra pointer parameter. *)
+PROCEDURE SkipTo512*(fp : WORD; lenLo, lenHi : WORD); NEAR;
+VAR rem, need, newLo, newHi : WORD; newPos : LONGINT;
+BEGIN
+  rem := lenLo;
+  rem := rem & 511;
+  IF rem = 0 THEN RETURN END;
+  need := 512;
+  DEC(need, rem);
+  FilePos(fp);
+  newLo := AX; newHi := DX;
+  INC(newLo, need);
+  IF CFLAG THEN INC(newHi) END;
+  AX := newLo; DX := newHi;
+  newPos := DX:AX;
+  DX:AX := newPos;
+  Seek(fp, DX:AX)
+END SkipTo512;
+
+(* CopyRaw*: copy exactly len (a genuine LONGINT lo/hi pair) bytes from
+   the file at inFp to the file at outFp unchanged, in chunkSize-sized
+   pieces -- remLo/remHi's own borrow-decrement loop uses the same
+   idiom LZSSLIB.SMD's own OutByte/remLo/remHi already establishes
+   elsewhere in this tree. copyBufPtr is the caller's own
+   ADR(copyBuf), a chunkSize-byte scratch buffer; chunkSize is the
+   caller's own CopyChunk constant (512 in both current callers, taken
+   as a parameter rather than hardcoded here so this stays a pure
+   function of what the caller passes, not an assumption about their
+   own buffer's real declared size). *)
+PROCEDURE CopyRaw*(lenLo, lenHi : WORD; inFp, outFp : WORD;
+                    copyBufPtr : WORD; chunkSize : WORD); NEAR;
+VAR remLo, remHi, want, got : WORD; remZero : BOOLEAN;
+BEGIN
+  remLo := lenLo; remHi := lenHi;
+  remZero := FALSE;
+  IF remLo = 0 THEN
+    IF remHi = 0 THEN remZero := TRUE END
+  END;
+  WHILE ~remZero DO
+    want := chunkSize;
+    IF remHi = 0 THEN
+      IF want > remLo THEN want := remLo END
+    END;
+    got := BlockRead(inFp, copyBufPtr, want);
+    IF got = 0 THEN RETURN END;
+    BlockWrite(outFp, copyBufPtr, got);
+    AX := remLo;
+    DEC(AX, got);
+    IF CFLAG THEN DEC(remHi) END;
+    remLo := AX;
+    remZero := FALSE;
+    IF remLo = 0 THEN
+      IF remHi = 0 THEN remZero := TRUE END
+    END
+  END
+END CopyRaw;
+
+(* IsLongZero*: TRUE if the (lo, hi) LONGINT pair is exactly 0 -- moved
+   here from TARPAK.SMD's/TARUNPAK.SMD's own identical copies (own
+   local copy of LZPLIB.SMD's own internal IsZero, not *-exported
+   there, so not part of that module's own API/.SHD -- this tree's
+   convention is that the nested-IF idiom below, not that internal
+   helper, is what a caller uses; LZSSLIB.SMD's own remZero logic
+   already establishes the same pattern, DOCS/SPHINX.MD S7.4: no
+   assignable &/OR boolean expression). *)
+PROCEDURE IsLongZero*(lo, hi : WORD) : BOOLEAN; NEAR;
+BEGIN
+  IF lo = 0 THEN
+    IF hi = 0 THEN RETURN TRUE END
+  END;
+  RETURN FALSE
+END IsLongZero;
+
+(* ClearChksumField*: overwrite the header at hdrPtr's own 8-byte
+   chksum field with ASCII spaces, USTAR's own defined convention for
+   computing a header's checksum (HeaderChecksum* treats those 8 bytes
+   as spaces regardless, but the field must ALSO really hold spaces in
+   the header actually written out, per the format). *)
+PROCEDURE ClearChksumField*(hdrPtr : WORD); NEAR;
+VAR i : WORD;
+BEGIN
+  BX := hdrPtr;
+  SI := ADR([DS:BX].TarHeader.chksum);
+  i := 0;
+  WHILE i < 8 DO
+    AL := 32;
+    [DS:SI] := AL;
+    INC(SI);
+    INC(i)
+  END
+END ClearChksumField;
 
 (* HeaderChecksum*: sum of all 512 header bytes, with the chksum field
    itself (8 bytes) treated as ASCII spaces for the purpose of the sum

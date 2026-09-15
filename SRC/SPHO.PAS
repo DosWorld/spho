@@ -3826,7 +3826,7 @@ end;
   second-argument expr. }
 procedure EmitIncDecAmountToReg(const nm: string; mnemonic: word);
   var opnd: string; addSub: word; nmIsAx, nmIsAl, protectAx: boolean;
-      saveId: word;
+      saveId, bxSaveId: word;
 begin
   nmIsAx := EqualICase(nm, 'ax');
   { AL is exactly as self-referential as AX (INC(AX,expr)'s own
@@ -3857,6 +3857,28 @@ begin
     the caller's original AX from the stack. }
   protectAx := not (nmIsAx or nmIsAl);
   AddSubMnemonic(mnemonic, addSub);
+  { nmIsAx/nmIsAl both use BX as scratch, below, to carry expr's value
+    across the caller's-AX pop/restore -- BX is an ordinary general-
+    purpose register with no dedicated preserved-register convention,
+    so it can be independently live at the call site exactly like the
+    CX-clobber bug this procedure's own header comment already
+    documents fixing (found via LIB/OUT.SMD's own 'INC(AL, 30H)' call
+    corrupting a caller's live CX). BX is equally exposed (found via
+    EXAMPLES/CRK/APPLYCRK.SMD's own ParseApplyArg: 'DEC(AL, 30H)'
+    right after 'BX := AX' silently clobbered BX's own low byte,
+    corrupting a running accumulator and breaking every +N/-N patch
+    application). Pushed here, BEFORE AX's own save/EmitExpr sequence
+    below even starts (so the two push/pop pairs nest correctly, LIFO:
+    BX outermost, AX innermost -- popping AX first, further down,
+    would otherwise pop BX's saved value into AX by mistake), and
+    popped back at the very end of each of the two branches below,
+    once BX is no longer needed as scratch. Tagged with
+    EmitGenSavePush/Pop (matching AX's own convention below) so Stage
+    C's own save/restore-elimination rules can still prove this pair
+    compiler-owned and eliminable when BX turns out not to be live at
+    a given call site. }
+  if nmIsAx or nmIsAl then bxSaveId := EmitGenSavePush('bx')
+  else bxSaveId := 0;
   { Fast path: expr is a single bare register or plain numeric literal
     with nothing chained after it -- OperandText for either of those
     two forms never touches AX/CX/any register at all (it just returns
@@ -3891,33 +3913,45 @@ begin
   end;
   if nmIsAx then begin
     { INC(AX, expr)/DEC(AX, expr): expr's own value is already in AX;
-      the caller's OLD AX sits on the stack (pushed above). BX is used
-      as the scratch to carry expr's value across the pop -- NOT CX,
-      unlike this procedure's own previous version (this file's own
-      header comment on this procedure claims no register but AX
-      itself is ever disturbed here, "no risk of colliding with some
-      OTHER live register the way carrying the amount through CX used
-      to" -- true for every OTHER destination register (protectAx,
-      below) but NOT for nmIsAx/nmIsAl themselves until this fix: both
-      previously used 'mov cx,ax'/'mov cl,al' as their own scratch,
-      silently clobbering the caller's own live CX exactly like the
-      bug that comment describes -- found via LIB/OUT.SMD's own
-      'INC(AL, 30H)' inside Out_Word, corrupting a caller's live CX
-      across an ordinary Out_Int() call). BX is not risk-free either in
-      the abstract, but this codebase already treats it as ordinary
-      scratch at call boundaries with no dedicated preserved-register
-      convention (EmitCall's own header comment; Out_Int/Out_Word's
-      own bodies already use BX freely with no USES BX anywhere), so
-      reusing it here is consistent with the rest of this file, not a
-      new risk category. }
+      the caller's OLD AX sits on the stack (pushed above, innermost).
+      BX is used as the scratch to carry expr's value across the AX
+      pop -- NOT CX, unlike this procedure's own previous version
+      (this file's own header comment on this procedure claims no
+      register but AX itself is ever disturbed here, "no risk of
+      colliding with some OTHER live register the way carrying the
+      amount through CX used to" -- true for every OTHER destination
+      register (protectAx, below) but NOT for nmIsAx/nmIsAl themselves
+      until this fix: both previously used 'mov cx,ax'/'mov cl,al' as
+      their own scratch, silently clobbering the caller's own live CX
+      exactly like the bug that comment describes -- found via
+      LIB/OUT.SMD's own 'INC(AL, 30H)' inside Out_Word, corrupting a
+      caller's live CX across an ordinary Out_Int() call).
+
+      BX itself was EQUALLY exposed to that same class of bug until
+      this fix -- an ordinary general-purpose register with no
+      dedicated preserved-register convention, so it can be
+      independently live at the call site too (found via
+      EXAMPLES/CRK/APPLYCRK.SMD's own ParseApplyArg: 'DEC(AL, 30H)'
+      right after 'BX := AX' from a 'mul cx' result silently clobbered
+      BX's own low byte, corrupting a running accumulator and breaking
+      every +N/-N patch application). The caller's own BX was already
+      pushed, OUTERMOST, before AX's own save/EmitExpr sequence above
+      even ran (this procedure's own top, guarded by "if nmIsAx or
+      nmIsAl"), so BX is popped back here, LAST, once it is no longer
+      needed as scratch -- the two genSaveId-tagged pairs correctly
+      nest LIFO: BX outermost, AX innermost. }
     AppendInstr2(MnMov, 'bx', 'ax');
     EmitGenSavePop('ax', saveId);
-    AppendInstr2(addSub, 'ax', 'bx')
+    AppendInstr2(addSub, 'ax', 'bx');
+    EmitGenSavePop('bx', bxSaveId)
   end else if nmIsAl then begin
-    { Same BX-instead-of-CX shape as nmIsAx above, at byte width. }
+    { Same BX-instead-of-CX shape as nmIsAx above, at byte width; BX's
+      own push already happened at this procedure's own top, same as
+      nmIsAx above. }
     AppendInstr2(MnMov, 'bl', 'al');
     EmitGenSavePop('ax', saveId);
-    AppendInstr2(addSub, 'al', 'bl')
+    AppendInstr2(addSub, 'al', 'bl');
+    EmitGenSavePop('bx', bxSaveId)
   end else if protectAx and Regs86.IsByteReg(Regs86.LookupReg(UpStr(nm))) then begin
     { nm is some OTHER byte register (not AL) -- apply AL to nm directly
       while AL still holds expr's own freshly-computed value (nm is

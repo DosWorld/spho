@@ -19,7 +19,7 @@
 
 MODULE TARUNPAK;
 
-IMPORT SYSTEM, FILES, OUT, TARLIB, LZPLIB;
+IMPORT SYSTEM, FILES, OUT, TARLIB, LZPLIB, CMDLINE;
 
 CONST
   MaxName = 128;
@@ -27,7 +27,7 @@ CONST
 
 VAR
   inName, outName : BYTE[MaxName];
-  cmdIdx, cmdTailLen : INTEGER;
+  cmdState : CmdState;
 
   inF, outF : File;
   hdr : TarHeader;
@@ -44,146 +44,31 @@ VAR
   ok : BOOLEAN;
   outFp : WORD;
 
-PROCEDURE SkipBlanks(); NEAR;
-BEGIN
-  WHILE cmdIdx <= cmdTailLen DO
-    BX := 80H + cmdIdx;
-    AL := [ES:BX];
-    IF AL = Space THEN INC(cmdIdx)
-    ELSIF AL = Tab THEN INC(cmdIdx)
-    ELSE BREAK END
-  END
-END SkipBlanks;
-
-PROCEDURE GetToken(dst : INTEGER) : BOOLEAN; NEAR;
-VAR cnt : INTEGER; c : BYTE; maxNameM1 : INTEGER;
-BEGIN
-  maxNameM1 := MaxName - 1;
-  IF cmdIdx > cmdTailLen THEN RETURN FALSE END;
-  BX := 80H + cmdIdx;
-  c := [ES:BX];
-  IF c = CR THEN RETURN FALSE END;
-  cnt := 0;
-  WHILE cmdIdx <= cmdTailLen DO
-    BX := 80H + cmdIdx;
-    c := [ES:BX];
-    IF c = Space THEN BREAK END;
-    IF c = Tab THEN BREAK END;
-    IF c = CR THEN BREAK END;
-    IF cnt < maxNameM1 THEN
-      SI := dst; INC(SI, cnt); [DS:SI] := c; INC(cnt)
-    END;
-    INC(cmdIdx)
-  END;
-  SI := dst; INC(SI, cnt); AL := 0; [DS:SI] := AL;
-  RETURN cnt > 0
-END GetToken;
-
+(* SkipBlanks/GetToken/Error/PadTo512/SkipTo512/CopyRaw/IsLongZero/
+   ClearChksumField all moved to TARLIB.SMD -- this file's own copies
+   were byte-for-byte identical to TARPAK.SMD's, a real duplication
+   risk despite TARLIB.SMD already existing as their shared module.
+   TARLIB itself no longer carries its own separate GetTokenPlain/
+   SkipBlanksPlain/StartTarCmdLine/TarCmdState -- this file now
+   IMPORTs LIB/CMDLINE.SMD directly and uses its own CmdState/
+   StartCmdLine/SkipBlanks/GetToken, the same shared primitives
+   MKCRK.SMD/APPLYCRK.SMD/LZSS.SMD/LZP.SMD/MIME.SMD/LCOUNT.SMD/
+   SMDFMT.SMD all already use, instead of a second, TARPAK-specific
+   command-line module. CMDLINE.GetToken is quote-aware, a strict
+   superset of what this file's own former no-quote scanner needed
+   (neither "in.tar" nor "out.tar" realistically starts with a
+   literal '"'). cmdState replaces this file's former
+   cmdIdx/cmdTailLen locals. *)
 PROCEDURE ParseCmdLine() : BOOLEAN; NEAR;
 USES ES;
 BEGIN
-  GetPSP();
-  ES := AX;
-  BX := 80H;
-  AL := [ES:BX];
-  cmdTailLen := AL;
-  cmdIdx := 1;
-  SkipBlanks();
-  IF ~GetToken(ADR(inName)) THEN RETURN FALSE END;
-  SkipBlanks();
-  IF ~GetToken(ADR(outName)) THEN RETURN FALSE END;
+  StartCmdLine(ADR(cmdState));
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(inName), MaxName) THEN RETURN FALSE END;
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(outName), MaxName) THEN RETURN FALSE END;
   RETURN TRUE
 END ParseCmdLine;
-
-PROCEDURE Error(msg : WORD); NEAR;
-BEGIN
-  Out_String(msg); Out_Ln; Halt(1)
-END Error;
-
-(* Same "only the low 9 bits of len matter" note as TARPAK.SMD's own
-   PadTo512 -- lenHi taken only for a uniform lo/hi call signature. *)
-PROCEDURE PadTo512(fp : WORD; lenLo, lenHi : WORD); NEAR;
-VAR rem, need : WORD;
-BEGIN
-  rem := lenLo;
-  rem := rem & 511;
-  IF rem = 0 THEN RETURN END;
-  need := 512;
-  DEC(need, rem);
-  BlockWrite(fp, ADR(zeroBlock), need)
-END PadTo512;
-
-PROCEDURE SkipTo512(fp : WORD; lenLo, lenHi : WORD); NEAR;
-VAR rem, need, newLo, newHi : WORD; newPos : LONGINT;
-BEGIN
-  rem := lenLo;
-  rem := rem & 511;
-  IF rem = 0 THEN RETURN END;
-  need := 512;
-  DEC(need, rem);
-  FilePos(fp);
-  newLo := AX; newHi := DX;
-  INC(newLo, need);
-  IF CFLAG THEN INC(newHi) END;
-  AX := newLo; DX := newHi;
-  newPos := DX:AX;
-  DX:AX := newPos;
-  Seek(fp, DX:AX)
-END SkipTo512;
-
-(* CopyRaw: same genuine-LONGINT-len, borrow-decrement pattern as
-   TARPAK.SMD's own CopyRaw (DOCS/TRBUG.MD). *)
-PROCEDURE CopyRaw(lenLo, lenHi : WORD); NEAR;
-VAR remLo, remHi, want, got : WORD; remZero : BOOLEAN;
-BEGIN
-  remLo := lenLo; remHi := lenHi;
-  remZero := FALSE;
-  IF remLo = 0 THEN
-    IF remHi = 0 THEN remZero := TRUE END
-  END;
-  WHILE ~remZero DO
-    want := CopyChunk;
-    IF remHi = 0 THEN
-      IF want > remLo THEN want := remLo END
-    END;
-    got := BlockRead(ADR(inF), ADR(copyBuf), want);
-    IF got = 0 THEN RETURN END;
-    BlockWrite(ADR(outF), ADR(copyBuf), got);
-    AX := remLo;
-    DEC(AX, got);
-    IF CFLAG THEN DEC(remHi) END;
-    remLo := AX;
-    remZero := FALSE;
-    IF remLo = 0 THEN
-      IF remHi = 0 THEN remZero := TRUE END
-    END
-  END
-END CopyRaw;
-
-(* IsLongZero: same helper as TARPAK.SMD's own (DOCS/SPHINX.MD S7.4:
-   no assignable &/OR boolean expression, so this nested-IF form is the
-   idiom, not a one-liner). *)
-PROCEDURE IsLongZero(lo, hi : WORD) : BOOLEAN; NEAR;
-BEGIN
-  IF lo = 0 THEN
-    IF hi = 0 THEN RETURN TRUE END
-  END;
-  RETURN FALSE
-END IsLongZero;
-
-PROCEDURE ClearChksumField(); NEAR;
-VAR i : WORD;
-BEGIN
-  BX := ADR(hdr);
-  SI := ADR([DS:BX].TarHeader.chksum);
-  i := 0;
-  WHILE i < 8 DO
-    AL := 32;
-    [DS:SI] := AL;
-    INC(SI);
-    INC(i)
-  END
-END ClearChksumField;
 
 BEGIN
   IF ~ParseCmdLine() THEN Error("usage: TARUNPAK in.tar out.tar") END;
@@ -195,10 +80,8 @@ BEGIN
   CX := 512;
   PUSH(DS);
   POP(ES);
-  ASM
-    cld
-    rep stosb
-  END;
+  SetDFlag(FALSE);
+  STOREB(TRUE);
 
   done := FALSE;
   WHILE ~done DO
@@ -231,7 +114,7 @@ BEGIN
         IF CFLAG THEN DEC(realHi) END;
         realLo := AX;
         DEC(realHi, curHi);
-        PadTo512(ADR(outF), realLo, realHi);
+        PadTo512(ADR(outF), realLo, realHi, ADR(zeroBlock));
 
         curPos := FilePos(ADR(outF));
 
@@ -240,7 +123,7 @@ BEGIN
         Seek(outFp, DX:AX);
         BX := ADR(hdr);
         FormatOctal(ADR([DS:BX].TarHeader.size), 12, realLo, realHi);
-        ClearChksumField();
+        ClearChksumField(ADR(hdr));
         chk := HeaderChecksum(ADR(hdr));
         BX := ADR(hdr);
         FormatOctal(ADR([DS:BX].TarHeader.chksum), 8, chk, 0);
@@ -252,8 +135,8 @@ BEGIN
       END
     ELSE
       IF ~IsLongZero(storedLo, storedHi) THEN
-        CopyRaw(storedLo, storedHi);
-        PadTo512(ADR(outF), storedLo, storedHi);
+        CopyRaw(storedLo, storedHi, ADR(inF), ADR(outF), ADR(copyBuf), CopyChunk);
+        PadTo512(ADR(outF), storedLo, storedHi, ADR(zeroBlock));
         SkipTo512(ADR(inF), storedLo, storedHi)
       END
     END

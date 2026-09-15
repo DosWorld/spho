@@ -56,13 +56,17 @@ MODULE LCOUNT;
    PSP layout itself, the same way SYSTEM.ASM's own common_init does for
    its own unrelated reasons. *)
 
-IMPORT SYSTEM, FILES, OUT;
+IMPORT SYSTEM, FILES, OUT, CMDLINE;
 
 CONST
   MaxName = 128;
 
 VAR
   fname     : BYTE[MaxName];
+  cmdState  : CmdState;     (* LIB/CMDLINE.SMD's own PSP-tail scan state,
+                               replacing this file's former hand-rolled
+                               GetCmdLine (see that procedure's own
+                               removal note below) *)
   inReader  : File;         (* READER's own buffered-read state, replacing
                                this file's own former readBuf/bufLen/
                                bufPos/ReadOneByte *)
@@ -79,110 +83,25 @@ VAR
   commentLines : WORD;
   oberonLines  : WORD;
 
-(* GetCmdLine: fetch this program's own PSP segment (AH=62h, portable --
-   DS at program entry is not guaranteed to already be the PSP segment
-   for a linked .EXE), then copy the command tail (PSP offset 80h = byte
-   length, 81h.. = the raw text, DOCS none of this is SPHINX-documented,
-   it is plain DOS PSP layout) into fname, stopping at the first space/
-   tab/CR or MaxName-1 bytes, and NUL-terminating it (Reset needs
-   an ASCIIZ name, not the DOS $-terminated convention DosMessage uses
-   elsewhere). Leading spaces/tabs before the filename (a lone leading
-   space is universal -- DOS always writes at least one before the first
-   argument) are skipped first. *)
-(* IsBlank: TRUE for space or tab. A helper, not inlined, because SPHO's
-   IF condition is a single 'a REL b' test only (DOCS/SPHO.MD's own
-   "Known simplifications" -- no '&'/'OR' composition in a condition),
-   so "IF (c=Space) OR (c=Tab) THEN" doesn't parse; a plain BOOLEAN-
-   returning helper called from an ordinary single-condition IF sidesteps
-   that everywhere it's needed instead of hand-nesting IFs at each site. *)
-PROCEDURE IsBlank(AL) : BOOLEAN; NEAR;
-BEGIN
-  IF AL = Space THEN
-    AL := TRUE
-  ELSIF AL = Tab THEN
-    AL := TRUE
-  ELSE
-    AL := FALSE
-  END
-END IsBlank;
-
-(* IsNameEnd: TRUE for space, tab, or CR -- where the filename token on
-   the command tail ends. *)
-PROCEDURE IsNameEnd(c : BYTE) : BOOLEAN; NEAR;
-BEGIN
-  IF IsBlank(c) THEN
-     AL := TRUE
-  ELSIF c = CR THEN
-     AL := TRUE
-  ELSE
-     AL := FALSE
-  END
-END IsNameEnd;
-
+(* GetCmdLine: fetch the command tail's own leading token into fname --
+   moved onto LIB/CMDLINE.SMD's own StartCmdLine/SkipBlanks/GetToken
+   (this file's own former hand-rolled implementation, plus its own
+   local IsBlank/IsNameEnd, carried a real bug fixed earlier -- a
+   stale-SI NUL-terminator write on an empty command tail -- precisely
+   BECAUSE this logic was duplicated instead of shared; see
+   DOCS/TRBUG.MD's own dedicated LCOUNT entry). CMDLINE.GetToken is
+   quote-aware (a `"..."` filename reads through to the matching
+   closing quote), a strict superset of what this file's own former
+   GetToken variant needed -- no realistic LCOUNT invocation passes a
+   filename starting with a literal '"'. IsBlank itself (still used
+   below by ClassifyByte, for its own unrelated comment-scanning
+   purpose, not just command-line parsing) is CMDLINE's own exported
+   IsBlank now too, not a second local copy. *)
 PROCEDURE GetCmdLine(): BOOLEAN; NEAR;
-VAR tailLen : INTEGER; i : INTEGER; n : INTEGER; c : BYTE;
-    maxNameM1 : INTEGER;
 BEGIN
-  maxNameM1 := MaxName - 1;
-  GetPSP();   (* PSP segment comes back in AX -- used directly below,
-                 no local needed to hold it (it's dead the instant
-                 ES:=AX reads it out) *)
-  ES := AX;
-  BX := 80H;
-  (* PSP offset 80h is a single BYTE (the command tail's own length),
-     not a WORD -- a bare "[ES:BX]" with no declared-field size hint
-     defaults to a word-sized read (SizeHintFor's own fallback), which
-     would read this length byte AND the very first tail character
-     packed together as one 16-bit value instead of just the length.
-     Reading through AL directly, then widening into tailLen, forces
-     the correct 1-byte access without a dead intermediate local. *)
-  AL := [ES:BX];
-  tailLen := AL;
-
-  (* skip leading spaces/tabs; BREAK on the first non-blank byte (or on
-     running past tailLen -- an all-blank tail, no filename given) stops
-     the loop WITHOUT disturbing i, unlike an "advance i past the end to
-     signal stop" trick, which would destroy the very index this loop
-     exists to find. No local to hold [ES:BX] first -- AL IS IsBlank's own
-     register-named parameter (PROCEDURE IsBlank(AL)), so loading it
-     straight into AL and calling immediately skips a dead intermediate
-     BYTE local entirely; safe here ONLY because AL's value isn't needed
-     again after the call -- IsBlank's own BOOLEAN result (returned in AX,
-     clobbering AL) is all this loop reads back (tailLen/i themselves
-     still can't move into registers -- they must survive this call, and
-     IsBlank has no USES clause to preserve anything for them). *)
-  INC(BX);
-  DX := 1;
-  WHILE DX <= tailLen DO
-    AL := [ES:BX];
-    IF IsBlank(AL) THEN INC(DX) ELSE BREAK END
-    INC(BX);
-  END;
-  i := DX;
-
-  (* Copy bytes from i into fname until a space/tab/CR, MaxName-1, or the
-     end of the tail is reached. c MUST be a real local here, unlike the
-     loop above -- the byte's own value is still needed AFTER the
-     IsNameEnd call (at "[DS:SI] := c" below), and IsNameEnd's call
-     clobbers AL/AX with its own BOOLEAN result the same way IsBlank's
-     does; a bare AL local (tried here once, reverted) silently copied
-     IsNameEnd's 0/1 result into fname instead of the real byte. *)
-  n := 0;
-  WHILE i <= tailLen DO
-    BX := 80H + i;
-    c := [ES:BX];
-    IF IsNameEnd(c) THEN BREAK END;
-    IF n >= maxNameM1 THEN BREAK END;
-    SI := ADR(fname);
-    INC(SI, n);
-    [DS:SI] := c;
-    INC(n);
-    INC(i)
-  END;
-  INC(SI);
-  AL := 0;
-  [DS:SI] := AL;
-  AL := n > 0
+  StartCmdLine(ADR(cmdState));
+  SkipBlanks(ADR(cmdState));
+  RETURN GetToken(ADR(cmdState), ADR(fname), MaxName)
 END GetCmdLine;
 
 (* EndLine: classify the line just finished (blank / comment / oberon)

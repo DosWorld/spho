@@ -1,0 +1,291 @@
+(* MIME - standard RFC 4648 Base64 encoder/decoder CLI, streaming one
+   file to another byte-at-a-time (LZP.SMD/TARPAK.SMD's own
+   ReadByte/WriteByte convention, LIB/LZPLIB.SMD's own header comment
+   on why -- no whole-buffer staging needed, FILES.SMD's own File
+   record is already page-buffered).
+
+   Usage: MIME <E|D> inf outf
+     E: encode inf's raw bytes to outf as Base64 text (76-char lines,
+        RFC 2045's own MIME line-length convention, CRLF endings).
+     D: decode inf's Base64 text (any line length, embedded CR/LF/
+        whitespace skipped) back to outf's raw bytes.
+
+   Encode: 3 raw bytes -> 4 Base64 chars, standard '+/' alphabet and
+   '=' end-padding (RFC 4648 SS4), buffered 3 bytes at a time (Group3),
+   final partial group (1 or 2 leftover bytes) padded per RFC 4648's
+   own table. Decode: 4 Base64 chars -> 3 raw bytes, buffered 4 chars
+   at a time (Group4) via a 256-entry reverse-lookup table
+   (DecodeTable, built once by BuildDecodeTable), skipping any byte
+   that isn't a table hit (CR/LF/space -- MIME's own "insert line
+   breaks" allowance, RFC 2045 SS6.8) until a real Base64 char or '='
+   is found; '=' stops decoding (only legal at the very end of the
+   real data, same as SRC/UTIL.PAS's own B64Feed convention for the
+   translator's own BASE64() literal decoder). *)
+MODULE Mime;
+
+IMPORT SYSTEM, FILES, OUT, CMDLINE;
+
+CONST
+  MaxName = 128;
+  LineLen = 76;      (* RFC 2045 SS6.8: MIME base64 lines are at most 76
+                         encoded chars before a CRLF. *)
+  Pad = 3DH;         (* '=' *)
+  CR = 0DH; LF = 0AH; Space = 20H; Tab = 09H;
+
+VAR
+  inName  : BYTE[MaxName];
+  outName : BYTE[MaxName];
+  mode    : BYTE;
+
+  (* IsBlank/IsSep/SkipBlanks/GetToken/the PSP-tail-setup boilerplate
+     all moved to LIB/CMDLINE.SMD -- this file's own copies were
+     byte-for-byte identical to LZSS.SMD's/LZP.SMD's/MKCRK.SMD's/
+     APPLYCRK.SMD's (see CMDLINE.SMD's own header comment). cmdState
+     replaces this file's former cmdIdx/cmdTailLen locals. *)
+  cmdState : CmdState;
+
+  EncodeTable : BYTE[64];
+  DecodeTable : BYTE[256];   (* 0..63 for a real Base64 char, 0FFH
+                                 otherwise (skip), 0FEH for '=' (stop). *)
+
+  inH, outH : File;
+  inFp, outFp : WORD;
+
+PROCEDURE ParseCmdLine() : BOOLEAN; NEAR;
+USES ES;
+VAR modeBuf : BYTE[256];
+BEGIN
+  StartCmdLine(ADR(cmdState));
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(modeBuf), 256) THEN RETURN FALSE END;
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(inName), MaxName) THEN RETURN FALSE END;
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(outName), MaxName) THEN RETURN FALSE END;
+
+  SI := ADR(modeBuf);
+  AL := [DS:SI];
+  IF AL = 65H THEN AL := 45H ELSIF AL = 64H THEN AL := 44H END;
+  mode := AL;
+  AL := TRUE
+END ParseCmdLine;
+
+PROCEDURE Error(msg : WORD; errCode : BYTE); NEAR;
+BEGIN
+  Out_String(msg); Out_Ln; Halt(errCode)
+END Error;
+
+(* ---------------- tables ---------------- *)
+
+PROCEDURE BuildEncodeTable(); NEAR;
+VAR i, j : WORD;
+BEGIN
+  i := 0;
+  WHILE i < 26 DO EncodeTable[i] := i + 41H; INC(i) END;      (* A-Z *)
+  i := 0; j := 26;
+  WHILE i < 26 DO EncodeTable[j] := i + 61H; INC(i); INC(j) END; (* a-z *)
+  i := 0; j := 52;
+  WHILE i < 10 DO EncodeTable[j] := i + 30H; INC(i); INC(j) END; (* 0-9 *)
+  EncodeTable[62] := 2BH;  (* '+' *)
+  EncodeTable[63] := 2FH   (* '/' *)
+END BuildEncodeTable;
+
+PROCEDURE BuildDecodeTable(); NEAR;
+VAR i : WORD; c : BYTE;
+BEGIN
+  i := 0;
+  WHILE i < 256 DO DecodeTable[i] := 0FFH; INC(i) END;
+  i := 0;
+  WHILE i < 64 DO
+    c := EncodeTable[i];
+    DecodeTable[c] := i;
+    INC(i)
+  END;
+  DecodeTable[Pad] := 0FEH
+END BuildDecodeTable;
+
+(* ---------------- encode ---------------- *)
+
+(* EmitEncodedChar: write one Base64 char to outf, tracking the
+   76-char MIME line length (LineLen) -- a CRLF is inserted right
+   before the char that would otherwise exceed it, never after (so a
+   line is never emitted with a trailing blank CRLF-CRLF pair at
+   EOF -- Finish's own final WriteLn below covers that instead). *)
+VAR lineCol : WORD;
+
+PROCEDURE EmitEncodedChar(c : BYTE); NEAR;
+BEGIN
+  IF lineCol = LineLen THEN
+    WriteByte(outFp, CR); WriteByte(outFp, LF);
+    lineCol := 0
+  END;
+  WriteByte(outFp, c);
+  INC(lineCol)
+END EmitEncodedChar;
+
+(* EncodeGroup3: b0/b1/b2 already read (n = 1, 2, or 3 valid bytes;
+   b1/b2 are 0 and unused when n < 3, matching RFC 4648's own "treat a
+   short final group as zero-padded" rule) -- emits exactly 4 Base64
+   chars, the last (4-n) of them '=' padding. *)
+PROCEDURE EncodeGroup3(b0, b1, b2 : BYTE; n : WORD); NEAR;
+USES BX;
+VAR idx : BYTE;
+BEGIN
+  AL := b0; AH := 0;
+  CL := 2; AX := AX SHR CL;
+  idx := AL;
+  EmitEncodedChar(EncodeTable[idx]);
+
+  AL := b0; AH := 0;
+  CL := 4; AX := AX SHL CL;
+  AX := AX & 3FH;
+  BL := AL; BH := 0;
+  AL := b1; AH := 0;
+  CL := 4; AX := AX SHR CL;
+  BX := BX OR AX;
+  idx := BL;
+  EmitEncodedChar(EncodeTable[idx]);
+
+  IF n < 2 THEN
+    EmitEncodedChar(Pad); EmitEncodedChar(Pad); RETURN
+  END;
+
+  AL := b1; AH := 0;
+  CL := 2; AX := AX SHL CL;
+  AX := AX & 3FH;
+  BL := AL; BH := 0;
+  AL := b2; AH := 0;
+  CL := 6; AX := AX SHR CL;
+  BX := BX OR AX;
+  idx := BL;
+  EmitEncodedChar(EncodeTable[idx]);
+
+  IF n < 3 THEN
+    EmitEncodedChar(Pad); RETURN
+  END;
+
+  idx := b2 & 3FH;
+  EmitEncodedChar(EncodeTable[idx])
+END EncodeGroup3;
+
+PROCEDURE EncodeFile(); NEAR;
+VAR r0, r1, r2 : INTEGER; b0, b1, b2 : BYTE; n : WORD;
+BEGIN
+  lineCol := 0;
+  r0 := ReadByte(inFp);
+  WHILE r0 >= 0 DO
+    b0 := r0; b1 := 0; b2 := 0; n := 1;
+    r1 := ReadByte(inFp);
+    IF r1 >= 0 THEN
+      b1 := r1; n := 2;
+      r2 := ReadByte(inFp);
+      IF r2 >= 0 THEN
+        b2 := r2; n := 3
+      ELSE
+        r2 := -1
+      END
+    ELSE
+      r1 := -1
+    END;
+    EncodeGroup3(b0, b1, b2, n);
+    IF n < 3 THEN r0 := -1 ELSE r0 := ReadByte(inFp) END
+  END;
+  IF lineCol > 0 THEN WriteByte(outFp, CR); WriteByte(outFp, LF) END
+END EncodeFile;
+
+(* ---------------- decode ---------------- *)
+
+(* NextCode: skip any byte whose own DecodeTable entry is 0FFH
+   (CR/LF/space/tab/anything else outside the alphabet -- RFC 2045
+   SS6.8's own "insert line breaks" allowance), returning the next
+   REAL code (0..63) or 0FEH for '=' padding. -1 at real EOF. *)
+PROCEDURE NextCode() : INTEGER; NEAR;
+VAR r : INTEGER; code : BYTE;
+BEGIN
+  r := ReadByte(inFp);
+  WHILE r >= 0 DO
+    code := DecodeTable[r];
+    IF code # 0FFH THEN RETURN code END;
+    r := ReadByte(inFp)
+  END;
+  RETURN -1
+END NextCode;
+
+(* DecodeGroup4: c0/c1 already known real codes (0..63) -- c2/c3 may
+   each be a real code, '=' (0FEH), or absent (end of stream, -1 via
+   done). Emits 1..3 raw bytes depending on how many of c2/c3 were
+   real codes rather than padding/EOF; RETURNs FALSE once padding or
+   EOF has been seen (the caller's own decode loop stops there -- '='
+   is only legal at the very end of the real data, same convention
+   SRC/UTIL.PAS's own B64Feed already documents for the translator's
+   BASE64() literal decoder). *)
+PROCEDURE DecodeGroup4(c0, c1 : BYTE; c2, c3 : INTEGER) : BOOLEAN; NEAR;
+USES BX;
+VAR b : BYTE;
+BEGIN
+  AL := c0; AH := 0;
+  CL := 2; AX := AX SHL CL;
+  BL := c1; BH := 0;
+  CL := 4; BX := BX SHR CL;
+  AX := AX OR BX;
+  b := AL;
+  WriteByte(outFp, b);
+
+  IF c2 < 0 OR c2 = 0FEH THEN RETURN FALSE END;
+
+  AL := c1; AH := 0;
+  CL := 4; AX := AX SHL CL;
+  BL := c2; BH := 0;
+  CL := 2; BX := BX SHR CL;
+  AX := AX OR BX;
+  b := AL;
+  WriteByte(outFp, b);
+
+  IF c3 < 0 OR c3 = 0FEH THEN RETURN FALSE END;
+
+  AL := c2; AH := 0;
+  CL := 6; AX := AX SHL CL;
+  BX := c3;
+  AX := AX OR BX;
+  b := AL;
+  WriteByte(outFp, b);
+
+  RETURN TRUE
+END DecodeGroup4;
+
+PROCEDURE DecodeFile(); NEAR;
+VAR c0, c1 : INTEGER; c2, c3 : INTEGER; more : BOOLEAN;
+BEGIN
+  c0 := NextCode();
+  WHILE c0 >= 0 DO
+    IF c0 = 0FEH THEN RETURN END;   (* leading '=' -- nothing left to decode *)
+    c1 := NextCode();
+    IF c1 < 0 OR c1 = 0FEH THEN RETURN END;  (* malformed tail -- stop cleanly *)
+    c2 := NextCode();
+    c3 := c2;
+    IF c2 >= 0 & c2 # 0FEH THEN c3 := NextCode() END;
+    more := DecodeGroup4(c0, c1, c2, c3);
+    IF more THEN c0 := NextCode() ELSE c0 := -1 END
+  END
+END DecodeFile;
+
+BEGIN
+  IF ~ParseCmdLine() THEN Error("usage: MIME <E|D> inf outf", 2) END;
+  IF mode # 45H THEN IF mode # 44H THEN Error("Mode must be E or D", 2) END END;
+
+  BuildEncodeTable();
+  BuildDecodeTable();
+
+  inFp := ADR(inH);
+  outFp := ADR(outH);
+  SI := ADR(inName);
+  IF ~Reset(inFp, SI) THEN Error("Cannot open input file", 1) END;
+  DI := ADR(outName);
+  IF ~ReWrite(outFp, DI) THEN Error("Cannot create output file", 1) END;
+
+  IF mode = 45H THEN EncodeFile() ELSE DecodeFile() END;
+
+  Close(inFp);
+  Close(outFp);
+  Halt(0)
+END Mime.

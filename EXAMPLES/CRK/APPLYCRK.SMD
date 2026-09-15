@@ -26,7 +26,7 @@
 
 MODULE APPLYCRK;
 
-IMPORT SYSTEM, OUT, FILES;
+IMPORT SYSTEM, OUT, FILES, CMDLINE;
 
 CONST
   MaxName = 128;
@@ -56,7 +56,7 @@ VAR
                                   before the Apply/Revert status line
                                   (below) can be printed *)
   targetH     : File;
-  cmdIdx, cmdTailLen : INTEGER;
+  cmdState    : CmdState;
 
   crkReader   : File;           (* READER's own multifile-capable state
                                    for crkName -- passed to Open/Close/
@@ -64,16 +64,11 @@ VAR
 
 (* ============================ line prep =============================== *)
 
-PROCEDURE IsBlank(AL) : BOOLEAN; NEAR;
-BEGIN
-  IF AL = Space THEN
-    AL := TRUE
-  ELSIF AL = Tab THEN
-    AL := TRUE
-  ELSE
-    AL := FALSE
-  END
-END IsBlank;
+(* IsBlank moved to LIB/CMDLINE.SMD (byte-for-byte identical to this
+   file's own former copy, and to MKCRK.SMD's/LZSS.SMD's/LZP.SMD's/
+   MIME.SMD's -- see CMDLINE.SMD's own header comment) -- still used
+   here by PrepLine, below, not just by the command-line parser
+   further down this file. *)
 
 (* strips a ';' comment (running to end of line, wherever it starts)
    and trims trailing spaces/tabs left over from before the ';' (or
@@ -488,64 +483,14 @@ END DoPatch;
 
 (* ============================ command line ============================ *)
 
-PROCEDURE IsSep(c : BYTE) : BOOLEAN; NEAR;
-BEGIN
-  IF IsBlank(c) THEN
-    AL := TRUE
-  ELSIF c = CR THEN
-    AL := TRUE
-  ELSE
-    AL := FALSE
-  END
-END IsSep;
-
-PROCEDURE SkipBlanks(); NEAR;
-VAR c : BYTE;
-BEGIN
-  WHILE cmdIdx <= cmdTailLen DO
-    BX := 80H + cmdIdx;
-    c := [ES:BX];
-    IF IsBlank(c) THEN
-      INC(cmdIdx)
-    ELSE
-      BREAK
-    END
-  END
-END SkipBlanks;
-
-PROCEDURE GetToken(dst : INTEGER) : BOOLEAN; NEAR;
-VAR n : INTEGER;
-    c : BYTE;
-    maxLenM1 : INTEGER;
-BEGIN
-  maxLenM1 := MaxName - 1;
-  IF cmdIdx > cmdTailLen THEN
-    RETURN FALSE
-  END;
-  BX := 80H + cmdIdx;
-  c := [ES:BX];
-  IF c = CR THEN
-    RETURN FALSE
-  END;
-  n := 0;
-  WHILE cmdIdx <= cmdTailLen DO
-    BX := 80H + cmdIdx;
-    c := [ES:BX];
-    IF IsSep(c) THEN BREAK END;
-    IF n < maxLenM1 THEN
-      SI := dst;
-      INC(SI, n);
-      [DS:SI] := c;
-      INC(n)
-    END;
-    INC(cmdIdx)
-  END;
-  SI := dst;
-  INC(SI, n);
-  AL := 0;
-  [DS:SI] := AL;
-  AL := n > 0
-END GetToken;
+(* IsSep/SkipBlanks/GetToken all moved to LIB/CMDLINE.SMD -- this file's
+   own former GetToken was quote-UNAWARE, unlike MKCRK.SMD's/LZSS.SMD's/
+   LZP.SMD's/MIME.SMD's identical quote-aware copies (a real, if minor,
+   behavioral drift between "the same" duplicated logic -- see
+   CMDLINE.SMD's own header comment); CMDLINE's own GetToken is the
+   quote-aware version, a strict superset of what this file needed
+   (neither a .crk filename nor a "+N"/"-N" argument realistically
+   starts with a literal '"'), so no behavior actually changes here. *)
 
 (* parses an optional trailing "+N" or "-N" token (decimal N) into
    wantApply/isApply/wantNum. Returns FALSE on a malformed token
@@ -605,17 +550,12 @@ USES ES;
 VAR argBuf : BYTE[MaxName];
     have : BOOLEAN;
 BEGIN
-  GetPSP();
-  ES := AX;
-  BX := 80H;
-  AL := [ES:BX];
-  cmdTailLen := AL;
-  cmdIdx := 1;
-  SkipBlanks();
-  IF ~GetToken(ADR(crkName)) THEN RETURN FALSE END;
+  StartCmdLine(ADR(cmdState));
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(crkName), MaxName) THEN RETURN FALSE END;
   wantApply := FALSE;
-  SkipBlanks();
-  have := GetToken(ADR(argBuf));
+  SkipBlanks(ADR(cmdState));
+  have := GetToken(ADR(cmdState), ADR(argBuf), MaxName);
   IF have THEN
     IF ~ParseApplyArg(ADR(argBuf)) THEN RETURN FALSE END
   END;

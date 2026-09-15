@@ -73,7 +73,7 @@ MODULE SMDFMT;
    ordinary SPHINX Oberon source (as everything under EXAMPLES/ and
    TESTS/ already looks) right, not every conceivable layout. *)
 
-IMPORT SYSTEM, FILES, OUT;
+IMPORT SYSTEM, FILES, OUT, CMDLINE;
 
 CONST
   IndentStep = 2;        (* spaces per indent level -- the tool's one
@@ -95,6 +95,9 @@ CONST
 VAR
   inName  : BYTE[MaxName];
   outName : BYTE[MaxName];
+  cmdState : CmdState;         (* LIB/CMDLINE.SMD's own PSP-tail scan
+                                  state, replacing GetTwoArgs' former
+                                  hand-rolled tailLen/i locals *)
 
   inReader  : File;            (* READER's own buffered-read state,
                                   replacing this file's former standalone
@@ -157,8 +160,12 @@ VAR
   ungetPos : INTEGER;
 
 (* ---- small char classifiers, own copies (STRINGS.SMD is known to
-   fail translation, DOCS/SPHO.MD -- kept independent, same as
-   LCOUNT.SMD's own IsBlank/IsNameEnd do) ---- *)
+   fail translation, DOCS/SPHO.MD -- kept independent). IsSpaceOrTab is
+   NOT the same as LIB/CMDLINE.SMD's own IsBlank -- this one is used
+   throughout this file's own formatter/scanner logic (whitespace
+   detection in .SMD source, not just command-line parsing), so it
+   stays a local copy even though GetTwoArgs, below, no longer needs
+   its own -- see GetTwoArgs' own header comment. ---- *)
 
 PROCEDURE IsSpaceOrTab(c : BYTE) : BOOLEAN; NEAR;
 BEGIN
@@ -170,7 +177,7 @@ END IsSpaceOrTab;
 
 PROCEDURE IsIdentChar(c : BYTE) : BOOLEAN; NEAR;
 BEGIN
-  IF c = 95 THEN RETURN TRUE END;                   (* '_' *)
+  IF c = 5FH THEN RETURN TRUE END;                   (* '_' *)
   IF c >= 30H THEN
     IF c <= 39H THEN RETURN TRUE END                (* '0'..'9' *)
   END;
@@ -234,9 +241,9 @@ BEGIN
       IF c = LF THEN inLine := FALSE; RETURN c END
 
     ELSIF inBlock THEN
-      IF c = 42 THEN                       (* '*' -- maybe closes the block *)
+      IF c = 2AH THEN                      (* '*' -- maybe closes the block *)
         c2 := RawNextByte();
-        IF c2 = 41 THEN                    (* ')' -- star-paren closes *)
+        IF c2 = 29H THEN                   (* ')' -- star-paren closes *)
           inBlock := FALSE
         ELSIF c2 # 0 THEN
           pushback := c2; pushedBack := TRUE
@@ -256,17 +263,17 @@ BEGIN
         inString := TRUE; RETURN c
       ELSIF c = Apos THEN
         inChar := TRUE; RETURN c
-      ELSIF c = 40 THEN                    (* '(' -- maybe opens a block comment *)
+      ELSIF c = 28H THEN                   (* '(' -- maybe opens a block comment *)
         c2 := RawNextByte();
-        IF c2 = 42 THEN                    (* '*' -- "(*" opens *)
+        IF c2 = 2AH THEN                   (* '*' -- "(*" opens *)
           inBlock := TRUE
         ELSE
           IF c2 # 0 THEN pushback := c2; pushedBack := TRUE END;
           RETURN c
         END
-      ELSIF c = 47 THEN                    (* '/' -- maybe opens a line comment *)
+      ELSIF c = 2FH THEN                   (* '/' -- maybe opens a line comment *)
         c2 := RawNextByte();
-        IF c2 = 47 THEN                    (* '/' -- "//" opens *)
+        IF c2 = 2FH THEN                   (* '/' -- "//" opens *)
           inLine := TRUE
         ELSE
           IF c2 # 0 THEN pushback := c2; pushedBack := TRUE END;
@@ -388,11 +395,11 @@ BEGIN
         isEnd := FALSE;
         IF scanLen = 3 THEN
           SI := ADR(scanBuf); AL := [DS:SI];
-          IF AL = 69 THEN
+          IF AL = 45H THEN                   (* 'E' *)
             INC(SI); AL := [DS:SI];
-            IF AL = 78 THEN
+            IF AL = 4EH THEN                 (* 'N' *)
               INC(SI); AL := [DS:SI];
-              IF AL = 68 THEN isEnd := TRUE END
+              IF AL = 44H THEN isEnd := TRUE END  (* 'D' *)
             END
           END
         END;
@@ -772,74 +779,21 @@ END Format;
 
 (* GetTwoArgs: split the DOS command tail into two whitespace-separated
    tokens (input filename, output filename), NUL-terminating each into
-   inName/outName. Same PSP-reading approach as LCOUNT.SMD's own
-   GetCmdLine (AH=62h for the PSP segment, PSP offset 80h = tail
-   length, 81h.. = raw text). Returns FALSE if either token is
-   missing. *)
+   inName/outName -- moved onto LIB/CMDLINE.SMD's own StartCmdLine/
+   SkipBlanks/GetToken (this file's own former hand-rolled copy of the
+   same skip-blanks/copy-token shape LCOUNT.SMD/MKCRK.SMD/etc. all
+   independently carried too -- see DOCS/TRBUG.MD's own dedicated
+   LCOUNT entry for the real bug that duplication risk already caused
+   once). CMDLINE.GetToken is quote-aware, a strict superset of what
+   this file's own former token scanner needed. Returns FALSE if
+   either token is missing. *)
 PROCEDURE GetTwoArgs() : BOOLEAN; NEAR;
-VAR tailLen : INTEGER;
-    i : INTEGER;
-    n : INTEGER;
-    c : BYTE;
-    psp : INTEGER;
-    maxNameM1 : INTEGER;
 BEGIN
-  maxNameM1 := MaxName - 1;
-  GetPSP();
-  psp := AX;
-  ES := psp;
-  BX := 80H;
-  AL := [ES:BX];
-  tailLen := AL;
-  i := 1;
-
-  (* skip leading blanks *)
-  WHILE i <= tailLen DO
-    BX := 80H + i;
-    c := [ES:BX];
-    IF IsSpaceOrTab(c) THEN INC(i) ELSE BREAK END
-  END;
-  IF i > tailLen THEN RETURN FALSE END;
-
-  (* copy first token into inName *)
-  n := 0;
-  WHILE i <= tailLen DO
-    BX := 80H + i;
-    c := [ES:BX];
-    IF IsSpaceOrTab(c) THEN BREAK END;
-    IF c = CR THEN BREAK END;
-    IF n >= maxNameM1 THEN BREAK END;
-    SI := ADR(inName); INC(SI, n);
-    [DS:SI] := c;
-    INC(n); INC(i)
-  END;
-  SI := ADR(inName); INC(SI, n);
-  AL := 0; [DS:SI] := AL;
-  IF n = 0 THEN RETURN FALSE END;
-
-  (* skip blanks between tokens *)
-  WHILE i <= tailLen DO
-    BX := 80H + i;
-    c := [ES:BX];
-    IF IsSpaceOrTab(c) THEN INC(i) ELSE BREAK END
-  END;
-  IF i > tailLen THEN RETURN FALSE END;
-
-  (* copy second token into outName *)
-  n := 0;
-  WHILE i <= tailLen DO
-    BX := 80H + i;
-    c := [ES:BX];
-    IF IsSpaceOrTab(c) THEN BREAK END;
-    IF c = CR THEN BREAK END;
-    IF n >= maxNameM1 THEN BREAK END;
-    SI := ADR(outName); INC(SI, n);
-    [DS:SI] := c;
-    INC(n); INC(i)
-  END;
-  SI := ADR(outName); INC(SI, n);
-  AL := 0; [DS:SI] := AL;
-  RETURN n > 0
+  StartCmdLine(ADR(cmdState));
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(inName), MaxName) THEN RETURN FALSE END;
+  SkipBlanks(ADR(cmdState));
+  RETURN GetToken(ADR(cmdState), ADR(outName), MaxName)
 END GetTwoArgs;
 
 BEGIN

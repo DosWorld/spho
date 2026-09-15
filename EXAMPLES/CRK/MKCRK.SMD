@@ -2,7 +2,7 @@
 
 MODULE MKCRK;
 
-IMPORT SYSTEM, OUT, FILES;
+IMPORT SYSTEM, OUT, FILES, CMDLINE;
 
 CONST
   BufIo   = 4096;   (* each input file's own read-ahead cache -- the
@@ -39,7 +39,7 @@ VAR
   anyDiff  : BOOLEAN;
 
   inName1, inName2 : BYTE[MaxName];
-  cmdIdx, cmdTailLen : INTEGER;
+  cmdState : CmdState;
 
 (* ============================ output ================================ *)
 
@@ -195,7 +195,7 @@ BEGIN
   IF len1Lo # len2Lo THEN sameSize := FALSE END;
   IF len1Hi # len2Hi THEN sameSize := FALSE END;
   IF ~sameSize THEN
-    WriteLine(ADR(stdout), "Files have diffrent sizes!");
+    WriteLine(ADR(stdout), "Files have different sizes!");
     WriteLn(ADR(stdout));
     (* compare only over the smaller file's own length, matching the
        original's EAX>ln1 check *)
@@ -221,7 +221,7 @@ BEGIN
   END;
 
   IF ~anyDiff THEN
-    WriteLine(ADR(stdout), "No diffrences found!");
+    WriteLine(ADR(stdout), "No differences found!");
     WriteLn(ADR(stdout))
   END;
 
@@ -231,107 +231,19 @@ END DoCompare;
 
 (* ============================ command line ============================ *)
 
-PROCEDURE IsBlank(AL) : BOOLEAN; NEAR;
-BEGIN
-  IF AL = Space THEN
-    AL := TRUE
-  ELSIF AL = Tab THEN
-    AL := TRUE
-  ELSE
-    AL := FALSE
-  END
-END IsBlank;
-
-PROCEDURE IsSep(c : BYTE) : BOOLEAN; NEAR;
-BEGIN
-  IF IsBlank(c) THEN
-    AL := TRUE
-  ELSIF c = CR THEN
-    AL := TRUE
-  ELSE
-    AL := FALSE
-  END
-END IsSep;
-
-PROCEDURE SkipBlanks(); NEAR;
-VAR c : BYTE;
-BEGIN
-  WHILE cmdIdx <= cmdTailLen DO
-    BX := 80H + cmdIdx;
-    c := [ES:BX];
-    IF IsBlank(c) THEN
-      INC(cmdIdx)
-    ELSE
-      BREAK
-    END
-  END
-END SkipBlanks;
-
-PROCEDURE GetToken(dst : INTEGER) : BOOLEAN; NEAR;
-VAR n : INTEGER;
-    c : BYTE;
-    quoted : BOOLEAN;
-    maxNameM1 : INTEGER;
-BEGIN
-  maxNameM1 := MaxName - 1;
-  IF cmdIdx > cmdTailLen THEN
-    RETURN FALSE
-  END;
-  BX := 80H + cmdIdx;
-  c := [ES:BX];
-  IF c = CR THEN
-    RETURN FALSE
-  END;
-  quoted := FALSE;
-  IF c = 22H THEN
-    quoted := TRUE;
-    INC(cmdIdx)
-  END;
-  n := 0;
-  WHILE cmdIdx <= cmdTailLen DO
-    BX := 80H + cmdIdx;
-    c := [ES:BX];
-    IF quoted THEN
-      IF c = 22H THEN
-        INC(cmdIdx);
-        BREAK
-      END;
-      IF c = CR THEN
-        BREAK
-      END
-    ELSE
-      IF IsSep(c) THEN
-        BREAK
-      END
-    END;
-    IF n < maxNameM1 THEN
-      SI := dst;
-      INC(SI, n);
-      [DS:SI] := c;
-      INC(n)
-    END;
-    INC(cmdIdx)
-  END;
-  SI := dst;
-  INC(SI, n);
-  AL := 0;
-  [DS:SI] := AL;
-  AL := n > 0
-END GetToken;
-
+(* IsBlank/IsSep/SkipBlanks/GetToken/the PSP-tail-setup boilerplate all
+   moved to LIB/CMDLINE.SMD -- this file's own copies were byte-for-byte
+   identical to APPLYCRK.SMD's/LZSS.SMD's/LZP.SMD's/MIME.SMD's, a real
+   duplication risk (see CMDLINE.SMD's own header comment). cmdState
+   replaces this file's former cmdIdx/cmdTailLen locals. *)
 PROCEDURE ParseCmdLine() : BOOLEAN; NEAR;
 USES ES;
 BEGIN
-  GetPSP();
-  ES := AX;
-  BX := 80H;
-  AL := [ES:BX];
-  cmdTailLen := AL;
-  cmdIdx := 1;
-  SkipBlanks();
-  IF ~GetToken(ADR(inName1)) THEN RETURN FALSE END;
-  SkipBlanks();
-  IF ~GetToken(ADR(inName2)) THEN RETURN FALSE END;
+  StartCmdLine(ADR(cmdState));
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(inName1), MaxName) THEN RETURN FALSE END;
+  SkipBlanks(ADR(cmdState));
+  IF ~GetToken(ADR(cmdState), ADR(inName2), MaxName) THEN RETURN FALSE END;
   AL := TRUE
 END ParseCmdLine;
 
@@ -363,7 +275,11 @@ BEGIN
   b1l := 0; p1 := 0;
   b2l := 0; p2 := 0;
 
-  WriteLine(ADR(stdout), "Place your CRK title here\r\n\r\n");
+  (* MKCRK has no way to know what this patch is FOR -- the title is a
+     free-form description the user fills in themselves (APPLYCRK reads
+     and displays it, see ReadTitle/SaveTitle there); this placeholder
+     line is a prompt to edit, not a real generated title. *)
+  WriteLine(ADR(stdout), "*** EDIT THIS TITLE BEFORE DISTRIBUTING ***\r\n\r\n");
   DoCompare();
   WriteLn(ADR(stdout));
   WriteLn(ADR(stdout));

@@ -3351,9 +3351,9 @@ end;
     same srcVal it always did). }
 procedure FoldSavedOperandSelfDest(startChunk: POpChunk; startSlot: integer;
                                     endChunk: POpChunk; endSlot: integer);
-  var c, mc, bc, pc, ac: POpChunk; k, mk, bk, pk, ak: integer;
+  var c, mc, bc, pc, ac, oc: POpChunk; k, mk, bk, pk, ak, ok: integer;
       axTxt, bxTxt, src, addrTxt: string; srcOp: TOperand;
-      pushId: word;
+      pushId: word; bxRestoredAfter: boolean;
 begin
   c := startChunk; k := startSlot;
   repeat
@@ -3388,8 +3388,51 @@ begin
                         DecodeOperand(src, srcOp);
                         if (srcOp.kind = OpKindImm)
                            or ((srcOp.kind = OpKindMem) and srcOp.isFrameObject) then begin
-                          if LocalDeadAfter(ac, ak, endChunk, endSlot, RegMaskBX, FlagMaskNone) then begin
-                            { BX provably dead afterward -- full collapse. }
+                          { bxRestoredAfter: SPHO.PAS's own EmitIncDecAmountToReg
+                            (nmIsAx branch) now wraps this whole PUSH-AX(id)/
+                            MOV-AX,src/MOV-BX,AX/POP-AX(id)/ADD-or-SUB-AX,BX
+                            window in an OUTER PUSH BX(id2)/POP BX(id2) pair of
+                            its own (a separate fix for a real bug -- BX used
+                            to be silently clobbered here, DOCS/TRBUG.MD's own
+                            "Related bug found and fixed" entry on this exact
+                            shape). When that outer POP BX(id2) immediately
+                            follows the ADD/SUB matched here, it UNCONDITIONALLY
+                            restores the caller's own real BX right after --
+                            so whatever this fold leaves BX holding in between
+                            is provably irrelevant, the exact same "no one can
+                            observe this register's value" property
+                            LocalDeadAfter's own forward scan exists to prove,
+                            just proven directly by construction here instead
+                            of by scanning. Full collapse is therefore ALWAYS
+                            sound when this outer POP is present, without
+                            needing LocalDeadAfter at all -- covers the one
+                            case LocalDeadAfter itself could never prove (BX
+                            genuinely read again later BY THE CALLER after
+                            this procedure returns, which is exactly what the
+                            outer POP restores it to, so that later read sees
+                            the CALLER's own BX, never this fold's scratch
+                            value, regardless of what this fold does to BX
+                            here). The outer PUSH/POP BX pair itself is left
+                            untouched -- removing it too would need a backward
+                            scan this unit has no primitive for yet; C3
+                            (RemoveUnnecessarySaveRestore) is the natural
+                            future home for that, once it accepts a nested
+                            push/pop interior (currently rejects one
+                            outright). }
+                          oc := ac; ok := ak;
+                          bxRestoredAfter := NextReal(oc, ok, endChunk, endSlot)
+                            and (oc^.ops[ok].kind = TOpInstr)
+                            and (oc^.ops[ok].mnemonic = MnPop)
+                            and (oc^.ops[ok].genSaveId <> 0)
+                            and (oc^.ops[ok].genSaveId <> pushId);
+                          if bxRestoredAfter then begin
+                            StrTab.Get(oc^.ops[ok].op1, bxTxt);
+                            bxRestoredAfter := Util.EqualICase(bxTxt, 'bx')
+                          end;
+                          if bxRestoredAfter
+                             or LocalDeadAfter(ac, ak, endChunk, endSlot, RegMaskBX, FlagMaskNone) then begin
+                            { BX provably dead afterward (either proof) --
+                              full collapse. }
                             ac^.ops[ak].op2 := StrTab.Put(src);
                             c^.ops[k].mnemonic := MnNop;
                             mc^.ops[mk].mnemonic := MnNop;
@@ -3468,9 +3511,9 @@ end;
   conditional on that extra proof, not automatic. }
 procedure CollapseByteConstScaffolding(startChunk: POpChunk; startSlot: integer;
                                         endChunk: POpChunk; endSlot: integer);
-  var c, mc, sc, ac, pc: POpChunk; k, mk, sk, ak, pk: integer;
-      axTxt, kTxt, scratch, scratch2, alTxt: string;
-      kVal: word; scratchReg: integer; pushId: word;
+  var c, mc, sc, ac, pc, oc: POpChunk; k, mk, sk, ak, pk, ok: integer;
+      axTxt, kTxt, scratch, scratch2, alTxt, bxTxt: string;
+      kVal: word; scratchReg: integer; pushId: word; scratchRestoredAfter: boolean;
 begin
   c := startChunk; k := startSlot;
   repeat
@@ -3507,10 +3550,44 @@ begin
                         c^.ops[k].mnemonic := MnNop;
                         mc^.ops[mk].mnemonic := MnNop;
                         pc^.ops[pk].mnemonic := MnNop;
-                        if LocalDeadAfter(ac, ak, endChunk, endSlot, RegBitFor(scratchReg, true), FlagMaskNone) then begin
-                          { scratch provably dead afterward -- fully
-                            collapse: drop the MOV scratch,K entirely,
-                            fold K straight into the ADD/SUB. }
+                        { scratchRestoredAfter: when scratch is BL,
+                          SPHO.PAS's own EmitIncDecAmountToReg (nmIsAl
+                          branch) now wraps this whole window in an OUTER
+                          PUSH BX(id2)/POP BX(id2) pair (a real-bug fix --
+                          BX used to be silently clobbered here, DOCS/
+                          TRBUG.MD's own "Related bug found and fixed"
+                          entry). When that outer POP BX(id2) immediately
+                          follows the ADD/SUB matched here, it
+                          unconditionally restores the caller's own real
+                          BX right after -- see FoldSavedOperandSelfDest's
+                          own identical proof, just above this rule, for
+                          the full reasoning (same shape, same argument).
+                          Not checked for CL: nothing in this codebase
+                          gives CL an outer save/restore of its own (the
+                          CX-clobber bugfix moved this call site to BX
+                          entirely; a CL match here only exists for
+                          forward-compatibility with OPT.TXT's own
+                          CL-specific spec text, never actually emitted by
+                          SPHO.PAS today), so CL still relies on
+                          LocalDeadAfter alone, unchanged. }
+                        scratchRestoredAfter := false;
+                        if scratchReg = Regs86.RegBL then begin
+                          oc := ac; ok := ak;
+                          scratchRestoredAfter := NextReal(oc, ok, endChunk, endSlot)
+                            and (oc^.ops[ok].kind = TOpInstr)
+                            and (oc^.ops[ok].mnemonic = MnPop)
+                            and (oc^.ops[ok].genSaveId <> 0)
+                            and (oc^.ops[ok].genSaveId <> pushId);
+                          if scratchRestoredAfter then begin
+                            StrTab.Get(oc^.ops[ok].op1, bxTxt);
+                            scratchRestoredAfter := Util.EqualICase(bxTxt, 'bx')
+                          end
+                        end;
+                        if scratchRestoredAfter
+                           or LocalDeadAfter(ac, ak, endChunk, endSlot, RegBitFor(scratchReg, true), FlagMaskNone) then begin
+                          { scratch provably dead afterward (either proof)
+                            -- fully collapse: drop the MOV scratch,K
+                            entirely, fold K straight into the ADD/SUB. }
                           sc^.ops[sk].mnemonic := MnNop;
                           ac^.ops[ak].op2 := StrTab.Put(IntStr(kVal and $FF))
                         end else begin
