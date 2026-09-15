@@ -127,6 +127,43 @@ type
     next:    PPendingChunk
   end;
 
+  { POptRangeChunk/TOptRangeChunk: OPT.TXT's own R6 finding ("this needs
+    a post-parse optimization phase... because the current immediate
+    per-procedure pass cannot see later callers") -- one entry per
+    PROCEDURE body, recorded by ParseProcedure INSTEAD OF calling
+    PHOpt.Optimize immediately the way every earlier version of this
+    file did. Same chunked-list shape/convention as TPendingChunk just
+    above (one append per PROCEDURE parsed, never per operation, so
+    this list stays small regardless of how large any one procedure's
+    own body is). OptimizeAllDeferred (below) walks this list exactly
+    once, after CheckPendingCalls has resolved every pending call site
+    (RunBody's own call order) -- only then does every TOperation's own
+    callProcId (Types.TOperation, set by EmitCall/EmitCallNoArgs) refer
+    to a stable, fully-resolved callee, letting PHOpt.PAS's own
+    deferred call-graph analysis build a sound per-procedure output-
+    demand fact before any individual procedure's own Optimize call
+    actually runs. }
+  POptRangeChunk = ^TOptRangeChunk;
+  TOptRangeChunk = record
+    procId:     array[1..Chunk] of integer;    { SymTab's own `pi` --
+                                                   PHOpt.PAS's own call-
+                                                   graph analysis keys its
+                                                   per-procedure demand
+                                                   facts by this same id,
+                                                   the one callProcId
+                                                   stamps at each call
+                                                   site (see that field's
+                                                   own comment, Types.
+                                                   TOperation). }
+    startChunk: array[1..Chunk] of POpChunk;
+    startSlot:  array[1..Chunk] of integer;
+    endChunk:   array[1..Chunk] of POpChunk;
+    endSlot:    array[1..Chunk] of integer;
+    level:      array[1..Chunk] of integer;
+    count:      integer;
+    next:       POptRangeChunk
+  end;
+
   { TCompilation: state that lives for the whole run (SOPLAN.MD's own
     Phase 2 -- an explicit compilation-state record instead of bare
     globals). One instance ever exists (comp, below) -- Spho.pas runs a
@@ -166,6 +203,10 @@ type
     loopDepth: integer;
     opHead, opTail: POpChunk;
     nOps: integer;
+    optRangeHead, optRangeTail: POptRangeChunk;   { OPT.TXT's own R6
+                                                      finding -- see
+                                                      TOptRangeChunk's
+                                                      own comment above. }
   end;
 
   { TProcedureContext: the CURRENT procedure's own parse state, reset at
@@ -185,6 +226,57 @@ var
   es: Emits.TEmitState;
   comp: TCompilation;
   ctx: TProcedureContext;
+
+  { optRanges/optConservative: OPT.TXT's own R6 finding -- unit-level
+    (not a local inside OptimizeAllDeferred) purely to avoid a large
+    automatic array on the stack, same caution OPT.TXT's own R4
+    resolution text already named ("not additional large automatic
+    arrays") applied here to a NEW large array rather than the Stage D
+    ones that finding was originally about. Sized to PHOpt.MaxProcs
+    (512 -- see that constant's own header comment, PHOPT.PAS, for why
+    this is a real MEASURED bound against this translator's own largest
+    example, not SymTab's own much larger theoretical structural cap;
+    TProcRange/TProcDemand/a plain boolean array all sized to SymTab's
+    own real 4096 cap overflowed TP7's own 64KB data segment outright,
+    confirmed directly, "Error 49: Data segment too large") --
+    optRanges holds strictly fewer entries in practice (one per
+    recorded OptRangeAppend call, i.e. one per PROCEDURE actually
+    optimized at -O1/-O2, never more than SymTab.ProcCount itself),
+    optConservative is genuinely indexed 1:1 by procId up to
+    SymTab.ProcCount. }
+  optRanges: array[0..PHOpt.MaxProcs-1] of PHOpt.TProcRange;
+  optConservative: array[0..PHOpt.MaxProcs-1] of boolean;
+
+  { optLevel: OPT.TXT's own "FIRST PREREQUISITE: COMMAND-LINE
+    OPTIMIZATION LEVELS" -- 0/1/2 for -O0/-O1/-O2, parsed once by
+    ParseOptLevel (RunBody's own first real step) from the raw
+    ParamStr(1..ParamCount) list, defaulting to 1 when no -O flag is
+    given at all ("by default (if parameter missed) use -O1"). Read
+    by ParseProcedure's own PHOpt.Optimize call site: 0 skips the call
+    entirely; 1/2 both call it (Stage A's own correctness repairs live
+    inside PHOpt.Optimize itself, unconditionally -- they are bug
+    fixes to existing rules, not new rewrites, so both levels get them
+    for free per OPT.TXT's own "-O1 ... with the Stage A correctness
+    repairs"); -O2 is accepted but currently behaves identically to -O1
+    (Stages B onward, which would give -O2 real additional rewrites,
+    are not implemented yet -- OPT.TXT's own explicit stage-by-stage
+    order, "Finish and verify each stage before enabling its
+    dependents"). }
+  optLevel: integer;
+
+  { nextGenSaveId: OPT.TXT's own Stage C "generated-save-pair identity"
+    metadata (Stage B's own intro: "Add emitter metadata only where
+    needed... generated save-pair identity... Capture it while symbols
+    exist"). A plain, never-reset, monotonically increasing counter --
+    0 means "not a compiler-generated scratch save" (TOperation's own
+    genSaveId field default, set by NewOpSlot), any nonzero value is
+    unique across the WHOLE translation (not just one procedure), so
+    two independent save/restore pairs can never be mistaken for the
+    same one even if PHOpt.PAS's own C1/C2/C3 matchers someday need to
+    compare ids across chunk boundaries. Incremented once per NEW
+    save/restore pair claimed (EmitGenSave below), never per operation
+    -- both the PUSH and its matching POP share the SAME id. }
+  nextGenSaveId: word;
 
   { topModName: the top-level file's own 'MODULE Name;' spelling --
     captured by ParseModule(isTop=TRUE) only (an IMPORTed file's own
@@ -230,6 +322,7 @@ function ParseArrayBound: integer; far; forward;
 procedure EmitAdrOperand(const arg: string; si: integer; var dst: string); forward;
 procedure OperandText(var dst: string); forward;
 function PeekOperandIsByte(const nm: string): boolean; forward;
+function PeekVarIsInt(const nm: string): boolean; forward;
 
 { CheckPendingCalls: called once, after the whole top-level file (and
   every file it IMPORTs) has been fully parsed. Every entry PendingAppend
@@ -327,6 +420,92 @@ begin
   last^.count := k
 end;
 
+{ OptRangeAppend: OPT.TXT's own R6 finding -- record ONE procedure
+  body's own [startChunk,startSlot..endChunk,endSlot] range plus its
+  own -O level and SymTab procId, instead of calling PHOpt.Optimize
+  immediately the way ParseProcedure used to. OptimizeAllDeferred
+  (below) walks this whole list exactly once, after every call site in
+  the module has been fully resolved (RunBody's own call order:
+  ParseModule, then CheckPendingCalls, then OptimizeAllDeferred, then
+  SerializeOps). }
+procedure OptRangeAppend(procId: integer; startChunk: POpChunk; startSlot: integer;
+                          endChunk: POpChunk; endSlot: integer; level: integer);
+  var last: POptRangeChunk; k: integer;
+begin
+  if (comp.optRangeTail = nil) or (comp.optRangeTail^.count >= Chunk) then begin
+    New(last);
+    last^.count := 0; last^.next := nil;
+    if comp.optRangeHead = nil then comp.optRangeHead := last else comp.optRangeTail^.next := last;
+    comp.optRangeTail := last
+  end;
+  last := comp.optRangeTail;
+  k := last^.count + 1;
+  last^.procId[k] := procId;
+  last^.startChunk[k] := startChunk; last^.startSlot[k] := startSlot;
+  last^.endChunk[k] := endChunk; last^.endSlot[k] := endSlot;
+  last^.level[k] := level;
+  last^.count := k
+end;
+
+{ OptimizeAllDeferred: OPT.TXT's own R6 finding -- calls PHOpt.Optimize
+  once per recorded range, in the SAME order ParseProcedure would have
+  called it immediately before this change (append order == source
+  order, unaffected by deferring the call itself); the only actual
+  behavior change is WHEN each call happens (after CheckPendingCalls,
+  not immediately per-procedure), giving PHOpt.PAS's own call-graph
+  analysis (built once, lazily, the first time PHOpt.Optimize itself
+  needs it -- see PHOPT.PAS's own header comment) full visibility into
+  every call site in the module, including a forward reference to a
+  procedure whose own body was parsed LATER than some of its callers. }
+procedure OptimizeAllDeferred;
+  var rc: POptRangeChunk; k, nRanges, nProcs, i: integer;
+begin
+  { Flatten comp.optRangeHead's own chunked list into optRanges (PHOpt.
+    BuildCallGraph needs a plain array -- a TP7 open-array parameter
+    can't walk a linked chunk list on its own) -- OPT.TXT's own R6
+    finding. }
+  nRanges := 0;
+  rc := comp.optRangeHead;
+  while rc <> nil do begin
+    for k := 1 to rc^.count do begin
+      if nRanges < PHOpt.MaxProcs then begin
+        optRanges[nRanges].procId := rc^.procId[k];
+        optRanges[nRanges].startChunk := rc^.startChunk[k];
+        optRanges[nRanges].startSlot := rc^.startSlot[k];
+        optRanges[nRanges].endChunk := rc^.endChunk[k];
+        optRanges[nRanges].endSlot := rc^.endSlot[k];
+        nRanges := nRanges + 1
+      end
+    end;
+    rc := rc^.next
+  end;
+  { optConservative: OPT.TXT's own R6 finding -- "Keep... external/
+    indirect calls and address-taken entry points conservative", plus
+    exported (a `*`-marked PROCEDURE may be called from some OTHER
+    module entirely outside this pass's own visibility, via IMPORT/the
+    generated .SHD header -- DOCS/SPHINX.MD's own EXTERNAL-declaration
+    convention on the IMPORTING side). One entry per SymTab row,
+    covering every procedure this module KNOWS about, not just the
+    ones with a recorded optimize range (an EXTERNAL/FORWARD-only row
+    has no body/range at all, but can still be a real callee some
+    other procedure's own call site targets, and must still be
+    correctly forced conservative here). }
+  nProcs := SymTab.ProcCount;
+  for i := 0 to nProcs - 1 do begin
+    if i < PHOpt.MaxProcs then
+      optConservative[i] := SymTab.ProcIsExternal(i) or SymTab.ProcIsExported(i)
+                             or SymTab.ProcIsAddressTaken(i)
+  end;
+  PHOpt.BuildCallGraph(nProcs, nRanges, optRanges, optConservative);
+  rc := comp.optRangeHead;
+  while rc <> nil do begin
+    for k := 1 to rc^.count do
+      PHOpt.Optimize(rc^.startChunk[k], rc^.startSlot[k],
+                      rc^.endChunk[k], rc^.endSlot[k], rc^.level[k], rc^.procId[k]);
+    rc := rc^.next
+  end
+end;
+
 { InternOrZero: StrTab.Put(s), EXCEPT an empty string interns as id 0
   ("no string") instead of a real StrTab entry -- StrTab.Put('') would
   otherwise allocate a genuine id for the empty string like any other
@@ -372,6 +551,8 @@ begin
   last^.ops[k].op1 := 0;
   last^.ops[k].op2 := 0;
   last^.ops[k].sect := comp.curSect;
+  last^.ops[k].genSaveId := 0;
+  last^.ops[k].callProcId := 0;
   last^.count := k;
   oc := last; oi := k
 end;
@@ -427,6 +608,37 @@ begin
   oc^.ops[oi].mnemonic := mnemonic;
   oc^.ops[oi].op1 := InternOrZero(opnd1);
   oc^.ops[oi].op2 := InternOrZero(opnd2)
+end;
+
+{ EmitGenSavePush/EmitGenSavePop: OPT.TXT Stage C's own "generated-
+  save-pair identity" metadata -- a PUSH/POP pair this call site itself
+  knows is a compiler-owned scratch-register save/restore (never a
+  user-written PUSH()/POP() statement or a USES register-preservation
+  pair -- neither of those call sites uses these two, only
+  AppendInstr1(MnPush/MnPop,...) directly, same as before this pair
+  existed) is tagged with a freshly claimed, globally unique id shared
+  by both operations. EmitGenSavePush returns the id so its own caller
+  can pass the SAME value to EmitGenSavePop once the matching POP is
+  emitted -- deliberately explicit (not an implicit "most recent
+  push" stack this unit tracks internally) since some call sites push
+  more than one register before popping any of them back, and getting
+  that pairing wrong would silently mislabel two UNRELATED PUSH/POP
+  operations as a matched pair, a real correctness risk for whatever
+  Stage C rule later trusts this id. }
+function EmitGenSavePush(const opnd: string): word;
+  var oc: POpChunk; oi: integer;
+begin
+  AppendInstr1Ref(MnPush, opnd, oc, oi);
+  Inc(nextGenSaveId);
+  oc^.ops[oi].genSaveId := nextGenSaveId;
+  EmitGenSavePush := nextGenSaveId
+end;
+
+procedure EmitGenSavePop(const opnd: string; id: word);
+  var oc: POpChunk; oi: integer;
+begin
+  AppendInstr1Ref(MnPop, opnd, oc, oi);
+  oc^.ops[oi].genSaveId := id
 end;
 
 { AppendAsmLine: direct replacement for Spho.pas's own Emit/Emit2 (and
@@ -672,23 +884,56 @@ end;
   RecTypes and GlobVar rather than living in either. }
 
 { ParseArrayBound: 'N' in 'NAME: T[N]' -- a numeric literal, or a CONST
-  identifier. }
+  identifier. PLAN.TXT S1.4: N <= 0 (negative or zero) is rejected here
+  -- the one place every declared bound passes through, whether it's a
+  RECORD field's own '[N]' (RecTypes.ParseRecordType), an array VAR's
+  own 'T[N]' (GlobVar.ParseVarSection), or the same syntax's address-
+  only sugar on a formal PARAMETER -- so fixing it here covers all
+  three without duplicating the check at each call site. Before this,
+  'VAR buf: WORD[N];' with a negative CONST N silently emitted a NASM
+  'resw <negative>' -- caught only much later, and only as a confusing
+  TASM.EXE assembly error, not a clean translator diagnostic naming
+  the real problem. A zero bound is rejected too: 'T[0]' has no
+  legitimate real use ('T[]', a DIFFERENT, already-existing empty-
+  bound syntax, is how an array whose OWN size comes from a BASE64()/
+  FILE()/"..." initializer is actually spelled, DOCS/SPHINX.MD S3.4).
+  vL (a genuine longint, not the final integer function result) holds
+  the raw parsed value BEFORE it's narrowed to this function's own
+  16-bit integer return type -- PLAN.TXT's own "perform size
+  calculations without silently wrapping at 16 bits": Scan.CurTokVal
+  and SymTab.SymVal are already both longint, so the truncation this
+  function used to do by simply writing "integer(...)" straight into
+  its own result happened silently, one full step before this
+  function's own >0 check could ever see the real value -- 'WORD[40000]'
+  used to silently become integer(40000) = -25536 (40000 mod 65536,
+  reinterpreted signed) BEFORE the old check ran, so it was rejected
+  as "-25536" (confusing, and technically the wrong reason) rather
+  than the real problem: 40000 itself is simply too large a bound for
+  this translator's own 16-bit element-count representation, whatever
+  T's own size is. }
 function ParseArrayBound: integer;
-  var si: integer; nm, msg: string;
+  var si: integer; vL: longint; nm, msg: string;
 begin
   if Scan.CurTokKind = TNum then begin
-    si := integer(Scan.CurTokVal); SymTab.Next; ParseArrayBound := si; exit
+    vL := Scan.CurTokVal; SymTab.Next
   end else if Scan.CurTokKind = TIdent then begin
     Scan.CurTokText(nm); SymTab.Next;
     si := SymTab.FindSym(nm);
-    if (si >= 0) and (SymTab.SymKind(si) = SymConst) then begin
-      ParseArrayBound := integer(SymTab.SymVal(si)); exit
-    end;
-    msg := 'array bound is not a numeric literal or CONST: ' + nm;
-    Scan.ReportError(msg); ParseArrayBound := 1
+    if (si >= 0) and (SymTab.SymKind(si) = SymConst) then
+      vL := SymTab.SymVal(si)
+    else begin
+      msg := 'array bound is not a numeric literal or CONST: ' + nm;
+      Scan.ReportError(msg); ParseArrayBound := 1; exit
+    end
   end else begin
-    Scan.ReportError('expected array bound'); ParseArrayBound := 1
-  end
+    Scan.ReportError('expected array bound'); ParseArrayBound := 1; exit
+  end;
+  if (vL <= 0) or (vL > 32767) then begin
+    msg := 'array bound must be a positive count, no larger than 32767, got '
+      + IntStr(vL);
+    Scan.ReportError(msg); vL := 1
+  end;
+  ParseArrayBound := integer(vL)
 end;
 
 { ---------------- expression translation ---------------- }
@@ -776,6 +1021,8 @@ procedure EmitIndexedOperand(si: integer; const nm: string; var dst: string; var
   var elemTy: integer; elemSz: integer; typ: SymTab.TTypeInfo;
       base, idxNm, idxOpnd, msg: string; idxSi: integer;
       isConstIdx: boolean; constOff: integer; shiftAmt: integer;
+      idxPeekNm: string; idxIsByte: boolean; bxIsSS: boolean; bxBase: string;
+      rawIdx: integer; arrLen: longint;
 begin
   elemTy := SymTab.SymTy(si);
   if elemTy = TyRec then begin
@@ -795,21 +1042,54 @@ begin
     array bound -- checked here (not via ParseArrayBound itself) since
     the non-constant case below needs the general OperandText path
     instead, not ParseArrayBound's own narrower one. }
-  isConstIdx := false; constOff := 0;
+  isConstIdx := false; constOff := 0; rawIdx := 0;
   if Scan.CurTokKind = TNum then begin
-    isConstIdx := true; constOff := integer(Scan.CurTokVal) * elemSz; SymTab.Next
+    isConstIdx := true; rawIdx := integer(Scan.CurTokVal); SymTab.Next
   end else if Scan.CurTokKind = TIdent then begin
     Scan.CurTokText(idxNm);
     idxSi := SymTab.FindSym(idxNm);
     if (idxSi >= 0) and (SymTab.SymKind(idxSi) = SymConst) and not SymTab.IsRegName(idxNm) then begin
-      isConstIdx := true; constOff := integer(SymTab.SymVal(idxSi)) * elemSz; SymTab.Next
+      isConstIdx := true; rawIdx := integer(SymTab.SymVal(idxSi)); SymTab.Next
     end
   end;
+  if isConstIdx then begin
+    { PLAN.TXT S1.4: reject a constant index that's provably out of
+      range at translate time -- negative outright, or (when the
+      array's own element count is actually knowable) >= that count.
+      An array-typed formal PARAMETER is skipped entirely, not silently
+      "checked and found fine": its own declared bound never proves the
+      caller's real allocation size (PLAN.TXT S1.3's own scope note,
+      TryBuiltinOperand's matching SIZE()/LEN() rejection for the exact
+      same reason), so there's no reliable bound here to check against
+      at all. }
+    if rawIdx < 0 then begin
+      msg := 'array index is negative: ' + nm + '[' + IntStr(longint(rawIdx)) + ']';
+      Scan.ReportError(msg); rawIdx := 0
+    end else if not SymTab.SymIsParam(si) then begin
+      arrLen := SymTab.SymVal(si);
+      if SymTab.SymIsLitInit(si) and (elemSz > 0) then arrLen := arrLen div elemSz;
+      if (arrLen > 0) and (rawIdx >= arrLen) then begin
+        msg := 'array index ' + IntStr(longint(rawIdx)) + ' is out of range for ' + nm
+          + ' (length ' + IntStr(longint(arrLen)) + ')';
+        Scan.ReportError(msg); rawIdx := 0
+      end
+    end;
+    constOff := rawIdx * elemSz
+  end;
 
+  bxIsSS := false;
   if SymTab.SymIsParam(si) then begin
     { Param: its own stack slot holds the array's base ADDRESS as a
       value -- load it into BX (needed even for a constant index, since
-      a parameter's own value is never known at translate time). }
+      a parameter's own value is never known at translate time). An
+      array formal passes an offset only, with no hidden segment (this
+      file's own DOCS/SPHINX.MD S6.6/S10) -- bxIsSS stays FALSE here
+      deliberately: the callee genuinely has no way to know whether the
+      caller's own array lived in SS or DS, PLAN.TXT S1.8's own "a
+      separate issue" scope note (passing a local array to an offset-
+      only formal still requires DS=SS at the call site, unfixed by
+      this same PLAN.TXT item -- see this procedure's own SS-override
+      comment below for the part that IS in scope). }
     SymOperandText(si, nm, base);
     AppendInstr2(MnMov, 'bx', base)
   end else if isConstIdx then begin
@@ -839,9 +1119,28 @@ begin
       returned 18 instead of the correct 60). A global array's own
       base (the `if not SymIsLocal` case, unaffected by this fix) was
       never at risk -- EmitAdrOperand returns a bare label for it, no
-      register write at all. }
+      register write at all.
+
+      bxIsSS := TRUE (PLAN.TXT S1.8, "correctness priority"): a local
+      array lives in SS, but 'lea bx, [bp-N]' only computes the OFFSET
+      -- BX itself carries no segment information, and a bare '[bx]'
+      memory operand implicitly means DS:BX, not SS:BX (NASM's own
+      default segment for BX same as for any other non-BP base
+      register). Before this fix, runtime-indexed local-array access
+      silently read/wrote through DS instead of SS, correct only by
+      accident whenever DS happens to equal SS (this project's own
+      tiny-model .COM convention keeps them equal at program start, but
+      nothing enforces that for the rest of a running program -- see
+      DOCS/SPHINX.MD's own "Constant local indexing uses BP-relative
+      storage... require DS = SS" limitation note, now narrower: only
+      the constant-index case ever legitimately relied on that, since
+      it goes through '[bp-N]' directly, itself always SS-relative
+      regardless of DS; the non-constant case fixed here needs no such
+      assumption anymore). Fixed by emitting an explicit 'SS:' segment
+      override on the final memory operand below instead. }
     SymOperandText(si, nm, base);
-    AppendInstr2(MnLea, 'bx', base)
+    AppendInstr2(MnLea, 'bx', base);
+    bxIsSS := true
   end else begin
     { Real array VAR, non-constant index, GLOBAL array: EmitAdrOperand
       returns a bare compile-time label (no register write), safe to
@@ -849,8 +1148,9 @@ begin
     EmitAdrOperand(nm, si, base);
     AppendInstr2(MnMov, 'bx', base)
   end;
+  if bxIsSS then bxBase := '[SS:BX]' else bxBase := '[bx]';
   if isConstIdx then
-    SpliceOffset('[bx]', constOff, dst)
+    SpliceOffset(bxBase, constOff, dst)
   else begin
     { Index arithmetic scaled by the element's own byte size (a 'shl' by
       0/1/2 bits -- every scalar element size here is a power of two:
@@ -861,15 +1161,32 @@ begin
       a live value sitting in AX that this indexing computation must
       not clobber before the caller's own combining instruction reads
       it. CX has no such conflict anywhere buf[i]/arr[i] can be reached
-      from. }
+      from.
+      idxIsByte: peeked BEFORE OperandText consumes/flattens the token
+      (PeekOperandIsByte's own header comment, same pattern TryEmitNot/
+      EmitCondJump already use) -- a BYTE/BOOLEAN-typed index VAR (or a
+      bare byte register, AL/BL/...) must load via CL + a separate
+      zero-extend, never a blind 'mov cx, idxOpnd': that would read a
+      full WORD starting at a one-byte VAR's own storage, pulling
+      whatever memory happens to follow it into CH as live garbage that
+      then corrupts the scaled index (confirmed the hard way via
+      EXAMPLES/MIME/MIME.SMD's own 'EncodeTable[idx]' with idx: BYTE --
+      every lookup read CH's own garbage into the array address). }
+    Scan.CurTokText(idxPeekNm);
+    idxIsByte := (Scan.CurTokKind = TIdent) and PeekOperandIsByte(idxPeekNm);
     OperandText(idxOpnd);
-    AppendInstr2(MnMov, 'cx', idxOpnd);
+    if idxIsByte then begin
+      if EqualICase(idxOpnd, 'AX') then AppendInstr2(MnMov, 'cl', 'al')
+      else AppendInstr2(MnMov, 'cl', idxOpnd);
+      AppendInstr2(MnMov, 'ch', '0')
+    end else
+      AppendInstr2(MnMov, 'cx', idxOpnd);
     if elemSz > 1 then begin
       if elemSz = 2 then shiftAmt := 1 else shiftAmt := 2;
       AppendInstr2(MnShl, 'cx', IntStr(longint(shiftAmt)))
     end;
     AppendInstr2(MnAdd, 'bx', 'cx');
-    dst := '[bx]'
+    dst := bxBase
   end;
   SymTab.Expect(SymTab.SyRBrack)
 end;
@@ -883,12 +1200,130 @@ end;
   latter (reading/writing it as if it were one scalar would silently
   read/write the wrong size), so the array-field check below is skipped
   when forAddress is TRUE. }
-procedure ParseMemOperand(var dst: string; var sizeHint: string; forAddress: boolean);
-  var seg, base: string; fieldName, recTyName, msg: string;
-      ti: integer; ftyp: SymTab.TTypeInfo; fcnt: word; haveSeg: boolean;
+{ IsEffAddrBaseReg: TRUE iff regUp (already upper-cased) is a legal
+  8086 base register for an effective address -- BX/BP/SI/DI only
+  (PLAN.TXT S2.1's own "Accept 8086 address forms only" list). Used to
+  both recognize the new base+index+disp grammar (TryParseEffAddr,
+  below) and its own AX-based-address rejection ("Reject AX-based
+  addresses... and other unsupported forms"). }
+function IsEffAddrBaseReg(const regUp: string): boolean;
+begin
+  IsEffAddrBaseReg := EqualICase(regUp, 'BX') or EqualICase(regUp, 'BP')
+                    or EqualICase(regUp, 'SI') or EqualICase(regUp, 'DI')
+end;
+
+{ TryParseEffAddr: attempts PLAN.TXT S2.1's own new effective-address
+  grammar -- a base register (BX/BP/SI/DI) optionally followed by '+'
+  and an index register (only BX+SI/BX+DI/BP+SI/BP+DI are legal
+  8086 base+index pairs -- BX+BP and any other combination, including
+  a repeated base, is rejected outright, "Reject... BX+BP, scaled
+  indices, and other unsupported forms"), optionally followed by a
+  constant displacement ('+'/'-' then a numeric literal -- SI+CONST
+  reads as one signed 16-bit immediate either way, matching ordinary
+  8086 encoding, not two separate additions). Returns FALSE (consuming
+  nothing) if the current token isn't a register at all, or isn't one
+  of BX/BP/SI/DI specifically -- the caller falls back to
+  ParseMemOperand's own pre-existing single-token base parse for every
+  other case (a plain VAR name, a bare numeric address, AX/CX/DX/other
+  registers -- all handled exactly as before this addition, unchanged).
+  isSS is set TRUE iff the base register is BP (PLAN.TXT S2.1's own
+  "Without an explicit segment, BP-based addresses use SS; the
+  remaining forms use DS" -- the caller applies this default only when
+  no explicit SEG: was written, same as ParseMemOperand's own existing
+  seg-default logic elsewhere). }
+{ ParseEffAddrTail: appends an optional '+index' (SI/DI only, and only
+  when legal alongside baseNm -- BX+SI/BX+DI/BP+SI/BP+DI, "Reject...
+  BX+BP, scaled indices, and other unsupported forms") and an optional
+  constant displacement onto addrText, given the base register's own
+  name baseNm (already consumed by the caller -- either the plain
+  single-register path or the TRegPair-fused 'SEG:BASE' path, both of
+  which reach here identically once their own base register is known,
+  so 'DS:BX + SI + 4' and a loosely-spelled 'BX + SI + 4' with no
+  segment are parsed by the exact same tail logic either way). }
+procedure ParseEffAddrTail(const baseNm: string; var addrText: string);
+  var idxNm, msg: string; neg: boolean; disp: longint; consumedPlus: boolean;
+begin
+  { A leading '+' could introduce an index register ('[BX+SI]') OR a
+    plain positive displacement ('[BX+4]') -- no lookahead buffer
+    exists in this scanner (Scan.CurTok* only ever exposes the token
+    already consumed), so '+' is consumed first (IsLexSym, self-
+    advancing) and the token that becomes current right after decides
+    which of the two this actually is: a register -> index, anything
+    else (expected: a numeric literal) -> falls through to the
+    displacement check below unchanged, exactly as if this '+' had
+    been the displacement's own sign token all along. }
+  consumedPlus := false;
+  if SymTab.IsLexSym(SymTab.SyPlus) then begin
+    consumedPlus := true;
+    if (Scan.CurTokKind = TIdent) and SymTab.CurTokIsReg then begin
+      Scan.CurTokText(idxNm);
+      if not (EqualICase(idxNm, 'SI') or EqualICase(idxNm, 'DI')) then begin
+        msg := 'unsupported effective-address index register: ' + idxNm;
+        Scan.ReportError(msg); SymTab.Next
+      end else if EqualICase(baseNm, 'SI') or EqualICase(baseNm, 'DI') then begin
+        msg := 'unsupported effective-address base+index combination: ' + baseNm + '+' + idxNm;
+        Scan.ReportError(msg); SymTab.Next
+      end else begin
+        addrText := addrText + '+' + UpStr(idxNm); SymTab.Next
+      end;
+      consumedPlus := false   { the index register (or the malformed
+                                  token reported above) is now fully
+                                  consumed -- any further '+'/'-'
+                                  belongs to a genuinely NEW
+                                  displacement clause, parsed by the
+                                  ordinary check below, not treated as
+                                  still "pending" from this one. }
+    end
+  end;
+  disp := 0; neg := false;
+  if consumedPlus or SymTab.IsSym(SymTab.SyPlus) or SymTab.IsSym(SymTab.SyMinus) then begin
+    if not consumedPlus then begin
+      neg := SymTab.IsSym(SymTab.SyMinus);
+      SymTab.Next
+    end;
+    if Scan.CurTokKind = TNum then begin
+      disp := Scan.CurTokVal; SymTab.Next
+    end else
+      Scan.ReportError('expected a constant displacement in effective address');
+    if neg then addrText := addrText + '-' + IntStr(disp)
+    else addrText := addrText + '+' + IntStr(disp)
+  end
+end;
+
+{ TryParseEffAddr: entry point for a LOOSELY-spelled (no TRegPair fast
+  path involved) effective address, e.g. a bare 'BX+SI+4' with no
+  segment override written at all. Returns FALSE (consuming nothing)
+  when the current token isn't one of BX/BP/SI/DI -- the caller falls
+  back to ParseMemOperand's own pre-existing single-token base parse
+  for every other case (a plain VAR name, a bare numeric address, AX/
+  CX/DX/other registers -- all unchanged by this addition). The
+  TRegPair-fused 'SEG:BASE' case (e.g. '[DS:BX + SI + 4]') never
+  reaches this function at all -- ParseMemOperand's own TRegPair
+  branch already consumed 'DS:BX' as one token by the time '+SI+4'
+  is seen, so it calls ParseEffAddrTail directly instead, see that
+  branch's own comment. }
+function TryParseEffAddr(var addrText: string; var isSS: boolean; var baseOut: string): boolean;
+  var baseNm: string;
+begin
+  TryParseEffAddr := false;
+  if (Scan.CurTokKind <> TIdent) or not SymTab.CurTokIsReg then exit;
+  Scan.CurTokText(baseNm);
+  if not IsEffAddrBaseReg(baseNm) then exit;
+  TryParseEffAddr := true;
+  SymTab.Next;
+  baseOut := baseNm;
+  isSS := EqualICase(baseNm, 'BP');
+  addrText := UpStr(baseNm);
+  ParseEffAddrTail(baseNm, addrText)
+end;
+
+procedure ParseMemOperand(var dst: string; var sizeHint: string; forAddress: boolean;
+                           var isTypedWidth: boolean);
+  var seg, base, baseNm: string; fieldName, recTyName, msg: string;
+      ti: integer; ftyp: SymTab.TTypeInfo; fcnt: word; haveSeg, isSS: boolean;
 begin
   sizeHint := '';
-  seg := ''; haveSeg := false;
+  seg := ''; haveSeg := false; isSS := false;
   if Scan.CurTokKind = TRegPair then begin
     { '[SEG:BASE]' with a tightly-spelled pair, e.g. '[DS:BX]' -- the
       scanner's own TRegPair fast path (see Scan.RawNext's comment)
@@ -900,21 +1335,88 @@ begin
       SymTab.IsLexSym(SyColon) below would never see it -- this was a
       real regression before this branch existed: '[DS:BX].Rec.field'
       silently lost its own segment override, TESTS/RECORDS.SMD's own
-      "[DS:BX].Point.x := AX" case). }
+      "[DS:BX].Point.x := AX" case). PLAN.TXT S2.1's own '+index+disp'
+      tail (e.g. '[DS:BX + SI + 4]') DOES reach here too, unlike this
+      comment's own earlier draft assumed -- the scanner's TRegPair
+      fast path only ever fuses the FIRST two tokens ('DS:BX'), fully
+      independent of whatever follows, so '+SI+4' is still sitting
+      unconsumed right after SymTab.Next below; ParseEffAddrTail
+      parses it the exact same way the loosely-spelled 'BX+SI+4' case
+      (no segment override, TryParseEffAddr below) already does --
+      found the hard way, confirmed by TESTS/EFFADDR.SMD's own
+      '[DS:BX + SI + 4].WORD' case failing to parse at all before this
+      fix, cascading into several follow-on "unexpected" errors. }
     haveSeg := true;
     Scan.CurTokRegPair(seg, base);
-    SymTab.Next
+    SymTab.Next;
+    baseNm := base;
+    ParseEffAddrTail(baseNm, base)
+  end else if TryParseEffAddr(base, isSS, baseNm) then begin
+    { PLAN.TXT S2.1: 'BX+SI+4' etc -- TryParseEffAddr already validated
+      and consumed the whole base+index+disp grammar; only a leading
+      'SEG:' can still precede it (it was already ruled out above by
+      TRegPair's own fast path catching the tightly-spelled case, so
+      only a loosely-spelled 'DS : BX+SI' -- with real whitespace
+      around ':' -- could reach here, and SPHINX's own scanner never
+      produces that shape in practice; this branch exists for
+      completeness, not a real gap). No explicit SEG here means isSS
+      decides the default (BP-based -> SS, everything else -> DS),
+      applied by the .BYTE/.WORD handling below -- ParseMemOperand's
+      own EXISTING single-token base path (the two branches above/
+      below this one) never had a register-conditional default at all
+      (always DS unless literally written), so this default is new,
+      scoped to ONLY the new grammar, per this session's own design
+      decision (arithmetic addressing is reserved for .BYTE/.WORD). }
   end else begin
     Scan.CurTokText(base); SymTab.Next;
     if SymTab.IsLexSym(SymTab.SyColon) then begin
       haveSeg := true; seg := base; Scan.CurTokText(base); SymTab.Next
-    end
+    end;
+    baseNm := base
   end;
   SymTab.Expect(SymTab.SyRBrack);
   dst := '[';
   if haveSeg then dst := dst + seg + ':' + base
+  else if isSS then dst := dst + 'SS:' + base
   else dst := dst + base;
+  isTypedWidth := false;
   if SymTab.IsLexSym(SymTab.SyDot) then begin
+    { '.' already consumed (IsLexSym) -- what follows decides which of
+      two grammar forms this is: PLAN.TXT S2.1's own '.BYTE'/'.WORD'
+      explicit width selector (KwByte/KwWord are reserved keywords,
+      never a real RECORD type's own name, so there is no ambiguity),
+      or the pre-existing '.RecordType.field' structured-access form
+      (any other identifier). }
+    if SymTab.IsKw(SymTab.KwByte) or SymTab.IsKw(SymTab.KwWord) then begin
+      if SymTab.IsKw(SymTab.KwByte) then sizeHint := 'byte' else sizeHint := 'word';
+      SymTab.Next;
+      isTypedWidth := true;
+      { PLAN.TXT S2.1's own base-register restriction ("Accept 8086
+        address forms only"... BX/BP/SI/DI, "Reject AX-based
+        addresses... and other unsupported forms") only applies to
+        THIS typed-width path, never to the pre-existing '.RecordType.
+        field'/bare-memory forms (which have always accepted any
+        register as base, unchanged, a pre-existing simplification out
+        of PLAN.TXT's own scope) -- checked here, retroactively against
+        the already-parsed baseNm, rather than earlier at parse time,
+        since whether '.BYTE'/'.WORD' even follows isn't knowable until
+        this exact point (TryParseEffAddr's own callers already reject
+        an illegal base up front, but the OTHER two branches above --
+        TRegPair's fused 'SEG:BASE', and the plain single-token
+        fallback -- never restricted their own base register at all,
+        so '[DS:AX].BYTE' silently reached here with no rejection
+        before this check existed, confirmed the hard way via
+        TESTS/EFFADDR.SMD's own negative case). A base that's already
+        a full effective address (base+index, from TryParseEffAddr) is
+        never re-checked here -- IsEffAddrBaseReg was already the
+        gating condition for reaching that branch at all, so baseNm
+        there is always already legal. }
+      if not IsEffAddrBaseReg(baseNm) then begin
+        msg := 'unsupported effective-address base register for .BYTE/.WORD: ' + baseNm;
+        Scan.ReportError(msg)
+      end;
+      dst := dst + ']'; exit
+    end;
     Scan.CurTokText(fieldName); SymTab.Next;   { RecordType name }
     ti := SymTab.FindType(fieldName);
     SymTab.Expect(SymTab.SyDot);
@@ -936,11 +1438,31 @@ begin
   dst := dst + ']'
 end;
 
-{ IsBuiltinName: TRUE for a value built-in (ADR/SEG/SIZE/ODD) name. }
+{ IsBuiltinName: TRUE for a value built-in (ADR/SEG/SIZE/LEN/ODD) name.
+  LEN is checked differently from the other four (EqualICase alone,
+  unconditionally winning over any same-named declared identifier,
+  matching this function's own pre-existing behavior for ADR/SEG/SIZE/
+  ODD, left unchanged here): LEN is new (PLAN.TXT S1.3) and collides
+  with a real, already-widely-used parameter name in this project's
+  own LIB/FILES.SMD (ClampToEnd/BlockRead/BlockWrite's own 'len: WORD'
+  formal, used throughout their own bodies as a plain identifier, e.g.
+  "IF remLo > len THEN") -- confirmed the hard way: TESTS/run_tests.py
+  regressed CLAMPEOF/LZPBIG (both exercise FILES.SMD) the moment LEN
+  was added here unconditionally, since EmitAssignRhs's own IsBuiltinName
+  check runs BEFORE checking whether the identifier is separately
+  declared. Rather than risk the same fix for ADR/SEG/SIZE/ODD (no
+  known collision for any of those in this codebase, and changing
+  their 34-years-established priority is a bigger, unrelated risk),
+  LEN alone defers to an already-declared symbol of the same name --
+  SymTab.FindSym(nm) < 0 means nm names nothing else, so it's safe to
+  treat as the LEN() builtin; if the program already has its own VAR/
+  param/CONST/PROC called len (any case), that declaration wins,
+  exactly matching pre-LEN behavior for that program. }
 function IsBuiltinName(const nm: string): boolean;
 begin
   IsBuiltinName := EqualICase(nm, 'ADR') or EqualICase(nm, 'SEG')
                 or EqualICase(nm, 'SIZE') or EqualICase(nm, 'ODD')
+                or (EqualICase(nm, 'LEN') and (SymTab.FindSym(nm) < 0))
 end;
 
 { IsGlobalVarName: TRUE if arg names a declared, non-local, non-register
@@ -971,10 +1493,18 @@ begin
 end;
 
 function TryBuiltinOperand(var dst: string): boolean;
-  var nm, arg, msg, mem, discardSize: string; ti, si: integer;
-      typ: SymTab.TTypeInfo; wasValid: boolean;
+  var nm, arg, msg, mem, discardSize, nmPeek: string; ti, si, elemSzLen: integer;
+      typ: SymTab.TTypeInfo; wasValid: boolean; discardTW: boolean;
 begin
   TryBuiltinOperand := true;
+  { nmPeek: the CURRENT token's own raw text, fetched once here before
+    the whole ADR/SEG/SIZE/LEN/ODD dispatch chain below -- only LEN's
+    own branch actually needs it (see that branch's own comment on
+    why), but fetching it unconditionally, before Scan.CurTokKind is
+    even checked, avoids re-deriving it differently inside that one
+    branch depending on control flow. Scan.CurTokText itself is a
+    cheap read of the already-scanned current token, never a re-scan. }
+  Scan.CurTokText(nmPeek);
   if Scan.TokTextEqICase('ADR') then begin
     SymTab.Next; SymTab.Expect(SymTab.SyLParen);
     if Scan.CurTokKind = TIdent then begin
@@ -982,10 +1512,19 @@ begin
       si := SymTab.FindSym(arg);
       if (si >= 0) and not SymTab.IsRegName(arg) then
         EmitAdrOperand(arg, si, dst)
-      else if (not SymTab.IsRegName(arg)) and (SymTab.ProcFindAny(arg, wasValid) >= 0) then
+      else if (not SymTab.IsRegName(arg)) and (SymTab.ProcFindAny(arg, wasValid) >= 0) then begin
         { ADR(ProcName): a PROCEDURE's own bare label name already IS its
-          offset as a NASM immediate. }
+          offset as a NASM immediate. OPT.TXT's own R6 finding: this
+          procedure's own address is now escaping this call site's own
+          visibility (installed as an interrupt vector, stored for a
+          later indirect call, or handed to raw ASM) -- mark it so
+          PHOpt.PAS's own deferred call-graph analysis conservatively
+          treats this row's own output demand as fully unknown, never
+          narrowed from only the direct, by-name call sites it can
+          actually see. }
+        SymTab.ProcSetAddressTaken(SymTab.ProcFindAny(arg, wasValid));
         dst := arg
+      end
       else begin
         msg := 'ADR() requires a declared VAR, param, or PROCEDURE name: ' + arg;
         Scan.ReportError(msg); dst := '0'
@@ -998,7 +1537,7 @@ begin
         an array field here the way it would as an ordinary value
         operand. A scalar field works here too (its address, same as
         ADR() of a plain scalar VAR), just less commonly useful. }
-      SymTab.Next; ParseMemOperand(mem, discardSize, true);
+      SymTab.Next; ParseMemOperand(mem, discardSize, true, discardTW);
       AppendInstr2(MnLea, 'ax', mem);
       dst := 'ax'
     end else begin
@@ -1019,26 +1558,115 @@ begin
     end;
     SymTab.Expect(SymTab.SyRParen); exit
   end else if Scan.TokTextEqICase('SIZE') then begin
+    { SIZE(type) keeps its original meaning (a scalar keyword or a
+      declared RECORD TYPE name -- ti >= 0 wins first, unconditionally,
+      exactly as before this PLAN.TXT S1.3 rework). SIZE(variable) is
+      the new case: the complete storage size in bytes of ANY declared
+      VAR (scalar, RECORD instance, plain 'T[N]' array, or a BASE64()/
+      FILE()/"..." literal-initialized array), resolved via SymIsArr/
+      SymIsLitInit rather than the old single "SymVal(si) > 0" test
+      (which could no longer tell a literal-init's own BYTE COUNT
+      apart from a plain array's own newly-added ELEMENT COUNT, both
+      sharing the same SymVal field -- see GlobVar's own header comment
+      on why reusing it is safe, and SymIsLitInit's own TSymChunk
+      comment on why this flag exists at all). Array PARAMETERS are
+      deliberately rejected (PLAN.TXT's own S1.3 scope note: "reject
+      SIZE on array parameters to avoid confusing pointed-to data size
+      with the two-byte address slot") -- a formal parameter's own
+      stack slot never holds the array itself, only a 2-byte address
+      into it, so SIZE() there would silently answer the wrong
+      question no matter which of those two numbers it picked. }
     SymTab.Next; SymTab.Expect(SymTab.SyLParen);
     if Scan.CurTokKind = TIdent then begin
       Scan.CurTokText(nm); SymTab.Next;
       ti := SymTab.FindType(nm);
       si := SymTab.FindSym(nm);
       if ti >= 0 then begin typ.ty := TyRec; typ.recIdx := ti; dst := IntStr(longint(RecTypes.TySize(typ))) end
-      else if (si >= 0) and (SymTab.SymKind(si) = SymVar) and (SymTab.SymVal(si) > 0) then
-        { a VAR declared via a BASE64()/FILE() array literal (the only
-          path that ever calls SymSetVal on a SymVar row, DOCS/SPHO.MD's
-          own "array literal" entry) -- SIZE(v) here is the decoded byte
-          count, not TySize(v's element type). An ordinary scalar VAR or
-          a plain T[N] array (no recorded length at all, SymVal still 0)
-          falls through to the type-name path below exactly as before. }
+      else if (si >= 0) and (SymTab.SymKind(si) = SymVar) and SymTab.SymIsArr(si) and SymTab.SymIsParam(si) then begin
+        msg := 'SIZE() of an array parameter is not supported (holds a 2-byte address, not the array): ' + nm;
+        Scan.ReportError(msg); dst := '0'
+      end else if (si >= 0) and (SymTab.SymKind(si) = SymVar) and SymTab.SymIsLitInit(si) then
+        { BASE64()/FILE()/"..." literal-initialized array: SymVal is
+          already the real decoded byte count, no further scaling. }
         dst := IntStr(SymTab.SymVal(si))
-      else begin
+      else if (si >= 0) and (SymTab.SymKind(si) = SymVar) and SymTab.SymIsArr(si) then begin
+        { plain 'T[N]' array VAR (not literal-init, not a parameter):
+          SymVal now holds N, the declared element count -- total size
+          is TySize(elementType) * N. }
+        typ.ty := SymTab.SymTy(si); typ.recIdx := SymTab.SymRecIdx(si);
+        dst := IntStr(longint(RecTypes.TySize(typ)) * SymTab.SymVal(si))
+      end else if (si >= 0) and (SymTab.SymKind(si) = SymVar) then begin
+        { an ordinary scalar VAR or a single RECORD instance -- total
+          size is just TySize of its own declared type. }
+        typ.ty := SymTab.SymTy(si); typ.recIdx := SymTab.SymRecIdx(si);
+        dst := IntStr(longint(RecTypes.TySize(typ)))
+      end else begin
+        { not a declared VAR at all -- SIZE(type), the original path,
+          unchanged: a scalar keyword (BYTE/WORD/INTEGER/LONGINT/
+          BOOLEAN, or the CHAR/POINTER synonyms). }
         RecTypes.ParseBaseTypeName(nm, typ);
         dst := IntStr(longint(RecTypes.TySize(typ)))
       end
     end else begin
-      Scan.ReportError('expected a type name in SIZE()'); SymTab.Next; dst := '0'
+      Scan.ReportError('expected a type or variable name in SIZE()'); SymTab.Next; dst := '0'
+    end;
+    SymTab.Expect(SymTab.SyRParen); exit
+  end else if Scan.TokTextEqICase('LEN') and (SymTab.FindSym(nmPeek) < 0) then begin
+    { LEN(array) (PLAN.TXT S1.3, new): the element count of a declared
+      array VAR, known at compile time. Guarded by SymTab.FindSym(nmPeek)
+      < 0 (nmPeek is the CURRENT token's own real spelling, e.g. 'len'
+      lowercase, fetched into a var ABOVE this whole if/else-if chain
+      specifically for this check -- FindSym('LEN') the literal
+      uppercase string would never match a lowercase declared 'len' at
+      all, silently defeating this exact guard) -- an already-declared
+      identifier of this exact spelling wins
+      instead, same reasoning as IsBuiltinName's own matching guard,
+      see that function's own comment) -- LIB/FILES.SMD has a real
+      parameter literally named 'len' used as a plain identifier
+      throughout ClampToEnd/BlockRead/BlockWrite's own bodies, which
+      this check reaches too (OperandText -> TryBuiltinOperand, a
+      different, more pervasive call path than IsBuiltinName's own
+      EmitAssignRhs call site -- both needed the same guard). A plain
+      'T[N]' array VAR returns N directly (SymVal, per ParseVarSection's
+      own new SymSetVal(si, cnt) -- see GlobVar's own header comment). A
+      BASE64()/FILE()/"..." literal-initialized array returns its own
+      decoded byte count DIVIDED by its element size, rejecting a
+      malformed payload whose byte count isn't evenly divisible by
+      that size (PLAN.TXT's own wording: "LEN requires that this count
+      be divisible by the element size; reject malformed typed
+      payloads" -- a byte/CHAR-element array's own element size is
+      always 1, so that specific combination can never actually
+      trigger this rejection, only a WORD/INTEGER/LONGINT-element
+      array's own literal init could). Array PARAMETERS and any non-
+      array VAR/type are rejected outright: PLAN.TXT's own S1.3 scope
+      note ("Initially reject LEN on array parameters: they carry an
+      offset, not an actual length... A written formal bound does not
+      prove the allocation size") -- there's no real element count to
+      report for either case. }
+    SymTab.Next; SymTab.Expect(SymTab.SyLParen);
+    if Scan.CurTokKind = TIdent then begin
+      Scan.CurTokText(nm); SymTab.Next;
+      si := SymTab.FindSym(nm);
+      if (si < 0) or (SymTab.SymKind(si) <> SymVar) or not SymTab.SymIsArr(si) then begin
+        msg := 'LEN() requires a declared array VAR: ' + nm;
+        Scan.ReportError(msg); dst := '0'
+      end else if SymTab.SymIsParam(si) then begin
+        msg := 'LEN() of an array parameter is not supported: ' + nm;
+        Scan.ReportError(msg); dst := '0'
+      end else if SymTab.SymIsLitInit(si) then begin
+        typ.ty := SymTab.SymTy(si); typ.recIdx := SymTab.SymRecIdx(si);
+        elemSzLen := RecTypes.TySize(typ);
+        if (elemSzLen > 0) and (SymTab.SymVal(si) mod elemSzLen = 0) then
+          dst := IntStr(SymTab.SymVal(si) div elemSzLen)
+        else begin
+          msg := 'LEN(): literal-initialized array''s own byte count is not divisible by its element size: ' + nm;
+          Scan.ReportError(msg); dst := '0'
+        end
+      end else
+        { plain 'T[N]' array VAR: SymVal is already N. }
+        dst := IntStr(SymTab.SymVal(si))
+    end else begin
+      Scan.ReportError('expected a declared array VAR name in LEN()'); SymTab.Next; dst := '0'
     end;
     SymTab.Expect(SymTab.SyRParen); exit
   end;
@@ -1049,7 +1677,7 @@ end;
   text; does not consume a following operator. A plain identifier
   immediately followed by '(' is a call (result lands in AX). }
 procedure OperandText(var dst: string);
-  var discardSize, nm, castNm, discardOpnd: string; idxSi: integer;
+  var discardSize, nm, castNm, discardOpnd: string; idxSi: integer; discardTW: boolean;
 begin
   lastOperandWasIntReg := false;
   if Scan.CurTokKind = TNum then begin
@@ -1103,7 +1731,7 @@ begin
         IdentOperandText(nm, dst)
     end
   end else if SymTab.IsSym(SymTab.SyLBrack) then begin
-    SymTab.Next; ParseMemOperand(dst, discardSize, false)
+    SymTab.Next; ParseMemOperand(dst, discardSize, false, discardTW)
   end else if SymTab.IsSym(SymTab.SyMinus) then begin
     SymTab.Next;
     if Scan.CurTokKind = TNum then begin
@@ -1416,15 +2044,28 @@ begin
     in signedness to mean anything, so this trusts firstOpndIsInt (the
     plan's own single-sided design, matching EmitCondJump/EmitRelational
     -- 'a's type decides) and does not re-derive a second, independent
-    signedness from opnd. }
-  bIsIntReg := SymTab.IsRegName(opnd) and lastOperandWasIntReg;
-  if bIsIntReg <> firstOpndIsInt then begin
-    { Mismatched casts on the two sides is almost certainly a mistake --
-      report it, but keep going with firstOpnd's own signedness so
-      translation can still surface any further errors. }
-    Scan.ReportError('mismatched WORD/INTEGER operands in */DIV/MOD (left is '
-      + 'INTEGER=' + IntStr(ord(firstOpndIsInt)) + ', right is INTEGER='
-      + IntStr(ord(bIsIntReg)) + ')')
+    signedness from opnd. Only a REGISTER opnd can carry an explicit,
+    independently-conflicting ".WORD"/".INTEGER" cast of its own -- a
+    plain literal or VAR/CONST name has no signedness annotation to
+    disagree with, so it must never trip this check regardless of
+    firstOpndIsInt (PLAN.TXT S1.2: fixing EmitExpr's own srcIsInt peek
+    made firstOpndIsInt correctly TRUE for a plain INTEGER VAR far more
+    often than before, which would otherwise have turned this
+    "SymTab.IsRegName(opnd) and lastOperandWasIntReg" check's own
+    non-register FALSE default into a constant false-positive mismatch
+    against any such VAR combined with a bare literal/CONST divisor,
+    e.g. "w DIV 4;" -- confirmed the hard way immediately after that
+    fix landed). }
+  if SymTab.IsRegName(opnd) then begin
+    bIsIntReg := lastOperandWasIntReg;
+    if bIsIntReg <> firstOpndIsInt then begin
+      { Mismatched casts on the two sides is almost certainly a mistake --
+        report it, but keep going with firstOpnd's own signedness so
+        translation can still surface any further errors. }
+      Scan.ReportError('mismatched WORD/INTEGER operands in */DIV/MOD (left is '
+        + 'INTEGER=' + IntStr(ord(firstOpndIsInt)) + ', right is INTEGER='
+        + IntStr(ord(bIsIntReg)) + ')')
+    end
   end;
   { firstOpnd -> AX first (mul/div's own implicit operand). A byte-sized
     firstOpnd (srcIsByte) must widen through AL/AH instead of a bare
@@ -1483,16 +2124,23 @@ end;
   protects EmitRelational's or EmitMulDiv's early-exit branches, matching
   how EmitExpr's own srcIsByte peek was already scoped before this fix --
   widening that scope is a separate concern, not part of this one. }
-procedure EmitExprFromEx(const firstOpnd, destReg: string; srcIsByte: boolean; callIsByte: boolean);
+procedure EmitExprFromEx(const firstOpnd, destReg: string; srcIsByte: boolean; callIsByte: boolean; callerSrcIsInt: boolean);
   var rel: string; firstOpndIsInt: boolean;
 begin
-  { firstOpnd's own WORD/INTEGER-ness: only knowable here for a bare
-    register operand, via lastOperandWasIntReg -- see EmitRelational's
-    own comment for the full reasoning/limitation. Captured BEFORE any
-    further OperandText call (inside EmitRelational/EmitMulDiv/
-    EmitExprTail below) has a chance to overwrite the flag for a
-    DIFFERENT operand. }
-  firstOpndIsInt := SymTab.IsRegName(firstOpnd) and lastOperandWasIntReg;
+  { firstOpnd's own WORD/INTEGER-ness: for a bare register operand, only
+    knowable here via lastOperandWasIntReg (a trailing ".INTEGER" cast,
+    detected by OperandText itself); for a plain VAR name, firstOpnd
+    arrives already flattened to NASM memory text ('[w]'/'[bp-2]') with
+    no INTEGER-ness of its own left in it, so the caller (EmitExpr) must
+    peek it BEFORE that flattening and pass the result through as
+    callerSrcIsInt (PLAN.TXT S1.2 -- see EmitExpr's own comment on the
+    "flag := w > x" bug this fixes). The two sources are mutually
+    exclusive (firstOpnd is either a register or a flattened VAR/other
+    operand, never both), so a plain OR combines them safely. Captured
+    BEFORE any further OperandText call (inside EmitRelational/
+    EmitMulDiv/EmitExprTail below) has a chance to overwrite
+    lastOperandWasIntReg for a DIFFERENT operand. }
+  firstOpndIsInt := (SymTab.IsRegName(firstOpnd) and lastOperandWasIntReg) or callerSrcIsInt;
   Scan.CurTokText(rel);
   if (Scan.CurTokKind = TSym) and IsRelSym(rel) then begin
     SymTab.Next;
@@ -1545,7 +2193,13 @@ end;
 
 procedure EmitExprFrom(const firstOpnd, destReg: string);
 begin
-  EmitExprFromEx(firstOpnd, destReg, false, false)
+  { callerSrcIsInt=false: every EmitExprFrom call site (unlike EmitExpr's
+    own EmitExprFromEx call) already passes firstOpnd as either a bare
+    register (its own lastOperandWasIntReg check inside EmitExprFromEx
+    still applies) or a BYTE-typed VAR (never INTEGER) -- see EmitExpr's
+    own header comment on why only ITS call site needed the new
+    parameter. }
+  EmitExprFromEx(firstOpnd, destReg, false, false, false)
 end;
 
 { TryEmitOdd: 'ODD(x)' -- a terminal boolean expression like a
@@ -1567,6 +2221,97 @@ begin
   AppendInstr2(MnMov, destReg, '0');
   EmitLabel(endLbl);
   TryEmitOdd := true
+end;
+
+{ TryEmitLoad: 'LOADB()'/'LOADW()' (PLAN.TXT S2.3) -- reads DS:SI into
+  AL/AX and advances SI by 1/2 per the current direction flag (lodsb/
+  lodsw themselves; this translator never emits CLD/STD on its own,
+  see SetDFlag, so the caller's own last SetDFlag call, if any, is
+  what decides direction here, unchanged by this function). "Initially
+  LOADB must be assigned directly to AL and LOADW to AX as shown, not
+  embedded in a larger expression" -- enforced here by requiring
+  destReg be EXACTLY 'al'/'ax' respectively; reaching this function
+  with any other destReg (e.g. chained into a larger expression, or
+  assigned to a plain WORD/BYTE VAR instead of the literal register)
+  is a translator error, not a silent narrowing/widening. }
+function TryEmitLoad(const destReg: string): boolean;
+  var msg: string; isB: boolean;
+begin
+  TryEmitLoad := false;
+  isB := SymTab.IsKw(SymTab.KwLoadB);
+  if not (isB or SymTab.IsKw(SymTab.KwLoadW)) then exit;
+  SymTab.Next; SymTab.Expect(SymTab.SyLParen); SymTab.Expect(SymTab.SyRParen);
+  if isB and not EqualICase(destReg, 'al') then begin
+    msg := 'LOADB() must be assigned directly to AL, not ''' + destReg + '''';
+    Scan.ReportError(msg)
+  end else if (not isB) and not EqualICase(destReg, 'ax') then begin
+    msg := 'LOADW() must be assigned directly to AX, not ''' + destReg + '''';
+    Scan.ReportError(msg)
+  end else if isB then AppendInstr0(MnLodsb)
+  else AppendInstr0(MnLodsw);
+  TryEmitLoad := true
+end;
+
+{ ParsePortOperand: 'INPORTB('/'INPORTW('/'OUTPORTB('/'OUTPORTW(' 's own
+  port argument -- PLAN.TXT S2.2's own "Initially allow only... DX or
+  an immediate port number in 0..255. Larger port numbers must be
+  loaded into DX first." A bare DX register is passed through as-is; a
+  numeric literal outside 0..255 is a translator error (still emitted
+  as written, same "report, then still emit the value as it was
+  written" recovery this file's own CheckTypedWidthStore already
+  established for an out-of-range .BYTE/.WORD immediate -- there is
+  nothing further to protect here once the diagnostic is reported, and
+  leaving the token/parse otherwise undisturbed avoids a cascade).
+  Anything else (a different register, a VAR, an expression) is
+  likewise a translator error -- PLAN.TXT's own "Initially allow
+  only" scope note names exactly these two forms and nothing wider. }
+function ParsePortOperand: string;
+  var nm, msg: string; v: longint;
+begin
+  ParsePortOperand := '0';
+  if (Scan.CurTokKind = TIdent) and SymTab.CurTokIsReg then begin
+    Scan.CurTokText(nm); SymTab.Next;
+    if EqualICase(nm, 'DX') then ParsePortOperand := 'dx'
+    else begin
+      msg := 'port operand must be DX or an immediate 0..255, not ''' + nm + '''';
+      Scan.ReportError(msg)
+    end
+  end else if Scan.CurTokKind = TNum then begin
+    v := Scan.CurTokVal;
+    Scan.CurTokText(nm); SymTab.Next;
+    if (v < 0) or (v > 255) then begin
+      msg := 'port number out of range (0..255): ' + IntStr(v);
+      Scan.ReportError(msg)
+    end;
+    ParsePortOperand := nm
+  end else begin
+    Scan.ReportError('port operand must be DX or an immediate 0..255');
+    SymTab.Next
+  end
+end;
+
+{ TryEmitInPort: 'INPORTB(port)'/'INPORTW(port)' -- like TryEmitLoad
+  above, a terminal expression form that must be assigned directly to
+  AL/AX respectively ("Initially allow only the exact accumulator
+  destinations/values shown"). }
+function TryEmitInPort(const destReg: string): boolean;
+  var msg, portOpnd: string; isB: boolean;
+begin
+  TryEmitInPort := false;
+  isB := SymTab.IsKw(SymTab.KwInPortB);
+  if not (isB or SymTab.IsKw(SymTab.KwInPortW)) then exit;
+  SymTab.Next; SymTab.Expect(SymTab.SyLParen);
+  portOpnd := ParsePortOperand;
+  SymTab.Expect(SymTab.SyRParen);
+  if isB and not EqualICase(destReg, 'al') then begin
+    msg := 'INPORTB() must be assigned directly to AL, not ''' + destReg + '''';
+    Scan.ReportError(msg)
+  end else if (not isB) and not EqualICase(destReg, 'ax') then begin
+    msg := 'INPORTW() must be assigned directly to AX, not ''' + destReg + '''';
+    Scan.ReportError(msg)
+  end else if isB then AppendInstr2(MnInB, 'al', portOpnd)
+  else AppendInstr2(MnInW, 'ax', portOpnd);
+  TryEmitInPort := true
 end;
 
 { PeekOperandIsByte: TRUE iff nm names a byte-sized operand -- a BYTE/
@@ -1718,9 +2463,11 @@ end;
 { EmitExpr: parse an expression (via OperandText for its first operand)
   and leave its value in destReg (a valid instruction operand, e.g. "ax"). }
 procedure EmitExpr(const destReg: string);
-  var opnd, nm: string; srcIsByte, callIsByte: boolean; si, ty: integer;
+  var opnd, nm: string; srcIsByte, callIsByte, srcIsInt: boolean; si, ty: integer;
 begin
   if TryEmitOdd(destReg) then exit;
+  if TryEmitLoad(destReg) then exit;
+  if TryEmitInPort(destReg) then exit;
   if TryEmitNot(destReg) then exit;
   if TryEmitNeg(destReg) then exit;
   { srcIsByte: only a genuine byte-sized MEMORY VAR needs this peek --
@@ -1746,17 +2493,31 @@ begin
     after the whole call, as a first attempt at this fix did here, left
     stale AH corrupting a chained "SomeBoolCall() + 1" add. }
   Scan.CurTokText(nm);
-  srcIsByte := false; callIsByte := false;
+  srcIsByte := false; callIsByte := false; srcIsInt := false;
   if (Scan.CurTokKind = TIdent) and not SymTab.IsRegName(nm) then begin
     si := SymTab.FindSym(nm);
     if (si >= 0) and (SymTab.SymKind(si) = SymVar) then begin
-      srcIsByte := (SymTab.SymTy(si) = TyByte) or (SymTab.SymTy(si) = TyBool)
+      srcIsByte := (SymTab.SymTy(si) = TyByte) or (SymTab.SymTy(si) = TyBool);
+      { srcIsInt: PLAN.TXT S1.2 -- a plain INTEGER VAR reaching a value-
+        position relational ('flag := w > x;') used to always compare
+        UNSIGNED regardless of its own declared signedness (only a bare
+        register operand's own trailing ".INTEGER" cast was ever
+        detected here), silently disagreeing with the SAME expression's
+        own condition-position form ('IF w > x THEN'), which already
+        correctly peeks the VAR's real type via EmitCondJump's own
+        aIsInt (confirmed the hard way: w,x: INTEGER; w:=-1; x:=1 --
+        "IF w>x" correctly says FALSE via a signed JLE, but "flag := w>x"
+        used to say TRUE via an unsigned JA, since -1 as UNSIGNED WORD
+        is 65535 > 1). PeekVarIsInt is this same peek-before-OperandText-
+        flattens-it pattern EmitCondJump's own aIsInt already
+        established, now finally wired up here too. }
+      srcIsInt := PeekVarIsInt(nm)
     end else if (si < 0) and SymTab.ProcFindRetTy(nm, ty) then begin
       callIsByte := (ty = TyByte) or (ty = TyBool)
     end
   end;
   OperandText(opnd);
-  EmitExprFromEx(opnd, destReg, srcIsByte, callIsByte)
+  EmitExprFromEx(opnd, destReg, srcIsByte, callIsByte, srcIsInt)
 end;
 
 { PeekVarIsInt: TRUE iff nm names an already-declared global/local INTEGER
@@ -1815,6 +2576,24 @@ begin
     end;
     AppendInstr1Ref(buf, nm, opChunk, opSlot); exit
   end;
+  { PLAN.TXT S1.5: 'ODD(x)' (a VALUE built-in, not a real procedure call)
+    reaching here as condition operand 'a' -- e.g. "IF ODD(x) THEN" --
+    used to fall through to the raw-identifier peek/OperandText path
+    below, which only knows how to flatten a VAR/register/genuine CALL
+    into memory/register text; ODD is neither (TryBuiltinOperand, the
+    ADR/SEG/SIZE/LEN memory-operand-text path OperandText already
+    delegates to, doesn't cover ODD either -- ODD needs real codegen, a
+    TEST+Jcc pair, not just substitute text), so it fell all the way
+    through to EmitCall's own "undefined procedure" error. Handled here
+    directly, BEFORE the peek: evaluate 'ODD(x)' the same way any other
+    value expression would (TryEmitOdd, into a scratch register), then
+    test that register's own bit 0 result against zero exactly like any
+    other bare BOOLEAN condition operand below -- CFLAG/ZFLAG's own
+    direct-flag-test branch above, and every other relational form,
+    are untouched. }
+  if (Scan.CurTokKind = TIdent) and Scan.TokTextEqICase('ODD') and TryEmitOdd('ax') then begin
+    a := 'ax'
+  end else begin
   { Peek a's own identifier BEFORE OperandText flattens it to memory text. }
   aIsByteVar := false; aIsInt := false;
   Scan.CurTokText(nm);
@@ -1846,7 +2625,8 @@ begin
     unless OperandText just consumed a ".INTEGER" cast right after it)
     is only knowable AFTER OperandText has run -- see
     lastOperandWasIntReg's own comment. }
-  if aIsReg then aIsInt := lastOperandWasIntReg;
+  if aIsReg then aIsInt := lastOperandWasIntReg
+  end;
   Scan.CurTokText(rel);
   bIsByteVar := false;
   if (Scan.CurTokKind = TSym) and IsRelSym(rel) then begin
@@ -2109,7 +2889,8 @@ end;
   register-named formal parameter. Then `call`/`call far Name` depending
   on the callee's own FAR-ness. }
 procedure EmitCall(const name: string);
-  var opnd, nm, regNameTmp, callTarget: string; buf: word; isFar: boolean; si, ty, pi, argIdx, nArgs, depthBytes, j: integer;
+  var opnd, nm, regNameTmp, callTarget: string; buf: word; isFar, isExternCallee: boolean;
+      si, ty, pi, argIdx, nArgs, depthBytes, j: integer;
       isByteVar, wasValid, isLongArg, isRegPairArg, isLongVar, isLongCall: boolean;
       pairSeg, pairOff, pairConsumed, hiWord: string;
       argBytes: array[0..MaxParams-1] of integer;
@@ -2119,6 +2900,36 @@ procedure EmitCall(const name: string);
 begin
   pi := SymTab.ProcFindAny(name, wasValid);
   argIdx := 0;
+  { PLAN.TXT S1.6: a call with at least one argument, reached before
+    'name' has ANY recorded signature at all (pi < 0 -- no real
+    definition, FORWARD, or EXTERNAL declaration has been parsed yet
+    for this name anywhere earlier in the module) cannot be emitted
+    correctly here, full stop -- every decision the argument-parsing
+    loop below makes (register-vs-stack placement, argBytes/LONGINT
+    width, register-pair legality) depends on the callee's own real
+    signature, which simply does not exist yet to consult. Unlike a
+    NEAR/FAR mnemonic guess (EmitCall's own trailing PendingAppend/
+    CheckPendingCalls, SOPLAN.MD Phase 5), there is no default that is
+    merely "possibly wrong until re-checked later" -- literally nothing
+    is known about argument count or placement, so guessing here can
+    only silently corrupt the call (confirmed the hard way: a 2-arg
+    call to a same-module procedure whose real 1-parameter definition
+    comes later translated with NO argument-count error at all, one
+    stack word never popped by the callee's own real "retn 2"; and a
+    call passing a plain stack argument for what turns out to be a
+    register-named parameter left the callee's own body reading
+    whatever garbage already sat in that register, the pushed word
+    never consumed by anything). A same-module forward call with NO
+    arguments at all (EmitCallNoArgs, a separate procedure, never
+    routes through here) is unaffected -- that path never had this
+    problem, since a 0-argument call has no placement decision to get
+    wrong, which is exactly why Phase 5 could safely drop FORWARD for
+    it in the first place. }
+  if (pi < 0) and not SymTab.IsSym(SymTab.SyRParen) then begin
+    Scan.ReportError('call to ''' + name + ''' with arguments requires a prior'
+      + ' declaration or FORWARD declaration in this module');
+    exit
+  end;
   { A register-pair argument (e.g. 'DX:AX') passed for a LONGINT
     parameter, when it isn't argument 0, pushes whatever DX:AX (or
     whichever pair) LIVE hold at its own position in the left-to-right
@@ -2268,15 +3079,30 @@ begin
   end;
   if not SymTab.ProcFindIsFar(name, isFar) then isFar := true;
   if isFar then buf := MnCallFar else buf := MnCall;
-  if not SymTab.ProcFindExternal(name, callTarget) then callTarget := name;
+  isExternCallee := SymTab.ProcFindExternal(name, callTarget);
+  if not isExternCallee then callTarget := name;
   AppendInstr1Ref(buf, callTarget, opRef, slotRef);
+  { OPT.TXT's own R6 finding: stamp this call site with the resolved
+    callee's own SymTab row (Types.TOperation's own callProcId field),
+    but ONLY for a proven same-module, direct, by-name call with a REAL
+    body in this module (pi>=0 and not external) -- PHOpt.PAS's own
+    deferred call-graph analysis (built after CheckPendingCalls, once
+    every pending call site is fully resolved) needs this to attribute
+    a call site's own "what does the code right after this CALL read"
+    proof back to the correct callee row; an EXTERNAL procedure's own
+    pi is real (one row per name, same as any other), but its body
+    lives outside this translation unit entirely, so it must stay
+    unattributed (0, the default) rather than silently misidentifying
+    opaque external code as something this analysis could reason about. }
+  if (pi >= 0) and not isExternCallee then
+    opRef^.ops[slotRef].callProcId := pi;
   if not SymTab.ProcFindIsFar(name, isFar) then
     PendingAppend(StrTab.Put(name), Scan.CurLine, opRef, slotRef)
 end;
 
 { EmitCallNoArgs: 'Name' already consumed, no '(' at all. }
 procedure EmitCallNoArgs(const name: string);
-  var callTarget: string; buf: word; isFar, wasValid: boolean; pi: integer;
+  var callTarget: string; buf: word; isFar, wasValid, isExternCallee: boolean; pi: integer;
       opRef: POpChunk; slotRef: integer;
 begin
   pi := SymTab.ProcFindAny(name, wasValid);
@@ -2285,8 +3111,13 @@ begin
   end;
   if not SymTab.ProcFindIsFar(name, isFar) then isFar := true;
   if isFar then buf := MnCallFar else buf := MnCall;
-  if not SymTab.ProcFindExternal(name, callTarget) then callTarget := name;
+  isExternCallee := SymTab.ProcFindExternal(name, callTarget);
+  if not isExternCallee then callTarget := name;
   AppendInstr1Ref(buf, callTarget, opRef, slotRef);
+  { OPT.TXT's own R6 finding -- see EmitCall's own identical comment
+    above for why. }
+  if (pi >= 0) and not isExternCallee then
+    opRef^.ops[slotRef].callProcId := pi;
   if not SymTab.ProcFindIsFar(name, isFar) then
     PendingAppend(StrTab.Put(name), Scan.CurLine, opRef, slotRef)
 end;
@@ -2500,6 +3331,37 @@ begin
           register -- this clobbered the very next stack slot). Fall
           through to the general EmitExprFrom/MoveAxToDest path instead,
           which already correctly narrows via AL when destSize='byte'. }
+      end else if destIsMem and EqualICase(destSize, 'word') and Regs86.IsByteReg(regId) then begin
+        { 'wordVar := AL;' (a byte-register source into a KNOWN WORD/
+          INTEGER-typed destination -- destSize='word' specifically,
+          NOT '' -- see below) -- the mirror-image bug of the one just
+          above: sfx computed above ('byte ', from the SOURCE
+          register's own size) would silently ignore the destination's
+          own declared WORD size and store only one byte, leaving the
+          destination's own HIGH byte whatever value already happened
+          to be sitting there (found via EXAMPLES/LZSS/LZP.SMD's own
+          long-standing "cmdTailLen := AL;" idiom, cmdTailLen a WORD/
+          INTEGER global -- silently correct only because a fresh
+          .bss global happens to start zeroed; EXAMPLES/MIME/MIME.SMD's
+          own byte-for-byte copy of the same CLI-parsing idiom is what
+          surfaced this while auditing real generated output). Fall
+          through to the general EmitExprFrom/MoveAxToDest path
+          instead, which already correctly WIDENS via
+          EmitWidenByteToWord when the source is a byte register and
+          destReg is not (EmitExprFromEx's own header comment).
+          destSize='' (unknown -- e.g. a raw '[DS:DI] := AL;' memory
+          write with no declared VAR type at all, LIB/FILES.SMD's own
+          BlockRead/BlockWrite byte-copy loops) must NOT take this
+          branch: an untyped destination has no "own declared WORD
+          size" to violate, so the SOURCE register's own size (byte,
+          here) is exactly the right one to trust, same as it always
+          was -- an earlier, broader version of this guard
+          (destSize<>'byte' rather than destSize='word') wrongly
+          widened these too, turning a correct single-byte buffer copy
+          into a 2-byte write that corrupted the following byte
+          (confirmed the hard way via TESTS/CLAMPEOF.SMD, which
+          regressed from its own expected 40000 to 0 until this
+          narrower condition replaced it). }
       end else begin
         RestoreBase; AppendInstr2(MnMov, sfx + destReg, nm);
         exit
@@ -2590,16 +3452,144 @@ begin
   EmitLongVarFromCallIfMatch := true
 end;
 
+{ CheckTypedWidthStore: PLAN.TXT S2.1's own strict store rules for a
+  '.BYTE'/'.WORD'-typed memory destination -- STRICTER than the
+  general EmitAssignRhs/MoveAxToDest machinery every OTHER memory
+  destination here uses (that machinery silently narrows/widens a
+  mismatched-width register source, a deliberate, already-established
+  behavior for '.RecordType.field'/bare memory -- see EmitAssignRhs's
+  own header comments on why). Peeks the CURRENT (not yet consumed)
+  RHS token the same "peek before OperandText/EmitAssignRhs flattens
+  it" pattern this file already uses throughout (PeekVarIsInt,
+  EmitCondJump's own aIsByteVar, etc): a bare register source must
+  match destSize's own width exactly ("initially require a matching-
+  width register for register-to-memory stores"); a bare numeric
+  literal must fit the destination's own width ("Diagnose out-of-range
+  immediate stores rather than silently narrowing them" -- BYTE: 0..255,
+  WORD: 0..65535). Anything else (a VAR name, a call, a chained
+  expression) is unrestricted -- PLAN.TXT never asked for narrower
+  rules THERE, only for a bare register or a bare immediate reaching
+  this specific typed destination directly. }
+{ CheckTypedWidthStore: PLAN.TXT S2.1's own strict store rules for a
+  '.BYTE'/'.WORD'-typed memory destination -- STRICTER than the
+  general EmitAssignRhs/MoveAxToDest machinery every OTHER memory
+  destination here uses (that machinery silently narrows/widens a
+  mismatched-width register source, a deliberate, already-established
+  behavior for '.RecordType.field'/bare memory, left unchanged --
+  scoped to ONLY '.BYTE'/'.WORD', this session's own explicit design
+  decision). Peeks the CURRENT (not yet consumed) RHS token the same
+  "peek before OperandText/EmitAssignRhs flattens it" pattern this
+  file already uses throughout (PeekVarIsInt, EmitCondJump's own
+  aIsByteVar, etc): a bare register source must match destSize's own
+  width exactly ("initially require a matching-width register for
+  register-to-memory stores"); a bare numeric literal must fit the
+  destination's own width ("Diagnose out-of-range immediate stores
+  rather than silently narrowing them" -- BYTE: 0..255, WORD:
+  0..65535). Anything else (a VAR name, a call, a chained expression)
+  is unrestricted -- PLAN.TXT never asked for narrower rules THERE,
+  only for a bare register or a bare immediate reaching this specific
+  typed destination directly. Never consumes any token itself -- purely
+  a diagnostic pass; TryDirectImmStore (below) does the real parsing/
+  consuming for the literal case, called separately by the caller. }
+procedure CheckTypedWidthStore(const destSize: string);
+  var nm, msg: string; regId: integer; v: longint;
+begin
+  if Scan.CurTokKind = TIdent then begin
+    Scan.CurTokText(nm);
+    if SymTab.IsRegName(nm) then begin
+      regId := Regs86.LookupReg(UpStr(nm));
+      if EqualICase(destSize, 'byte') and not Regs86.IsByteReg(regId) then begin
+        msg := 'register-to-memory store to a .BYTE destination requires a byte register, not ''' + nm + '''';
+        Scan.ReportError(msg)
+      end else if EqualICase(destSize, 'word') and Regs86.IsByteReg(regId) then begin
+        msg := 'register-to-memory store to a .WORD destination requires a word register, not ''' + nm + '''';
+        Scan.ReportError(msg)
+      end
+    end
+  end else if Scan.CurTokKind = TNum then begin
+    v := Scan.CurTokVal;
+    if EqualICase(destSize, 'byte') and ((v < 0) or (v > 255)) then begin
+      msg := 'immediate store to a .BYTE destination out of range (0..255): ' + IntStr(v);
+      Scan.ReportError(msg)
+    end else if EqualICase(destSize, 'word') and ((v < 0) or (v > 65535)) then begin
+      msg := 'immediate store to a .WORD destination out of range (0..65535): ' + IntStr(v);
+      Scan.ReportError(msg)
+    end
+  end
+end;
+
+{ TryDirectImmStore: returns TRUE iff it fully handled the store itself
+  (a bare numeric literal RHS with nothing chained after it -- the
+  caller must skip EmitAssignRhs entirely in that case, the literal
+  token already having been consumed here). Emits a direct 'mov word/
+  byte [mem], imm' -- one instruction, no AX round-trip -- for ANY
+  sized ('byte'/'word') memory destination, both the new '.BYTE'/
+  '.WORD' typed form AND the pre-existing '.RecordType.field' one
+  (unlike CheckTypedWidthStore's own strict rejection rules above,
+  this codegen optimization is NOT scoped to '.BYTE'/'.WORD' only --
+  there is no reason a genuinely simpler+shorter emission should be
+  withheld from an ordinary RECORD field just because its own
+  acceptance rules stay permissive). destSize='' (an untyped bare-
+  memory destination, or a RECORD field of a type SizeHintFor has no
+  byte/word mapping for, e.g. LONGINT) always returns FALSE --
+  unchanged from before this function existed, since there is no known
+  width to pick 'byte'/'word' from. FALSE for every other RHS shape (a
+  register, a VAR, a call, a literal with something chained after it)
+  -- the caller falls through to the ordinary EmitAssignRhs path
+  unchanged in every one of those cases, exactly as before this
+  function existed. }
+function TryDirectImmStore(const destMem, destSize: string): boolean;
+  var msg, sfx, litText: string; v: longint;
+begin
+  TryDirectImmStore := false;
+  if (destSize = '') or (Scan.CurTokKind <> TNum) then exit;
+  v := Scan.CurTokVal;
+  if (EqualICase(destSize, 'byte') and ((v < 0) or (v > 255)))
+     or (EqualICase(destSize, 'word') and ((v < 0) or (v > 65535))) then
+    { Out of range for its own destination width -- CheckTypedWidthStore
+      (the '.BYTE'/'.WORD'-only path) already reported this; a plain
+      RECORD field never had this check at all (still doesn't -- this
+      function only optimizes codegen, never adds a new rejection), so
+      staying silent and falling through to the general EmitAssignRhs
+      path here is correct for both callers: it either re-reports
+      nothing new ('.BYTE'/'.WORD', already flagged) or emits the
+      value exactly as it always did (a RECORD field, unchanged
+      behavior). }
+    exit;
+  Scan.CurTokText(litText);
+  SymTab.Next;
+  if IsChainOp then begin
+    { A literal WITH something chained after it (e.g. '[BX].WORD := 5 +
+      1;') is not a bare immediate -- finish the computation via the
+      general EmitExprFrom/MoveAxToDest path instead, same "already-
+      consumed operand handed to EmitExprFrom as its own firstOpnd"
+      shape EmitIncDecAmountToReg's own fast path uses for the
+      identical reason (the literal token is already gone from the
+      stream at this point, so the caller's own EmitAssignRhs can no
+      longer re-parse it from scratch -- this function must finish the
+      whole store itself once it reaches this branch). }
+    EmitExprFrom(litText, 'ax');
+    MoveAxToDest(destMem, true, destSize)
+  end else begin
+    if EqualICase(destSize, 'byte') then sfx := 'byte ' else sfx := 'word ';
+    AppendInstr2(MnMov, sfx + destMem, litText)
+  end;
+  TryDirectImmStore := true
+end;
+
 { ParseAssignOrCall: an assignment 'dst := expr' (dst is a register, a
   named var, or a '[seg:base]' direct memory operand) or a procedure
   call 'Name(args)'. }
 procedure ParseAssignOrCall;
   var lhs, destSeg, destOff, buf, msg, destSize, hiWord: string; si: integer;
+      isTypedWidth: boolean;
 begin
   if SymTab.IsSym(SymTab.SyLBrack) then begin
-    SymTab.Next; ParseMemOperand(buf, destSize, false);
+    SymTab.Next; ParseMemOperand(buf, destSize, false, isTypedWidth);
     SymTab.Expect(SymTab.SyAssign);
-    EmitAssignRhs(buf, true, destSize, false)
+    if isTypedWidth then CheckTypedWidthStore(destSize);
+    if not TryDirectImmStore(buf, destSize) then
+      EmitAssignRhs(buf, true, destSize, false)
   end else if Scan.CurTokKind = TRegPair then begin
     { A tightly-spelled register pair ("DX:AX", no whitespace inside
       it) as the assignment TARGET -- the scanner already recognized
@@ -2836,6 +3826,7 @@ end;
   second-argument expr. }
 procedure EmitIncDecAmountToReg(const nm: string; mnemonic: word);
   var opnd: string; addSub: word; nmIsAx, nmIsAl, protectAx: boolean;
+      saveId: word;
 begin
   nmIsAx := EqualICase(nm, 'ax');
   { AL is exactly as self-referential as AX (INC(AX,expr)'s own
@@ -2891,34 +3882,62 @@ begin
     { a chain followed after all -- fall through to the general path,
       evaluating the ALREADY-CONSUMED opnd as EmitExprFrom's own
       firstOpnd instead of re-parsing it from scratch. }
-    AppendInstr1(MnPush, 'ax');
+    saveId := EmitGenSavePush('ax');
     EmitExprFrom(opnd, 'ax')
   end else begin
-    if nmIsAx or nmIsAl or protectAx then begin AppendInstr1(MnPush, 'ax') end;
+    if nmIsAx or nmIsAl or protectAx then saveId := EmitGenSavePush('ax')
+    else saveId := 0;
     EmitExpr('ax')
   end;
   if nmIsAx then begin
-    AppendInstr2(MnMov, 'cx', 'ax');
-    AppendInstr1(MnPop, 'ax');
-    AppendInstr2(addSub, 'ax', 'cx')
+    { INC(AX, expr)/DEC(AX, expr): expr's own value is already in AX;
+      the caller's OLD AX sits on the stack (pushed above). BX is used
+      as the scratch to carry expr's value across the pop -- NOT CX,
+      unlike this procedure's own previous version (this file's own
+      header comment on this procedure claims no register but AX
+      itself is ever disturbed here, "no risk of colliding with some
+      OTHER live register the way carrying the amount through CX used
+      to" -- true for every OTHER destination register (protectAx,
+      below) but NOT for nmIsAx/nmIsAl themselves until this fix: both
+      previously used 'mov cx,ax'/'mov cl,al' as their own scratch,
+      silently clobbering the caller's own live CX exactly like the
+      bug that comment describes -- found via LIB/OUT.SMD's own
+      'INC(AL, 30H)' inside Out_Word, corrupting a caller's live CX
+      across an ordinary Out_Int() call). BX is not risk-free either in
+      the abstract, but this codebase already treats it as ordinary
+      scratch at call boundaries with no dedicated preserved-register
+      convention (EmitCall's own header comment; Out_Int/Out_Word's
+      own bodies already use BX freely with no USES BX anywhere), so
+      reusing it here is consistent with the rest of this file, not a
+      new risk category. }
+    AppendInstr2(MnMov, 'bx', 'ax');
+    EmitGenSavePop('ax', saveId);
+    AppendInstr2(addSub, 'ax', 'bx')
   end else if nmIsAl then begin
-    AppendInstr2(MnMov, 'cl', 'al');
-    AppendInstr1(MnPop, 'ax');
-    AppendInstr2(addSub, 'al', 'cl')
+    { Same BX-instead-of-CX shape as nmIsAx above, at byte width. }
+    AppendInstr2(MnMov, 'bl', 'al');
+    EmitGenSavePop('ax', saveId);
+    AppendInstr2(addSub, 'al', 'bl')
   end else if protectAx and Regs86.IsByteReg(Regs86.LookupReg(UpStr(nm))) then begin
     { nm is some OTHER byte register (not AL) -- apply AL to nm directly
       while AL still holds expr's own freshly-computed value (nm is
       provably not AL here, nmIsAl already handled that case above),
       THEN restore the caller's original AX -- no intermediate carry
       register at all, so nothing else nm's own caller might have live
-      (CX included) is ever touched by this call. }
+      (CX included) is ever touched by this call. This exact shape --
+      PUSH ax; <eval expr into ax>; add/sub nm,al; POP ax -- is OPT.TXT
+      C1/C2's own target (genSaveId tags both ends of the pair, above/
+      below, letting PHOpt.PAS's own Stage C matchers, once
+      implemented, prove this is a compiler-owned scratch save rather
+      than assuming it from context). }
     AppendInstr2(addSub, nm, 'al');
-    AppendInstr1(MnPop, 'ax')
+    EmitGenSavePop('ax', saveId)
   end else if protectAx then begin
     { nm is some OTHER word register (not AX) -- same direct-apply-
-      then-restore shape, at word width. }
+      then-restore shape, at word width -- OPT.TXT C1's own literal
+      example shape ("PUSH AX; MOV AX,src; ADD SI,AX; POP AX"). }
     AppendInstr2(addSub, nm, 'ax');
-    AppendInstr1(MnPop, 'ax')
+    EmitGenSavePop('ax', saveId)
   end
 end;
 
@@ -2926,7 +3945,7 @@ end;
   Two forms: INC(var)/DEC(var) and INC(var, expr)/DEC(var, expr). }
 procedure EmitIncDec(mnemonic: word);
   var nm, opnd, sfx, msg: string; addSub: word; si, ty: integer;
-      hasAmount: boolean;
+      hasAmount, discardTW: boolean;
 begin
   if SymTab.IsSym(SymTab.SyLBrack) then begin
     { INC/DEC([seg:base].RecordType.field): a struct field used as the
@@ -2938,7 +3957,7 @@ begin
       FALSE here since this is a value operand (read-modify-write via
       inc/dec or add/sub), not an address -- an array field is correctly
       rejected the same way "AX := [seg:base].Rec.field;" already is. }
-    SymTab.Next; ParseMemOperand(opnd, sfx, false); opnd := sfx + ' ' + opnd;
+    SymTab.Next; ParseMemOperand(opnd, sfx, false, discardTW); opnd := sfx + ' ' + opnd;
     hasAmount := SymTab.IsLexSym(SymTab.SyComma);
     if hasAmount then begin
       EmitExpr('ax');
@@ -2985,8 +4004,28 @@ end;
 
 { ParsePushPop: 'PUSH(r1,r2,...)'/'POP(r1,r2,...)' -- PUSH pushes left to
   right; POP pops in reverse order. }
+{ ParsePushPop: 'PUSH(r1,r2,...)'/'POP(r1,r2,...)' -- each ri is
+  either an ordinary register name or the literal 'FLAGS' (mirroring
+  USES's own EmitUsesPush/EmitUsesPop, which already special-case
+  FLAGS to PUSHF/POPF rather than a real register operand -- PUSH/POP
+  themselves never accept a bare "flags" pseudo-register on 8086 at
+  all). Before this fix, 'FLAGS' fell through to the ordinary
+  AppendInstr1(mnemonic, regs[i]) path unchanged, and regs[i]'s own
+  storage (RegList's fixed string[3]) silently truncated the 5-letter
+  name to 'FLA' -- neither a real register nor a real instruction,
+  producing "PUSH FLA"/"POP FLA" in the generated .ASM (confirmed the
+  hard way: TASM.EXE would reject it as an undefined symbol, with no
+  translator-side diagnostic at all pointing at the real cause). }
 procedure ParsePushPop(mnemonic: word; reverse: boolean);
   var regs: RegList; n, i: integer; regNameTmp: string;
+      isFlags: array[0..MaxUses-1] of boolean;
+  procedure EmitOne(idx: integer);
+  begin
+    if isFlags[idx] then begin
+      if mnemonic = MnPush then AppendInstr0(MnPushf) else AppendInstr0(MnPopf)
+    end else
+      AppendInstr1(mnemonic, regs[idx])
+  end;
 begin
   SymTab.Expect(SymTab.SyLParen);
   n := 0;
@@ -3002,7 +4041,10 @@ begin
           params) -- regs[n] is RegList's own TRegName (string[3]), so
           go through this plain-string temp first, same pattern
           EmitCall's own regNameTmp uses. }
-        Scan.CurTokText(regNameTmp); regs[n] := regNameTmp; Inc(n)
+        Scan.CurTokText(regNameTmp);
+        isFlags[n] := EqualICase(regNameTmp, 'FLAGS');
+        if not isFlags[n] then regs[n] := regNameTmp;
+        Inc(n)
       end;
       SymTab.Next
     until not SymTab.IsLexSym(SymTab.SyComma)
@@ -3010,9 +4052,253 @@ begin
   SymTab.Expect(SymTab.SyRParen);
   if reverse then i := n - 1 else i := 0;
   while (i >= 0) and (i < n) do begin
-    AppendInstr1(mnemonic, regs[i]);
+    EmitOne(i);
     if reverse then Dec(i) else Inc(i)
   end
+end;
+
+{ ParseCompileTimeBool: '(' already consumed by the caller. Reads one
+  identifier that must resolve to a CONST whose value is exactly 0 or
+  1 (in practice, TRUE/FALSE -- SymTab's own predeclared CONSTs,
+  RegisterBuiltins -- but any CONST alias of them, e.g. 'CONST On =
+  TRUE;', is accepted too, same as any other CONST use elsewhere in
+  this translator). PLAN.TXT S2.5/S2.3's own explicit requirement for
+  SetIFlag/SetCFlag/SetDFlag/STOREB/STOREW/COPYB/COPYW: "Initially
+  require a compile-time Boolean constant, not a runtime value" --
+  a plain VAR or register operand here is a translator error, not a
+  runtime branch, since these operations exist specifically to emit
+  one exact, statically-known instruction/prefix combination. }
+function ParseCompileTimeBool: boolean;
+  var nm, msg: string; si: integer;
+begin
+  ParseCompileTimeBool := false;
+  if Scan.CurTokKind <> TIdent then begin
+    Scan.ReportError('expected a compile-time Boolean constant (TRUE/FALSE)');
+    exit
+  end;
+  Scan.CurTokText(nm); SymTab.Next;
+  si := SymTab.FindSym(nm);
+  if (si < 0) or (SymTab.SymKind(si) <> SymConst)
+     or ((SymTab.SymVal(si) <> 0) and (SymTab.SymVal(si) <> 1)) then begin
+    msg := 'expected a compile-time Boolean constant (TRUE/FALSE): ' + nm;
+    Scan.ReportError(msg); exit
+  end;
+  ParseCompileTimeBool := SymTab.SymVal(si) <> 0
+end;
+
+{ ParseFlagStmt: 'SetIFlag(TRUE)'/'SetCFlag(FALSE)'/etc, already
+  identified by the caller -- 'Name(' up to (not including) the
+  Boolean argument already consumed. mnTrue/mnFalse are the two
+  possible zero-operand mnemonics (PLAN.TXT S2.5: STI/CLI, STC/CLC,
+  STD/CLD respectively). }
+procedure ParseFlagStmt(mnTrue, mnFalse: word);
+  var v: boolean;
+begin
+  SymTab.Expect(SymTab.SyLParen);
+  v := ParseCompileTimeBool;
+  SymTab.Expect(SymTab.SyRParen);
+  if v then AppendInstr0(mnTrue) else AppendInstr0(mnFalse)
+end;
+
+{ ParseRepeatStmt: 'STOREB(TRUE)'/'COPYW(FALSE)'/etc, already
+  identified by the caller. mn is the plain (no REP) mnemonic;
+  mnRep is the REP-prefixed one (PLAN.TXT S2.3: TRUE emits REP,
+  repeating CX times; FALSE omits REP, executing once regardless of
+  CX). }
+procedure ParseRepeatStmt(mn, mnRep: word);
+  var v: boolean;
+begin
+  SymTab.Expect(SymTab.SyLParen);
+  v := ParseCompileTimeBool;
+  SymTab.Expect(SymTab.SyRParen);
+  if v then AppendInstr0(mnRep) else AppendInstr0(mn)
+end;
+
+{ ParseOutPortStmt: 'OUTPORTB(port, AL)'/'OUTPORTW(port, AX)' --
+  PLAN.TXT S2.2's own "Initially allow only the exact accumulator
+  destinations/values shown" applies symmetrically to the value
+  argument here, same as INPORTB/INPORTW's own destReg restriction:
+  the second argument must be written as the literal register AL/AX,
+  not a VAR/expression that merely happens to hold the right value. }
+procedure ParseOutPortStmt(mn: word; wantAl: boolean);
+  var portOpnd, nm, msg: string;
+begin
+  SymTab.Expect(SymTab.SyLParen);
+  portOpnd := ParsePortOperand;
+  SymTab.Expect(SymTab.SyComma);
+  Scan.CurTokText(nm); SymTab.Next;
+  if wantAl and not EqualICase(nm, 'AL') then begin
+    msg := 'OUTPORTB() value must be the literal register AL, not ''' + nm + '''';
+    Scan.ReportError(msg)
+  end else if (not wantAl) and not EqualICase(nm, 'AX') then begin
+    msg := 'OUTPORTW() value must be the literal register AX, not ''' + nm + '''';
+    Scan.ReportError(msg)
+  end else begin
+    if wantAl then AppendInstr2(mn, portOpnd, 'al')
+    else AppendInstr2(mn, portOpnd, 'ax')
+  end;
+  SymTab.Expect(SymTab.SyRParen)
+end;
+
+{ ParseGeneralReg: reads one bare register name, requiring it be a
+  real GENERAL register (not a segment register) -- shared by
+  ParseCarryArithStmt/ParseRotateStmt below, both of which need this
+  exact restriction ("Initially accept matching-width general
+  registers only; no segment registers" -- PLAN.TXT S2.4). Reports an
+  error and returns '' for anything else (a non-register identifier, a
+  segment register, a different token kind entirely) -- the caller
+  decides how to recover; this function's own job is only to read and
+  validate one register name. }
+function ParseGeneralReg(const what: string): string;
+  var nm, msg: string;
+begin
+  ParseGeneralReg := '';
+  if (Scan.CurTokKind <> TIdent) or not SymTab.CurTokIsReg then begin
+    Scan.ReportError(what + ' requires a general register operand');
+    if Scan.CurTokKind <> TEof then SymTab.Next;
+    exit
+  end;
+  Scan.CurTokText(nm); SymTab.Next;
+  if Regs86.IsSegReg(Regs86.LookupReg(UpStr(nm))) then begin
+    msg := what + ' does not accept a segment register: ' + nm;
+    Scan.ReportError(msg); exit
+  end;
+  ParseGeneralReg := nm
+end;
+
+{ TCarryOpnd: one already-classified ADDCarry/SUBBorrow operand --
+  ParseCarryOperand's own result, consumed by ParseCarryArithStmt
+  right after both operands are fully read (never in between reading
+  them: PLAN.TXT S2.4's own "Emit the instruction directly so operand
+  evaluation cannot destroy the incoming carry flag" -- nothing here
+  computes into a register or otherwise touches flags while parsing,
+  it only ever produces operand TEXT, same discipline ParseGeneralReg
+  already established for the register-only case this replaces). }
+type
+  TCarryOpnd = record
+    text: string;
+    isReg, isMem, isImm: boolean;
+    isByte: boolean;   { meaningful only when isReg; a bare immediate/
+                           memory operand's own width isn't separately
+                           known here (memory carries no inherent width
+                           tag of its own at this call site -- unlike
+                           .BYTE/.WORD typed memory access, ADDCarry/
+                           SUBBorrow's own memory operand is a plain
+                           '[...]' with no such suffix), so width
+                           checking below only ever fires when BOTH
+                           sides are registers, same as before this
+                           fix -- a register/memory or register/
+                           immediate pair is accepted without a width
+                           check, matching real 8086 (which infers the
+                           memory operand's own width from whichever
+                           register/explicit size prefix appears, not
+                           validated here at the SPHINX level). }
+  end;
+
+{ ParseCarryOperand: reads one ADDCarry/SUBBorrow operand -- a bare
+  register (ParseGeneralReg's own rules: general-purpose only, no
+  segment register), a '[...]' memory operand (ParseMemOperand, the
+  same parser '.BYTE'/'.WORD' typed memory access already uses,
+  PLAN.TXT S2.1 -- forAddress=false, an ordinary value operand), or (source
+  operand only, gated by the caller) a decimal/hex numeric literal.
+  Real 8086 ADC/SBB accept reg/reg, reg/mem, mem/reg, reg/imm, and
+  mem/imm -- never mem/mem -- so this function only classifies ONE
+  operand; ParseCarryArithStmt itself is what rejects the mem/mem
+  combination once both sides are known. }
+procedure ParseCarryOperand(const what: string; allowImm: boolean; var r: TCarryOpnd);
+  var sizeHint: string; isTypedWidth: boolean; nm: string;
+begin
+  r.text := ''; r.isReg := false; r.isMem := false; r.isImm := false; r.isByte := false;
+  if Scan.CurTokKind = TSym then begin
+    Scan.CurTokText(nm);
+    if EqualICase(nm, '[') then begin
+      SymTab.Next;
+      ParseMemOperand(r.text, sizeHint, false, isTypedWidth);
+      r.isMem := true; exit
+    end
+  end;
+  if allowImm and (Scan.CurTokKind = TNum) then begin
+    Scan.CurTokText(r.text); SymTab.Next;
+    r.isImm := true; exit
+  end;
+  if (Scan.CurTokKind = TIdent) and SymTab.CurTokIsReg then begin
+    r.text := ParseGeneralReg(what);
+    if r.text <> '' then begin
+      r.isReg := true;
+      r.isByte := Regs86.IsByteReg(Regs86.LookupReg(UpStr(r.text)))
+    end;
+    exit
+  end;
+  if allowImm then
+    Scan.ReportError(what + ' requires a register, memory, or immediate operand')
+  else
+    Scan.ReportError(what + ' requires a register or memory operand');
+  if Scan.CurTokKind <> TEof then SymTab.Next
+end;
+
+{ ParseCarryArithStmt: 'ADDCarry(dest, src)'/'SUBBorrow(dest, src)' --
+  dest is a register or a '[...]' memory operand; src is a register, a
+  '[...]' memory operand, or an immediate -- matching real 8086 ADC/SBB
+  encodings exactly (reg/reg, reg/mem, mem/reg, reg/imm, mem/imm); a
+  mem/mem pair is rejected outright, since no such encoding exists at
+  all. Width matching ("matching-width general registers only") is
+  still checked when BOTH operands are registers -- a byte+word
+  mismatch there is rejected the same way CheckTypedWidthStore's own
+  register-width check already is (PLAN.TXT S2.1); memory's own width
+  isn't independently known at this call site (see TCarryOpnd's own
+  comment), so a register/memory or register/immediate pair is
+  accepted without that check, matching real 8086 (which resolves the
+  memory operand's own width from whichever register or explicit size
+  prefix is present, not validated at the SPHINX level here). }
+procedure ParseCarryArithStmt(mn: word; const name: string);
+  var dest, src: TCarryOpnd; msg: string;
+begin
+  SymTab.Expect(SymTab.SyLParen);
+  ParseCarryOperand(name, false, dest);
+  SymTab.Expect(SymTab.SyComma);
+  ParseCarryOperand(name, true, src);
+  SymTab.Expect(SymTab.SyRParen);
+  if (dest.text = '') or (src.text = '') then exit;
+  if dest.isMem and src.isMem then begin
+    msg := name + ' cannot have a memory operand on both sides';
+    Scan.ReportError(msg); exit
+  end;
+  if dest.isReg and src.isReg and (dest.isByte <> src.isByte) then begin
+    msg := name + ' requires matching-width registers, not ''' + dest.text + ''' and ''' + src.text + '''';
+    Scan.ReportError(msg); exit
+  end;
+  AppendInstr2(mn, dest.text, src.text)
+end;
+
+{ ParseRotateStmt: 'ROL(reg, 1)'/'ROR(reg, CL)'/'RCL(reg, 1)'/
+  'RCR(reg, CL)' -- a byte/word general register (ParseGeneralReg,
+  above -- the same "no expression evaluation, no segment register"
+  restriction as ParseCarryArithStmt) and a count that must be written
+  as literally '1' or the register 'CL', matching the two 8086
+  encodings that actually exist for a shift/rotate instruction (an
+  arbitrary immediate count is not a real 8086 form at all). }
+procedure ParseRotateStmt(mn: word; const name: string);
+  var reg, cnt, msg: string;
+begin
+  SymTab.Expect(SymTab.SyLParen);
+  reg := ParseGeneralReg(name);
+  SymTab.Expect(SymTab.SyComma);
+  cnt := '';
+  if (Scan.CurTokKind = TNum) and (Scan.CurTokVal = 1) then begin
+    cnt := '1'; SymTab.Next
+  end else if (Scan.CurTokKind = TIdent) and SymTab.CurTokIsReg then begin
+    Scan.CurTokText(cnt); SymTab.Next;
+    if not EqualICase(cnt, 'CL') then begin
+      msg := name + ' count must be 1 or CL, not ''' + cnt + '''';
+      Scan.ReportError(msg); cnt := ''
+    end else cnt := 'cl'
+  end else begin
+    msg := name + ' count must be 1 or CL';
+    Scan.ReportError(msg);
+    if Scan.CurTokKind <> TEof then SymTab.Next
+  end;
+  SymTab.Expect(SymTab.SyRParen);
+  if (reg <> '') and (cnt <> '') then AppendInstr2(mn, reg, cnt)
 end;
 
 { ParseStmt: one statement. Statement separator ';' consumed here. }
@@ -3036,6 +4322,21 @@ begin
     AppendInstr1(MnInt, buf)
   end else if SymTab.IsLexKw(SymTab.KwPush) then ParsePushPop(MnPush, false)
   else if SymTab.IsLexKw(SymTab.KwPop) then ParsePushPop(MnPop, true)
+  else if SymTab.IsLexKw(SymTab.KwSetIFlag) then ParseFlagStmt(MnSti, MnCli)
+  else if SymTab.IsLexKw(SymTab.KwSetCFlag) then ParseFlagStmt(MnStc, MnClc)
+  else if SymTab.IsLexKw(SymTab.KwSetDFlag) then ParseFlagStmt(MnStd, MnCld)
+  else if SymTab.IsLexKw(SymTab.KwStoreB) then ParseRepeatStmt(MnStosb, MnRepStosb)
+  else if SymTab.IsLexKw(SymTab.KwStoreW) then ParseRepeatStmt(MnStosw, MnRepStosw)
+  else if SymTab.IsLexKw(SymTab.KwCopyB) then ParseRepeatStmt(MnMovsb, MnRepMovsb)
+  else if SymTab.IsLexKw(SymTab.KwCopyW) then ParseRepeatStmt(MnMovsw, MnRepMovsw)
+  else if SymTab.IsLexKw(SymTab.KwOutPortB) then ParseOutPortStmt(MnOutB, true)
+  else if SymTab.IsLexKw(SymTab.KwOutPortW) then ParseOutPortStmt(MnOutW, false)
+  else if SymTab.IsLexKw(SymTab.KwAddCarry) then ParseCarryArithStmt(MnAdc, 'ADDCarry')
+  else if SymTab.IsLexKw(SymTab.KwSubBorrow) then ParseCarryArithStmt(MnSbb, 'SUBBorrow')
+  else if SymTab.IsLexKw(SymTab.KwRol) then ParseRotateStmt(MnRol, 'ROL')
+  else if SymTab.IsLexKw(SymTab.KwRor) then ParseRotateStmt(MnRor, 'ROR')
+  else if SymTab.IsLexKw(SymTab.KwRcl) then ParseRotateStmt(MnRcl, 'RCL')
+  else if SymTab.IsLexKw(SymTab.KwRcr) then ParseRotateStmt(MnRcr, 'RCR')
   else
     ParseAssignOrCall;
   while SymTab.IsLexSym(SymTab.SySemi) do begin end
@@ -3246,13 +4547,15 @@ end;
   genuine duplicate-definition translator error. }
 procedure ParseProcedure;
   var nm: string; exported, isFar, isInterrupt, hasParams, isFwd, isExtern, wasValid, needsFrame: boolean;
-      nStack, nParams, pi, kwTy: integer;
+      nStack, nParams, pi: integer;
+      retTyp: SymTab.TTypeInfo;
       savedLex: LexTab.TLexMark;
       regFlags: array[0..MaxParams-1] of boolean;
       sis: array[0..MaxParams-1] of integer;
       usesRegs: RegList; nUses: integer;
       msg, externName: string; buf: word;
       bodyStartChunk: POpChunk; bodyStartSlot: integer;
+      bodyEndChunk: POpChunk; bodyEndSlot: integer;
 begin
   ctx.labelCnt := 0;
   Scan.CurTokText(nm); SymTab.Next;
@@ -3286,9 +4589,32 @@ begin
     procRetTy still defaults to TyWord for RETURN-parsing purposes. }
   ctx.procRetTy := TyWord; ctx.hasRetTy := false;
   if SymTab.IsLexSym(SymTab.SyColon) then begin
-    kwTy := -1;
-    if SymTab.CurTokKind = SymTab.LexKw then kwTy := RecTypes.ScalarKwTy(SymTab.CurTokId);
-    if kwTy >= 0 then begin ctx.procRetTy := kwTy; ctx.hasRetTy := true; SymTab.Next end
+    { PLAN.TXT S1.7: 'RetTy' used to be resolved by its own narrower
+      inline check (ScalarKwTy directly on the current token) instead
+      of the general RecTypes.ParseBaseType every OTHER type position
+      (VAR declarations, RECORD fields, PROCEDURE parameters) already
+      goes through -- so a scalar TYPE alias (e.g. 'TYPE Handle =
+      WORD;') used as a return type ('PROCEDURE P(): Handle; NEAR;')
+      was never recognized as a scalar keyword at all, silently left
+      the identifier token completely UNCONSUMED (kwTy stayed -1,
+      SymTab.Next was only ever called inside "if kwTy >= 0"), and
+      corrupted the rest of this procedure's own parse from there
+      (confirmed the hard way: cascading "expected 'END'"/"expected
+      '.'" errors, nowhere near the real problem). ParseBaseType
+      itself already knows how to resolve a user TYPE alias (via
+      SymTab.FindType) in addition to every scalar keyword, so reusing
+      it here fixes the gap directly, consistently with every other
+      type position. A RECORD type name (aliased or not) is rejected
+      here explicitly -- SPHINX.MD's own §6.4 return-register
+      convention (BYTE/BOOLEAN->AL, WORD/INTEGER->AX, LONGINT->DX:AX)
+      has no slot for an arbitrary-sized RECORD value at all. }
+    Scan.CurTokText(msg);
+    RecTypes.ParseBaseType(retTyp);
+    if retTyp.ty = TyRec then
+      Scan.ReportError('RECORD type not supported as a return type: ' + msg)
+    else begin
+      ctx.procRetTy := retTyp.ty; ctx.hasRetTy := true
+    end
   end;
   isFar := exported; isInterrupt := false;
   if SymTab.IsLexSym(SymTab.SySemi) then begin end;
@@ -3416,16 +4742,66 @@ begin
     if nStack > 0 then AppendInstr1(buf, IntStr(longint(nStack)))
     else AppendInstr0(buf);
   end;
+  { bodyEndChunk/bodyEndSlot: snapshot the tail HERE, right after the
+    real RETN/RETF/IRET (whichever branch above just ran) and BEFORE
+    the blank Emit('') line right below -- OPT.TXT's own R6 finding
+    surfaced a real, pre-existing bug here: Emit('') appends a genuine
+    TOpAsm operation (AppendAsmLine, unconditionally, even for an EMPTY
+    string -- there is no "blank line, so skip appending anything at
+    all" special case), and PHOpt.PAS's own BuildCfg REJECTS any range
+    containing a TOpAsm outright (cfg.ok := false, unconditionally, no
+    exception for a blank/empty one) -- every PHOpt.Optimize call this
+    procedure ever made (going all the way back to before R6 existed)
+    included this trailing blank TOpAsm in its own range, which means
+    ByteCompareNoWiden (E4, the ONLY existing PHOpt.PAS rule that calls
+    BuildCfg) had ALWAYS silently failed its own internal CFG build on
+    every REAL procedure's own full range, never once actually
+    succeeding via this call path -- found via direct instrumentation
+    while verifying R6's own BuildCallGraph (which also calls BuildCfg,
+    once per procedure, and hit the exact same cfg.ok=FALSE on every
+    single one of Tetris's own 47 procedures). Fixed by recording the
+    range's own END at the real last instruction instead of the
+    blank-line tail -- the blank line itself was never meaningful
+    content anyway (Emit('') exists purely as visual spacing in the
+    generated .ASM, SerializeOne's own TOpAsm case just writes its own
+    text verbatim, an empty line in this case), so excluding it from
+    the analyzed range loses nothing a peephole/CFG pass could ever
+    want to see. }
+  bodyEndChunk := comp.opTail; bodyEndSlot := comp.opTail^.count;
   Emit('');
   { This procedure's own operation list is now fully appended (nothing
     else appends more operations for THIS procedure past this point) --
-    hand the whole [bodyStartChunk,bodyStartSlot .. tail] range to
-    PHOpt.Optimize before moving on, same "one PROCEDURE body at a
-    time" scope PHOPT.PAS's own header comment documents. comp.opTail/
-    comp.opTail^.count are the current tail (the just-appended blank
-    Emit('') line above), the same "wherever the append just landed"
-    reference AppendInstr1Ref/bodyStartChunk's own capture above use. }
-  PHOpt.Optimize(bodyStartChunk, bodyStartSlot, comp.opTail, comp.opTail^.count);
+    record the whole [bodyStartChunk,bodyStartSlot .. bodyEndChunk,
+    bodyEndSlot] range (NOT comp.opTail's own current position, which
+    would include the blank Emit('') line just above -- see this
+    procedure's own bodyEndChunk/bodyEndSlot capture, right before that
+    Emit('') call, for why) for OptimizeAllDeferred to hand to
+    PHOpt.Optimize later, once the WHOLE module (every PROCEDURE, every
+    call site) has been parsed.
+
+    OPT.TXT's own R6 finding ("this needs a post-parse optimization
+    phase... because the current immediate per-procedure pass cannot
+    see later callers"): calling PHOpt.Optimize immediately, right
+    here, the way every earlier version of this procedure did, means a
+    procedure parsed EARLIER in the module can never see a call site in
+    a procedure parsed LATER -- PHOpt.PAS's own deferred call-graph
+    analysis (built lazily, the first time OptimizeAllDeferred's own
+    PHOpt.Optimize calls actually need it) needs the WHOLE module's
+    call graph before it can safely narrow what a RETN is considered to
+    observe for any one procedure, not just the ones parsed so far. }
+  { OPT.TXT's own -O0/-O1/-O2 prerequisite: -O0 skips this entirely (no
+    peephole optimization at all -- no range is even recorded, so
+    OptimizeAllDeferred has nothing to do for this procedure); -O1 (the
+    default) and -O2 both record one, but PHOpt.Optimize's own "level"
+    parameter (OPT.TXT R1's own fix -- see PHOPT.PAS's own Optimize/
+    OptimizePass header comments) is what actually decides WHICH rules
+    run once PHOpt.Optimize itself is called: Stage A's own correctness
+    repairs run at level=1 unconditionally (bug fixes to existing
+    rules, not new rewrites); every Stage C/E rule added since is
+    gated to level>=2 inside PHOpt.Optimize itself, not here -- optLevel
+    is passed straight through unchanged. }
+  if optLevel > 0 then
+    OptRangeAppend(pi, bodyStartChunk, bodyStartSlot, bodyEndChunk, bodyEndSlot, optLevel);
   SymTab.LexTruncate(savedLex)
 end;
 
@@ -3524,10 +4900,47 @@ procedure Usage;
 begin
   WriteLn('SPHINX Oberon Translator, 2026 (c) DosWorld, Public domain (unlicense)');
   WriteLn;
-  WriteLn('Usage: SPHO file.smd');
+  WriteLn('Usage: SPHO [-O0|-O1|-O2] file.smd');
   WriteLn;
   WriteLn('  Translates file.smd (SPHINX Oberon Module, see DOCS/SPHINX.MD) to');
-  WriteLn('  file.asm (NASM-subset syntax).')
+  WriteLn('  file.asm (NASM-subset syntax).');
+  WriteLn;
+  WriteLn('  -O0  Do not run the peephole optimizer at all.');
+  WriteLn('  -O1  Run the optimizer (default if no -O flag is given).');
+  WriteLn('  -O2  Same as -O1 for now (reserved for additional rewrites).')
+end;
+
+{ ParseOptLevel: OPT.TXT's own -O0/-O1/-O2 command-line prerequisite --
+  scans every ParamStr(1..ParamCount) for the one recognized -O flag
+  (at most one; a second, contradicting -O flag is a translator error,
+  not silently "last one wins" or "first one wins" -- ambiguous intent
+  should not be guessed at). srcPath is set to whichever argument is
+  NOT a -O flag (still required to be exactly one such argument --
+  zero or more than one is Usage's own pre-existing "no argument"/
+  argc-mismatch path, unchanged by this addition, just now computed
+  from the non-flag argument count instead of assuming ParamStr(1) is
+  always the file). Returns FALSE (leaving level/srcPath unspecified)
+  on a malformed -O value or more than one non-flag argument -- the
+  caller reports Usage and exits, same as the pre-existing "argc < 1"
+  check already did for the zero-argument case. }
+function ParseOptLevel(var level: integer; var srcPath: string): boolean;
+  var i: integer; arg: string; haveLevel, haveSrc: boolean;
+begin
+  ParseOptLevel := false;
+  level := 1; srcPath := ''; haveLevel := false; haveSrc := false;
+  for i := 1 to ParamCount do begin
+    arg := ParamStr(i);
+    if (Length(arg) = 3) and (arg[1] = '-') and (UpCase(arg[2]) = 'O')
+       and (arg[3] in ['0', '1', '2']) then begin
+      if haveLevel then exit;   { a second -O flag -- ambiguous, reject }
+      level := Ord(arg[3]) - Ord('0'); haveLevel := true
+    end else begin
+      if haveSrc then exit;   { a second non-flag argument -- ambiguous, reject }
+      srcPath := arg; haveSrc := true
+    end
+  end;
+  if not haveSrc then exit;
+  ParseOptLevel := true
 end;
 
 { EmitLiteralBytes: writes text's own bytes (plus a trailing 0) as a
@@ -3593,6 +5006,7 @@ end;
   const/var tables. }
 procedure FreeChunks;
   var lc, ln: PLitChunk; pc, pn: PPendingChunk; oc, onext: POpChunk;
+      rc, rn: POptRangeChunk;
 begin
   lc := comp.litHead;
   while lc <> nil do begin ln := lc^.next; Dispose(lc); lc := ln end;
@@ -3603,6 +5017,9 @@ begin
   oc := comp.opHead;
   while oc <> nil do begin onext := oc^.next; Dispose(oc); oc := onext end;
   comp.opHead := nil; comp.opTail := nil;
+  rc := comp.optRangeHead;
+  while rc <> nil do begin rn := rc^.next; Dispose(rc); rc := rn end;
+  comp.optRangeHead := nil; comp.optRangeTail := nil;
   SymTab.FreeChunks
 end;
 
@@ -3626,11 +5043,10 @@ end;
 
 function RunBody: integer;
   var srcPath, outPath: string;
-      argc: integer;
 begin
-  argc := ParamCount;
-  if argc < 1 then begin Usage; RunBody := ExitUsage; exit end;
-  srcPath := ParamStr(1);
+  if not ParseOptLevel(optLevel, srcPath) then begin
+    Usage; RunBody := ExitUsage; exit
+  end;
   if not FileExistsLocal(srcPath) then begin
     LogErr.Error2('no such file: ', srcPath); RunBody := ExitIo; exit
   end;
@@ -3641,6 +5057,7 @@ begin
   comp.litHead := nil; comp.litTail := nil;
   comp.pendingHead := nil; comp.pendingTail := nil;
   comp.opHead := nil; comp.opTail := nil;
+  comp.optRangeHead := nil; comp.optRangeTail := nil;
   topModName := ''; topHasBegin := false;
   SymTab.Reset;
   Scan.SetSrcPath(srcPath);
@@ -3666,6 +5083,17 @@ begin
     Erase(es.f);
     FreeChunks; RunBody := ExitAsm; exit
   end;
+
+  { OPT.TXT's own R6 finding -- every call site in the module is now
+    fully resolved (CheckPendingCalls just ran), so every recorded
+    procedure range's own PHOpt.Optimize call can safely build/consult
+    a whole-module call-graph analysis, not just whatever procedures
+    happened to be parsed before this one. See OptRangeAppend/
+    OptimizeAllDeferred's own header comments above for the full
+    reasoning, and ParseProcedure's own comment at its OptRangeAppend
+    call site for why this replaced an immediate per-procedure
+    PHOpt.Optimize call. }
+  OptimizeAllDeferred;
 
   EmitLiterals;
   SerializeOps;

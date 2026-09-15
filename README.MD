@@ -2,7 +2,7 @@
 
 ## A Low-Level Oberon Dialect Compiling to NASM
 
-SPHINX Oberon is a strict 16-bit systems programming language that combines the structured syntax of Oberon-2 with direct access to the x86 CPU. This document defines the complete language semantics and, crucially, shows how each construct translates into human-readable NASM assembly. The target is real-mode DOS .COM or .EXE programs; segment registers are 16-bit and memory is addressed with `segment:offset` pairs.
+SPHINX Oberon is a strict 16-bit systems programming language that combines the structured syntax of Oberon with direct access to the x86 CPU. This document defines the complete language semantics and, crucially, shows how each construct translates into human-readable NASM assembly. The target is real-mode DOS .COM or .EXE programs; segment registers are 16-bit and memory is addressed with `segment:offset` pairs.
 
 Few notes:
 - This dialect allow _ into identifiers.
@@ -21,18 +21,22 @@ Few notes:
 Identifiers start with an ASCII letter or `_`, followed by ASCII letters,
 digits, or `_`. User-declared names are case-sensitive; spell references
 exactly as declared. Keywords and register names are recognized without
-case distinctions. Keep identifiers to at most 63 characters: the scanner
-splits longer text rather than reliably diagnosing an overlong name.
+case distinctions. Keep identifiers to at most 63 characters: an
+identifier or numeric literal exceeding that length is a translator
+error naming the offending token (not silent truncation/splitting).
 Source is byte-oriented, not Unicode; use ASCII syntax and explicit byte
 escapes for non-ASCII string data. Keep filenames in DOS 8.3 format.
 
 Keywords (do not reuse them as identifiers):
 
-```
+```ob2
 MODULE IMPORT CONST TYPE RECORD END VAR PROCEDURE FORWARD INTERRUPT
 FAR NEAR REG BEGIN RETURN IF THEN ELSIF ELSE WHILE DO BREAK CONTINUE
 ASM INC DEC PUSH POP USES BYTE WORD INTEGER LONGINT BOOLEAN INT SHL
 SHR XOR POINTER CHAR DIV MOD EXTERNAL OR
+SETIFLAG SETCFLAG SETDFLAG LOADB LOADW STOREB STOREW COPYB COPYW
+INPORTB INPORTW OUTPORTB OUTPORTW
+ADDCARRY SUBBORROW ROL ROR RCL RCR
 ```
 
 Register names and the predefined names `TRUE`, `FALSE`, `FLAGS`,
@@ -53,7 +57,7 @@ runtime error. There are no floating-point literals.
 
 ## 1. Module Structure
 
-```
+```ob2
 MODULE ModuleName;
   IMPORT OtherModule;   (* optional *)
   CONST ...
@@ -73,7 +77,7 @@ Globals are placed in `.data` when initialized, or `.bss` otherwise. Code goes i
 termination or DS/SS setup; establish the segments required by the selected
 COM/EXE layout and explicitly terminate the program. Example:
 
-```
+```ob2
 MODULE Hello;
 BEGIN
   AX := 0x4C00;
@@ -133,7 +137,6 @@ pop  ds
 ```
 
 Only registers named in `USES` are promised preservation across a procedure call (section 6.5). The compiler may also save scratch registers temporarily while evaluating expressions. In expressions, reading a register yields its current value; writing it updates the hardware.
-
 
 **Register and flag effects.** `USES` preserves listed registers across
 one procedure call, not across each expression inside its body. Generated
@@ -198,6 +201,17 @@ VAR
 
 In NASM these become `resb`, `resw`, `resd` or `db`, `dw`, `dd`.
 
+An array's `[N]` bound must be a positive numeric literal or `CONST`
+name, no larger than 32767  -- zero, negative, or oversized bounds are
+translator errors (see the Implementation Limits table, section 14).
+The array's own total byte count (`element_size * N`, or, for a RECORD
+array, its RECORD type's own full size times `N`) is also checked
+against the 65535-byte real-mode segment limit, independent of `N`'s own
+32767 cap  -- a large element size can still overflow well under that
+count limit (e.g. `LONGINT[20000]`, 80000 bytes). The same byte-count
+check applies to a RECORD field that is itself declared as an array
+(section 3.2).
+
 **Passing an array to a procedure:** use an array formal such as
 `buf: BYTE[]` and pass the array name (automatic address passing, section
 6.6), or explicitly pass `ADR(arr)` to a WORD/INTEGER address parameter.
@@ -240,7 +254,7 @@ Record types are defined at module level in the `TYPE` section. Each record beco
 
 **Syntax:**
 
-```
+```ob2
 TYPE
   RecordName = RECORD
     field1 : type;
@@ -252,7 +266,7 @@ TYPE
 **NASM translation:**  
 A NASM `struc` is emitted. The structure name is `RecordName` and its fields are accessible as `RecordName.fieldName` inside the assembler.
 
-```
+```ob2
 TYPE
   Point = RECORD
     x : INTEGER;
@@ -285,7 +299,7 @@ A RECORD field whose own size is 2 bytes or more (WORD/INTEGER/LONGINT/POINTER, 
 
 **Array fields:** a field may itself be an array (`name : type[N];`, the same `[N]` bound as an ordinary array VAR, section 3.1)  -- packed sequentially with no padding *inside* the array, same as a standalone array VAR:
 
-```
+```ob2
 TYPE
   FileBuf = RECORD
     handle : INTEGER;
@@ -309,6 +323,18 @@ endstruc
 `SIZE(FileBuf)` is 1030 (2+2+2+1024), and `handle`/`ofs`/`fill` still work as ordinary scalar fields (`[seg:base].FileBuf.ofs := ...`). An array field has no standalone name of its own to `ADR()` the way a global/local array does, so it's addressed through the same `[seg:base].RecordType.field` structured-access syntax, given to `ADR()` instead of a bare name: `ADR([DS:BX].FileBuf.data)`. Using an array field directly as a scalar operand (`AX := [DS:BX].FileBuf.data;`) is a translator error  -- only `ADR()` of it is valid.
 
 Once a record type is defined, it can be used in variable declarations and direct memory access (see section 10).
+
+**Scalar type aliases (Pascal port).** The `TYPE` section also accepts a non-`RECORD` declaration, `Name = ScalarType;`, naming an existing scalar type (`BYTE`/`BOOLEAN`/`WORD`/`INTEGER`/`LONGINT`, the Pascal-port synonyms `CHAR`/`POINTER`, or another already-declared alias):
+
+```ob2
+TYPE
+  Handle = WORD;
+  Offset = INTEGER;
+```
+
+An alias has **exactly** its underlying type's own representation and signedness  -- it is not a distinct, incompatible type, just another spelling for the same one. `VAR h: Handle;` reserves the same 2 bytes a plain `WORD` VAR would, and a comparison through an `INTEGER`-based alias (`Offset`, above) is still signed, exactly as if `INTEGER` had been written directly. An alias is usable everywhere an ordinary scalar type name is: `VAR` declarations, `RECORD` fields, `PROCEDURE` parameters, and `PROCEDURE` return types. `TYPE Foo = SomeRecordType;` (aliasing a `RECORD` type, rather than a scalar) is a translator error  -- only a scalar aliases this way.
+
+An **exported** alias (`Name* = ScalarType;`) is preserved in the module's own regenerated `.SHD` header exactly as written (`Handle = WORD;`), the same way an exported `RECORD` type's full field list is  -- an importing module's own `VAR h: Handle;` resolves it correctly.
 
 ### 3.3 Character and String Literals
 
@@ -359,14 +385,14 @@ This is what makes a literal delimiter, or a genuinely unprintable byte such as 
 
 A global array declared with an **empty** bound (`T[]`, no size) can be given a real initial value instead of being uninitialized `.bss` space  -- the array's length comes from the decoded data itself, not from a written-out `N`:
 
-```
+```ob2
 VAR
   v : BYTE[]    = BASE64("TWFu");
   w : CHAR[]    = FILE("sprites.bin");
   s : BYTE[]    = "Hello!";
 ```
 
-- `BASE64("...")` streams its encoded text and is exempt from the ordinary 255-byte string-literal limit. The decoded output is limited to 65535 bytes; that payload requires 87380 base64 characters, excluding whitespace. There is no separate 65535-character encoded-text limit. Ordinary string literals retain only their first 255 decoded bytes in the current scanner; keep them within that limit, since excess text is silently discarded.
+- `BASE64("...")` streams its encoded text and is exempt from the ordinary 255-byte string-literal limit. The decoded output is limited to 65535 bytes; that payload requires 87380 base64 characters, excluding whitespace. There is no separate 65535-character encoded-text limit. An ordinary string literal exceeding 255 decoded bytes is a translator error, not silent truncation; keep them within that limit.
 - `BASE64("...")` decodes a standard base64 string into raw bytes at translate time. Whitespace (space, tab, CR, LF) anywhere in the text is ignored, so a long blob may be broken across multiple source lines for readability:
   ```
   VAR v : BYTE[] = BASE64("TWFu
@@ -377,7 +403,7 @@ VAR
 - `"..."` (a plain string literal directly as the initializer, not wrapped in `BASE64()`/`FILE()`) encodes the literal's own raw bytes, plus one trailing zero byte (an ASCIIZ C-style string)  -- same 255-character limit as any other `"..."` string literal (section 3.3). Unlike `BASE64()`/`FILE()`, no decoding happens; the bytes are exactly the literal's own text, in source order.
 - `T` may be any element type SPHINX already accepts in an array declaration (`BYTE`/`CHAR`/`BOOLEAN`/`WORD`/`INTEGER`/`LONGINT`, or a declared `RECORD` type). The declared type is descriptive only  -- the decoded data is always emitted as a flat sequence of bytes, one `db` per byte (as a hex-byte immediate, e.g. `048h`, never a quoted NASM string  -- so an initializer text containing a `'` needs no special escaping), regardless of `T`.
 - The array always goes in `.data` (it holds a real stored value), never `.bss`, unlike every other array form.
-- `SIZE(v)` (section 9) returns the decoded byte count for an array declared this way (for `"..."`, that's the text length plus 1 for the trailing zero byte).
+- `SIZE(v)` (section 9) returns the decoded byte count for an array declared this way (for `"..."`, that's the text length plus 1 for the trailing zero byte). `LEN(v)` (section 9) returns that same byte count divided by `T`'s own element size (a translator error if not evenly divisible).
 - `T[]` **requires** a `BASE64()`/`FILE()`/`"..."` initializer  -- an empty bound with no initializer, or one of these initializers on an explicit `T[N]` bound, are both translator errors.
 - Only supported for a **global** `VAR`  -- SPHINX has no local-`.data` concept (a local array is always `.bss`/frame space), so `T[] = BASE64(...)`/`FILE(...)`/`"..."` inside a `PROCEDURE`'s own `VAR` section is a translator error.
 
@@ -592,17 +618,24 @@ BEGIN
 END Helper;
 ```
 
-**Declare the full signature before calls that depend on it.** A call to
-an undeclared same-file procedure is recorded; after parsing, the compiler
-resolves its name and patches `call` versus `call far`. An undefined name
-is an error. This late patch does not regenerate argument passing or
-return-value handling. Register parameters, LONGINT parameters/results,
-array auto-address passing, and byte-sized results depend on a signature
-already known when the call is emitted. Use `FORWARD` for these cases.
-For example, declare `PROCEDURE Send(AX); NEAR; FORWARD;` before a call
-that must place its argument in AX. Omitting the declaration is not a
-promise of equivalent code. A prior full definition or imported EXTERNAL
-signature also supplies the necessary information.
+**Declare the full signature before a call that passes arguments.** A
+call to an undeclared same-file procedure with **no arguments at all**
+is recorded; after parsing, the compiler resolves its name and patches
+`call` versus `call far` (no `FORWARD` needed for this case  -- see the
+example just above). An undefined name is still an error. This late
+patch only ever fixes up the `call`/`call far` mnemonic, never argument
+placement or return-value handling  -- so a call that passes **any**
+argument to a same-file procedure with no signature recorded yet
+(no prior real definition, `FORWARD`, or `EXTERNAL` declaration) is
+rejected outright, at the call site, with a translator error naming the
+missing `FORWARD` declaration. Register parameters, LONGINT parameters/
+results, array auto-address passing, and byte-sized results all depend
+on a signature already known when the call is emitted, and there is no
+safe default to guess in its absence. For example, declare
+`PROCEDURE Send(AX); NEAR; FORWARD;` before a call that must place its
+argument in AX. A prior full definition or imported EXTERNAL signature
+also supplies the necessary information, and satisfies this requirement
+exactly the same way a `FORWARD` declaration does.
 
 A `FORWARD` declaration is not itself a callable definition: a second,
 real `PROCEDURE Name...` with the same name is required later in the
@@ -660,6 +693,8 @@ Functions return via registers:
 | LONGINT       | DX:AX (DX=high, AX=low) |
 
 **`CHAR` is a synonym for `BYTE`** (Pascal port extension; the original Oberon implementation has no `CHAR` type anywhere  -- `ParseBaseType`'s original scalar-keyword list was `BYTE`/`BOOLEAN`/`WORD`/`INTEGER`/`LONGINT` only, matching section 3.1's own table). A single character is represented as a `BYTE` holding its ASCII value (or a `'x'` character literal, section 3.3, which is itself just a numeric immediate); `CHAR` is accepted everywhere `BYTE` is and produces identical code.
+
+`RetTy` may also be a scalar type alias (section 3.2)  -- it selects the same register(s) its underlying scalar type would, per the table above. A `RECORD` type name (aliased or not) is rejected as a return type outright: this table has no slot for an arbitrary-sized structured value.
 
 The compiler generates a move to the appropriate register(s) before `RET`.
 
@@ -825,20 +860,32 @@ into the generated address directly at translate time (no runtime
 arithmetic at all); any other index computes the address at runtime
 (base + index * element size).
 
-
-Indices are zero-based. Neither declared bounds nor individual accesses
-receive runtime bounds checks; constant out-of-range indices are not
-reliably rejected either. Index scaling/address addition uses 16-bit
-arithmetic and may wrap. Keep indices within the actual allocated storage.
-Only one scalar operand is accepted as an index, not `arr[i + 1]`.
+Indices are zero-based. There is no RUNTIME bounds check on any access
+(a non-constant index is never compared against the array's own length at
+run time; index scaling/address addition there uses 16-bit arithmetic and
+may wrap). A CONSTANT index (a numeric literal or `CONST` name), however,
+IS checked at translate time against the array's own declared length --
+`buf[5]` on a `WORD[3]` is a translator error ("array index ... is out of
+range for ..."), as is a negative constant index ("array index is
+negative"). This constant-index check only applies to a plain declared
+array `VAR`, never to an array-typed formal parameter (section 6.6,
+just above): a parameter carries only an address, not a real length, so
+there is nothing to check its index against. Keep non-constant indices
+within the actual allocated storage yourself. Only one scalar operand is
+accepted as an index, not `arr[i + 1]`.
 
 An array formal passes an offset only, with no hidden length or segment.
 A local array lives in SS; a global normally uses DS. Constant local
-indexing uses BP-relative storage, but runtime indexing computes BX and
-accesses `[BX]` through DS. Array-formal indexing also uses DS. Therefore
-local-array runtime indexing and passing local arrays to such formals
-require DS = SS, or explicit segment-aware memory access instead. This is
-a restriction of the current implementation, not an automatic segment
+indexing uses BP-relative storage (always SS-relative via BP, regardless
+of DS). Runtime (non-constant-index) local-array indexing computes BX
+and accesses it through an explicit `SS:` override, correctly regardless
+of DS's own current value. Array-formal indexing still uses DS
+unconditionally, since a formal parameter carries only a bare offset,
+with no segment information of its own for the callee to recover --
+passing a local array to such a formal (or otherwise handing its address
+across a segment boundary by hand) still requires DS = SS at the call
+site, or explicit segment-aware memory access instead. This is a
+restriction of the current implementation, not an automatic segment
 conversion. `ADR(local)` alone does not supply SS.
 
 ```ob2
@@ -1057,10 +1104,13 @@ Relationals compare two values and set the destination to 0 or 1. Internally, th
 `=`/`#` are sign-independent (`je`/`jne` either way). `<`/`>`/`<=`/`>=`
 use the LEFT operand's own signedness (section 7.1's "Signedness" subsection  -- 
 `WORD`/bare register default = unsigned `jb`/`ja`/`jbe`/`jae`;
-`INTEGER`/`.INTEGER`-cast register = signed `jl`/`jg`/`jle`/`jge`). This
+`INTEGER` VAR, or a `.INTEGER`-cast register, = signed `jl`/`jg`/`jle`/`jge`). This
 is a single-sided design: only the left operand's type decides the jump
 form, matching how a byte-sized VAR's own zero-extension is likewise only
-ever checked on the left operand.
+ever checked on the left operand. This holds identically in BOTH
+condition position (`IF w > x THEN ...`) and value position
+(`flag := w > x;`)  -- an `INTEGER` VAR compares signed either way, not
+just when used directly inside `IF`/`WHILE`.
 
 ```ob2
 IF AX > BX THEN ...          (* unsigned: bare registers default WORD *)
@@ -1177,7 +1227,7 @@ translates to:
 
 ### 8.1 IF Statement
 
-```
+```ob2
 IF condition THEN
   stats
 {ELSIF condition THEN
@@ -1221,7 +1271,7 @@ WHILE HasMore() DO ... END;   (* true whenever the returned byte # 0 *)
 
 ### 8.2 WHILE Loop
 
-```
+```ob2
 WHILE condition DO
   stats
 END
@@ -1330,12 +1380,14 @@ These are part of the language and generate inline code.
 | `DEC(var)`        | `dec word [var]`                    |
 | `INC(var, expr)`  | `add [var], expr` (or a register destination directly) |
 | `DEC(var, expr)`  | `sub [var], expr` |
-| `PUSH(r1,r2,...)` | `push r1` etc.                      |
-| `POP(r1,r2,...)`  | `pop rN` in reverse order           |
+| `PUSH(r1,r2,...)` | `push r1` etc. -- `FLAGS` is a valid argument, producing `pushf` |
+| `POP(r1,r2,...)`  | `pop rN` in reverse order -- `FLAGS` is a valid argument, producing `popf` |
 | `INT(n)`          | `int n`                             |
 | `ADR(v)`          | `offset v`                          |
 | `SEG(v)`          | `seg v`                             |
 | `SIZE(T)`         | `sizeof(T)` (constant)              |
+| `SIZE(v)`         | `v`'s own total storage size in bytes (constant) |
+| `LEN(v)`          | `v`'s own declared element count (constant) |
 | `ODD(x)`          | `test ax,1` / `jz`/`mov 0`/`jmp`/`mov 1` (no `SETcc`; 8086 only) |
 
 `ADR(v)` returns the offset of `v` within its segment. `v` may name a global VAR, a local VAR, a (non-register) parameter, or a PROCEDURE: a global or a PROCEDURE both yield a constant offset (`offset v`, a PROCEDURE's own bare label is already its own offset as a NASM immediate  -- useful for installing an interrupt vector or any other function-pointer-style use), while a local/parameter yields its stack-frame address computed at runtime (`lea ax, [bp+/-N]`). A register-named parameter has no address and is rejected.
@@ -1346,9 +1398,13 @@ For example, `ADR(xmsRec)` yields a constant offset.
 
 `SEG(v)` returns the segment of `v` (also global-VAR only).
 
-`SIZE(v)` also accepts a VAR name, not only a type name, when `v` is a global array declared with a `BASE64()`/`FILE()`/`"..."` initializer (section 3.4)  -- it returns that array's own decoded byte count. An ordinary scalar VAR or a plain `T[N]` array still requires `SIZE(T)`'s type-name form.
+`SIZE(v)` also accepts a VAR name, not only a type name: `SIZE(v)` returns `v`'s own complete storage size in bytes, for ANY declared VAR  -- an ordinary scalar (`TySize` of its own declared type), a single RECORD instance (`TySize` of its own RECORD type), a plain `T[N]` array (`TySize(T)*N`), or an array declared with a `BASE64()`/`FILE()`/`"..."` initializer (section 3.4, its own decoded byte count, including the trailing zero for a string initializer). `SIZE(v)` on an array-typed formal PARAMETER is a translator error, not a size at all: a parameter's own stack slot holds a 2-byte address into the caller's array, never the array's own storage, so there is no single correct answer to give.
 
-`ADR`/`SEG`/`SIZE`/`ODD` are value built-ins  -- usable as an expression's RHS, but not directly as an `IF`/`WHILE` condition. `CFLAG`/`ZFLAG` (section 7.5), by contrast, are condition-position-only. The two built-in families are not interchangeable.
+`LEN(v)` returns `v`'s own element count, known at compile time, for a declared array VAR: the plain `T[N]` form's own declared `N` directly, or (for a `BASE64()`/`FILE()`/`"..."`-initialized array) its own decoded byte count divided by its element size  -- a malformed payload whose byte count isn't evenly divisible by that size is a translator error. `LEN(v)` on an array-typed formal PARAMETER is also a translator error: a parameter carries only an offset, not a real length, and its own declared bound (if any) does not prove the caller's real allocation size. `LEN` on anything that isn't a declared array VAR (a scalar, a RECORD, a type name, an array parameter) is likewise a translator error.
+
+If a program already declares its own identifier literally named `len` (any case) -- a VAR, parameter, CONST, or PROCEDURE -- that declaration is used instead of the `LEN()` built-in wherever it appears; `LEN` only resolves to the built-in when no such declaration exists. (`ADR`/`SEG`/`SIZE`/`ODD` do not have this same fallback -- those four have always taken priority over a same-named declaration, unchanged here.)
+
+`ADR`/`SEG`/`SIZE`/`LEN`/`ODD` are value built-ins  -- usable as an expression's RHS, AND directly as an `IF`/`WHILE` condition (bare, e.g. `IF ODD(x) THEN`, negated with `~`, e.g. `WHILE ~ODD(x) DO`, or as either side of a relational comparison, e.g. `IF SIZE(buf) > 0 THEN`): the condition tests the built-in's own result against zero, the same way a bare `VAR`/register/call condition operand already does. `CFLAG`/`ZFLAG` (section 7.5), by contrast, are condition-position-only, tested directly via their own matching `Jcc` with no comparison at all -- the two built-in families are still not interchangeable.
 
 `INC`/`DEC` take an optional second argument  -- `INC(v, expr)`/`DEC(v, expr)` is `v := v + expr`/`v := v - expr`, `expr` any expression (including a call), evaluated the same way an ordinary right-hand side is. `v` may be a variable or a bare register name.
 
@@ -1451,6 +1507,28 @@ The compiler resolves the field offset using the NASM structure definition. For 
 
 When the target is a `LONGINT`, the compiler generates two moves if necessary, but the built-in `LONGINT` register-pair moves (see section 11) provide more efficient bulk transfer.
 
+### 10.1 Typed Memory Access and Effective Addresses (Pascal port)
+
+`.BYTE`/`.WORD` explicitly select a `[segment:base]` operand's access width, and the base itself may be a real 8086 effective address (a base register plus an optional index register plus an optional constant displacement) -- both new, and both a SEPARATE grammar from `.RecordType.field` (section 10, above): the two never combine, and address arithmetic (`BX+SI+4`) is only accepted directly before `.BYTE`/`.WORD`, never before `.RecordType.field` or bare memory (which keep their own existing single-register/immediate-base behavior, unchanged).
+
+```ob2
+[ES:DI].BYTE := 65;
+[ES:DI].WORD := 1234H;
+[DS:BX + SI + 4].WORD := AX;
+AX := [SS:BP - 6].WORD;
+```
+
+**Accepted address forms** -- a constant address; `BX`/`BP`/`SI`/`DI` alone, optionally plus a constant displacement; or `BX+SI`/`BX+DI`/`BP+SI`/`BP+DI`, optionally plus a displacement. `AX`-based addresses, `BX+BP`, a repeated/scaled index, and any other combination are translator errors, not silently accepted. Without an explicit segment, a `BP`-based address uses `SS`; every other form uses `DS` (the same default section 10's own bare-memory form already documents, just also applied to the new arithmetic forms here). Address syntax is not general expression syntax -- only the forms above, nothing else.
+
+**Store rules, stricter than section 10's own `.RecordType.field`/bare-memory forms**: a register-to-memory store requires an exactly matching-width register (`[ES:DI].BYTE := AX;` is a translator error -- `AX` is a word register); an immediate store must fit the destination's own width (`.BYTE`: 0..255, `.WORD`: 0..65535) or it is rejected outright, never silently narrowed. A bare immediate with nothing chained after it (`[BX].WORD := 777;`) emits a single direct `mov word [mem], 777` -- no `AX` round-trip -- the same optimization also applies to an ordinary `.RecordType.field` immediate store, though that path's own acceptance rules (mismatched-width register, out-of-range immediate) stay exactly as permissive as before this addition. A literal with something chained after it (`[BX].WORD := 5 + 1;`) still computes through `AX` as any other expression would.
+
+```nasm
+mov  byte [es:di], 65
+mov  word [es:di], 0x1234
+mov  word [ds:bx+si+4], ax
+mov  ax, [ss:bp-6]
+```
+
 ---
 
 ## 11. LONGINT Register-Pair Moves
@@ -1544,6 +1622,100 @@ cld
 rep stosb
 ```
 
+### 12.1 Explicit Flag Control and Memory Primitives (Pascal port)
+
+Six statements and two expression forms cover the most common raw-`ASM` idioms (`CLD`/`STD`/`STC`/`CLC`/`STI`/`CLI` and the `LODS`/`STOS`/`MOVS` family) without an `ASM` block at all. All eight are reserved keywords, not ordinary identifiers.
+
+**Flag control** -- each takes exactly one **compile-time** `TRUE`/`FALSE` constant (a runtime `BOOLEAN` VAR is a translator error) and emits exactly one instruction, no `ASM` block needed:
+
+```ob2
+SetDFlag(FALSE);   (* cld *)
+SetDFlag(TRUE);    (* std *)
+SetCFlag(FALSE);   (* clc *)
+SetCFlag(TRUE);    (* stc *)
+SetIFlag(FALSE);   (* cli *)
+SetIFlag(TRUE);    (* sti *)
+```
+
+None of these ever emits `CLD`/`STD` on their own before a memory primitive below -- the last `SetDFlag` call (if any) decides direction, exactly like raw assembly. Disabling then enabling interrupts (`SetIFlag(FALSE)` ... `SetIFlag(TRUE)`) is **not** equivalent to restoring their original state if they were already disabled going in -- there is no structured save/restore construct for this yet.
+
+**Memory copy/load/store** -- `LOADB()`/`LOADW()` are expression forms, only legal as the entire right-hand side of a direct assignment to `AL`/`AX` respectively (not embedded in a larger expression, not assigned to any other destination); `STOREB`/`STOREW`/`COPYB`/`COPYW` are statements taking one compile-time `TRUE`/`FALSE` argument:
+
+| SPHINX | Assembly | Implicit operands |
+|---|---|---|
+| `AL := LOADB();` | `lodsb` | reads `DS:SI` into `AL`, advances `SI` by 1 |
+| `AX := LOADW();` | `lodsw` | reads `DS:SI` into `AX`, advances `SI` by 2 |
+| `STOREB(FALSE);` | `stosb` | writes `AL` to `ES:DI`, advances `DI` by 1 |
+| `STOREB(TRUE);` | `rep stosb` | same, repeated `CX` times |
+| `STOREW(FALSE);` | `stosw` | writes `AX` to `ES:DI`, advances `DI` by 2 |
+| `STOREW(TRUE);` | `rep stosw` | same, repeated `CX` times |
+| `COPYB(FALSE);` | `movsb` | copies one byte `DS:SI` -> `ES:DI`, advances both by 1 |
+| `COPYB(TRUE);` | `rep movsb` | same, repeated `CX` times |
+| `COPYW(FALSE);` | `movsw` | copies one word `DS:SI` -> `ES:DI`, advances both by 2 |
+| `COPYW(TRUE);` | `rep movsw` | same, repeated `CX` times |
+
+The `TRUE`/`FALSE` argument controls `REP` only, independent of direction (`SetDFlag`, above): `TRUE` emits `REP` and consumes `CX` (on normal completion `CX` is 0); `FALSE` executes exactly once and leaves `CX` completely unchanged, even when `CX = 0` going in. `LOADB`/`LOADW` take no argument, always process exactly one element, and never emit `REP`. Every pointer register (`SI`/`DI`/segments) must already hold a valid address before the call -- these primitives generate no hidden operand setup, no bounds checking, and never advance a segment register when a 16-bit offset wraps. `COPY` is a directional copy, not automatically overlap-safe like `memmove`; the caller is responsible for choosing a safe direction/starting point when source and destination overlap. None of these instructions ever emits `CLD`/`STD` on their own -- direction is always whatever `SetDFlag` last set, unchanged by this call.
+
+```ob2
+VAR buf: BYTE[16];
+...
+ES := DS;
+DI := ADR(buf);
+AL := ' ';
+CX := 16;
+SetDFlag(FALSE);
+STOREB(TRUE);
+```
+
+translates to:
+
+```nasm
+mov  di, buf
+mov  al, 32
+mov  cx, 16
+cld
+rep stosb
+```
+
+Afterward every byte of `buf` is 32, `DI` has advanced by 16, `CX` is 0, and `AL` is still 32.
+
+### 12.2 Port Input/Output (Pascal port)
+
+`INPORTB`/`INPORTW` are expression forms (like `LOADB`/`LOADW`, section 12.1); `OUTPORTB`/`OUTPORTW` are statements taking `(port, value)`:
+
+| SPHINX | Assembly |
+|---|---|
+| `AL := INPORTB(DX);` | `in al, dx` |
+| `AX := INPORTW(DX);` | `in ax, dx` |
+| `AL := INPORTB(60H);` | `in al, 60h` |
+| `OUTPORTB(DX, AL);` | `out dx, al` |
+| `OUTPORTW(DX, AX);` | `out dx, ax` |
+| `OUTPORTB(20H, AL);` | `out 20h, al` |
+
+`B` means byte; `W` means word. Only two port forms are accepted: the literal register `DX`, or an immediate 0..255 -- a larger port number must be loaded into `DX` first, and any other register (or expression) as the port operand is a translator error. `INPORTB`/`INPORTW`'s own result must be assigned directly to `AL`/`AX` respectively, exactly like `LOADB`/`LOADW` (section 12.1) -- not embedded in a larger expression, not assigned to any other destination. `OUTPORTB`/`OUTPORTW`'s own value argument must be written as the literal register `AL`/`AX` respectively, not a VAR or expression that merely happens to hold the right value. None of these four ever touches `FLAGS`.
+
+### 12.3 Carry-Aware Arithmetic and Rotations (Pascal port)
+
+```ob2
+ADDCarry(AX, BX);   (* adc ax, bx *)
+SUBBorrow(DX, CX);  (* sbb dx, cx *)
+ROL(AX, 1);         (* rol ax, 1 *)
+ROR(AX, CL);        (* ror ax, cl *)
+RCL(AX, 1);         (* rcl ax, 1 *)
+RCR(AX, CL);        (* rcr ax, cl *)
+```
+
+`ADDCarry(dest, src)` is `dest := dest + src + incoming carry`; `SUBBorrow(dest, src)` is `dest := dest - src - incoming carry`. `dest` is a bare register name or a `[...]` memory operand; `src` is a bare register name, a `[...]` memory operand, or an immediate -- matching real 8086 `ADC`/`SBB` encodings exactly (`reg,reg` / `reg,mem` / `mem,reg` / `reg,imm` / `mem,imm`). A memory operand on **both** sides is a translator error -- no such encoding exists at all (every 8086 two-operand arithmetic instruction needs at least one register operand). Two register operands must be matching-width (`AX`/`BX` or `AL`/`BL`, never a mix); a segment register (`ES` etc) is never accepted on either side. Neither operand is ever evaluated as a general expression, whatever its own form -- reading them is limited to a bare register/memory/immediate lookup, with no expression computation of any kind in between: any operand evaluation between reading the operands and emitting `adc`/`sbb` could itself touch `CF` first, silently destroying the incoming carry before the instruction ever sees it. Result flags are exactly the CPU's own `ADC`/`SBB` flags, nothing added or promised beyond that.
+
+```ob2
+CX := CX SHR 1;      (* halve a count; CF := the bit shifted out *)
+ADDCarry(CX, 0);      (* CX := CX + 0 + CF -- adds back an odd remainder *)
+ADDCarry(AX, [total]); (* AX := AX + [total] + CF *)
+ADDCarry([total], BX); (* [total] := [total] + BX + CF *)
+```
+
+`ROL`/`ROR`/`RCL`/`RCR` take a bare byte or word general register (same restriction as above -- no segment register) and a count that must be written as literally `1` or the register `CL`, matching the two real 8086 encodings for a rotate instruction (an arbitrary immediate count like `ROL(AX, 2)` is not a real 8086 form and is a translator error). `RCL`/`RCR` rotate through the carry flag -- the incoming `CF` becomes the new bit that enters on one end, and the bit that rotates off the other end becomes the new `CF` -- while `ROL`/`ROR` rotate the register's own bits only, `CF` receiving a copy of the bit that rotated out but never feeding back in. No flags beyond the CPU instruction's own documented behavior are promised.
+
 ---
 
 ## 13. Complete Example with Record Types
@@ -1605,6 +1777,45 @@ are not preserved. This example assumes a single-segment COM layout
 - The resulting NASM file is assembled by this project's own `TASM.EXE` into a RDOFF2 `.RDF`, then linked with `TLINK.EXE` into a `.COM`/`.EXE`  -- not a generic `nasm -f bin`/`nasm -f obj` invocation.
 - Global type declarations produce `struc` definitions usable after their declaration; field offsets are accessed using the `RecordType.fieldName` notation in NASM expressions.
 
+### 14.1 Optimization Levels (`-O0`/`-O1`/`-O2`)
+
+`spho.exe [-O0|-O1|-O2] file.smd`  -- the one argument that isn't a recognized `-O0`/`-O1`/`-O2` flag is taken as `file.smd`; a second `-O` flag, or more than one non-flag argument, is a translator error (`Usage` printed, non-zero exit), the same path a missing argument already used. **`-O1` is the default when no `-O` flag is given at all.**
+
+The translator applies a per-PROCEDURE peephole optimizer (`SRC/PHOPT.PAS`) after parsing each body, before serialization -- register/flag/memory-visible behavior is always preserved; only which instructions actually get emitted changes.
+
+| Rule | What it does | `-O0` | `-O1` (default) | `-O2` |
+|---|---|:---:|:---:|:---:|
+| `ConstCond` | Folds a literal/literal `CMP`+`Jcc` (e.g. `WHILE TRUE DO`/`WHILE FALSE DO`) to an unconditional jump or nothing | no | yes | yes |
+| `ConstOrCond` | Folds a bare-BOOLEAN condition's `MOV`+`OR`+`Jcc` branch the same way | no | yes | yes |
+| `FoldSavedOperand` (C1) | Collapses a compiler-generated `PUSH AX`/`MOV AX,src`/`ADD`or`SUB dst,AX`/`POP AX` scratch save into `ADD`or`SUB dst,src` (immediate or proven frame-local source only) | no | no | yes |
+| `CollapseByteConstScaffolding` (C2) | Same idea at byte width, `CL`/`BL` scratch (`PUSH AX`/`MOV AX,K`/`MOV scratch,AL`/`POP AX`/`ADD`or`SUB AL,scratch`) -- fully collapses when the scratch register is provably dead afterward, otherwise keeps `MOV scratch,low8(K)` | no | no | yes |
+| `RemoveUnnecessarySaveRestore` (C3) | Deletes a compiler-generated `PUSH reg`/`POP reg` pair outright when nothing in the (bounded, at most 8 instructions) interior could need the saved value restored | no | no | yes |
+| `RemoveMovRR` (C4) | Deletes `MOV r,r` (identical register both sides) | no | no | yes |
+| `RemoveMovSwapBack` (C4) | Deletes the second of an adjacent `MOV a,b`/`MOV b,a` pair | no | no | yes |
+| `RemoveDeadConstMov` (C4) | Deletes the first of an adjacent `MOV r,K1`/`MOV r,K2` pair | no | no | yes |
+| `CheapReturn` | Deletes a jump whose target is the very next label | no | yes | yes |
+| `RemoveDeadBranch` (C4) | Deletes a jump reached by pure fallthrough through any number of labels | no | no | yes |
+| `JumpChain` | Retargets a jump-to-a-jump past the redundant hop (one hop per pass) | no | yes | yes |
+| `ThreadJumpChain` (C4) | Follows a multi-hop `JMP`-to-`JMP` chain to its real final target in one visit, with cycle detection | no | no | yes |
+| `RemoveRepeatedFlagOp` (C4) | Deletes a redundant adjacent identical `OR`/`CMP`/`TEST` | no | no | yes |
+| `RemoveIdentityLogicOp` (C4) | Deletes `OR`/`XOR reg,0` and `AND reg,all_ones` when provably flag-dead | no | no | yes |
+| `DeadCode` | Deletes structured code between an unconditional transfer and the next label | no | yes | yes |
+| `NoOpArith` | Deletes `ADD reg,0`/`SUB reg,0` when provably flag-dead | no | yes | yes |
+| `StoreForwarding` (E1) | Rewrites `MOV dstReg,mem` to `MOV dstReg,srcReg` when `mem` was stored from `srcReg` earlier in the same block, with nothing overwriting `srcReg` or touching memory in between; the store itself is retained | no | no | yes |
+| `FoldTempOperand` (E2) | Rewrites adjacent `MOV tmp,src`/`ADD`or`SUB`or`CMP dst,tmp` into `ADD`or`SUB`or`CMP dst,src` when `tmp` is provably dead afterward | no | no | yes |
+| `LoadModifyStore` (E3) | Collapses `MOV AX,mem`/`ADD`or`SUB AX,K`/`MOV mem,AX` into `ADD`or`SUB word mem,K` when `AX` is provably dead afterward and `mem` is a proven-safe (non-indexed) location | no | no | yes |
+| `ByteCompareNoWiden` (E4) | Collapses `MOV AL,byte mem`/`XOR AH,AH`/`CMP AX,K`/`Jcc L` into `CMP byte mem,K`/`Jcc L` when `K` is `0..255`, `Jcc` is an unsigned/equality condition, and `AX`/flags are provably dead on both successors (via Stage D's own CFG-based liveness) | no | no | yes |
+| `StoreReload` | Elides an immediate memory reload of a just-stored value | no | no | no |
+
+`-O1` runs only the Stage A rules above (`ConstCond`/`ConstOrCond`/`CheapReturn`/`JumpChain`/`DeadCode`/`NoOpArith`) -- every C1-C4/E1-E4 rule requires `-O2`. This was NOT always true: an implementation bug (OPT.TXT's own "R1" finding, fixed retroactively) meant every Stage C/E rule silently ran at the `-O1` default too, for the whole time each one was implemented, contradicting this project's own stated `-O1`/`-O2` contract from the start. Confirmed fixed directly: `-O1` output no longer contains any Stage C/E fold at all, and the level-less default is byte-for-byte identical to explicit `-O1`. See `DOCS/TRBUG.MD` for the full writeup.
+
+`StoreReload` is implemented but disabled at every level (including `-O2`): its own match cannot yet prove the elided memory operand never escapes (e.g. via `ADR()`) or aliases another write, so eliding the reload would risk observing a write made through that escaped address instead of the value just stored -- it stays off until a later stage supplies the metadata needed to prove that safely.
+
+The `(C1)`/`(C2)`/`(C3)`/`(C4)` rules require an additional "generated-save-pair" proof beyond ordinary text/mnemonic matching: a `PUSH`/`POP` pair is only ever eligible for C1/C2/C3 when the translator's own emitter tagged it, at the exact call site that produced it, as a genuine compiler-owned scratch save -- never a user-written `PUSH()`/`POP()` statement or a `USES` register-preservation pair. C1/C2 are tagged at `INC`/`DEC(reg, expr)`'s own codegen; C3 has no tagged call site yet (implemented and verified, but not yet wired to a specific emission point).
+
+`(E1)`-`(E4)` are the first rules that reason about data flow rather than purely local text/mnemonic patterns. `StoreForwarding` (E1) is implemented within one block only -- forwarding a value across a branch merge point is deferred, as is a separate, smaller E1 sub-case (removing a redundant `XOR AH,AH` zero-extension). `FoldTempOperand` (E2, the "temporary operands" sub-case of that item) is the register-only analog of C1; E2's other two sub-cases (repeated `CMP`/`TEST` across merged paths, dead `MOV AH,0`) are deferred, both needing real cross-block reasoning; no naturally-occurring trigger site exists for it in current codegen. `LoadModifyStore` (E3)'s own dead-register proof can reach a bare `RETN`/`RETF` at a procedure's own tail without being able to prove the register dead there (a `PROCEDURE` with no declared return value, ending in a bare `RETN` with nothing overwriting `AX` afterward, is a known, documented case that does not fold today). `ByteCompareNoWiden` (E4) is the first rule to consult Stage D's own CFG-based liveness rather than a simple local scan; it cannot currently fire on any comparison whose own result flows to a bare `RETN` (flags stay conservatively "live" through an unproven return, the same category of gap as E3's own), though it does fire on comparisons that stay within a loop body or other non-returning control flow -- confirmed via a real `EXAMPLES/TETRIS` code-size reduction. See `DOCS/SPHO.MD`'s own "Data-flow-dependent rewrites" section for the full explanation of all four, and `OPT.TXT`'s own section 12 "KNOWN LIMITATIONS AND GAPS: REVIEW AND RESOLUTION PLAN" for the authoritative, actively-maintained tracker of every remaining gap across all stages.
+
+`-O0` disables the optimizer's own call entirely for every PROCEDURE; the generated code is otherwise identical in observable behavior, just less compact (every comparison/branch/redundant instruction the rules above would otherwise remove is still present). See `DOCS/SPHO.MD`'s own "Peephole optimization" section for the full per-rule design notes and safety reasoning.
 
 ### Implementation Limits
 
@@ -1613,9 +1824,12 @@ runtime system. Do not depend on invalid input receiving a clean error.
 
 | Item | Limit |
 |---|---|
-| Identifier/token spelling | 63 characters |
-| Ordinary string literal | 255 decoded bytes; excess bytes currently discarded |
+| Identifier/token spelling | 63 characters; longer is a translator error |
+| Ordinary string literal | 255 decoded bytes; longer is a translator error |
 | BASE64/FILE decoded array | 65535 bytes |
+| Array `[N]` bound | 1 to 32767; zero/negative/oversized is a translator error |
+| Array/array-field total byte count | 65535 bytes; larger is a translator error |
+| Constant array index | must be non-negative and within the array's own declared length; violation is a translator error (array-typed parameters exempt -- no declared length to check against) |
 | Parameters per procedure | 32 |
 | Fields per record | 112 |
 | Entries in USES | 32 (only legal hardware registers/FLAGS are meaningful) |
@@ -1637,8 +1851,8 @@ with status 0 on success or 1 on failure. It is standalone and does not
 use the print-output smoke-test convention or require imported libraries.
 To verify it after building the translator, run from `TESTS/`:
 
-```
-emu2 ../SRC/SPHO.EXE RECDOC.SMD
+```sh
+emu2 ../SRC/spho.exe RECDOC.SMD
 emu2 ../BIN/TASM.EXE RECDOC.ASM
 emu2 ../BIN/TLINK.EXE /T=com RECDOC.RDF RECDOC.COM
 emu2 RECDOC.COM

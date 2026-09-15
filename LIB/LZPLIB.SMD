@@ -203,10 +203,8 @@ BEGIN
   AL := 0;
   PUSH(DS);
   POP(ES);
-  ASM
-    cld
-    rep stosb
-  END;
+  SetDFlag(FALSE);
+  STOREB(TRUE)
 END InitLzpTable;
 
 PROCEDURE IsZero(a1, a2 : WORD) : BOOLEAN; NEAR;

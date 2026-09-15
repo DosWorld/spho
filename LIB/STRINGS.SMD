@@ -8,8 +8,8 @@ BEGIN
   PUSH(DS); POP(ES);
   CX := 0FFFFH;
   AL := 0;
+  SetDFlag(FALSE);
   ASM
-    cld
     repne scasb
   END;
   DEC(DI);
@@ -26,10 +26,8 @@ BEGIN
   PUSH(DS); POP(ES);
   CX := n;
   INC(CX);
-  ASM
-    cld
-    rep movsb
-  END
+  SetDFlag(FALSE);
+  COPYB(TRUE)
 END StrCopy;
 
 PROCEDURE StrCat*(str, dst : INTEGER); NEAR;
@@ -49,8 +47,8 @@ BEGIN
   SI := a;
   DI := b;
   PUSH(DS); POP(ES);
+  SetDFlag(FALSE);
   ASM
-    cld
     repe cmpsb
   END;
   IF ZFLAG THEN AX := TRUE ELSE AX := FALSE END

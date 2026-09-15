@@ -201,7 +201,7 @@ procedure ParseVarSection(isGlobal: boolean; var frameOfs: integer;
                            parseArrayBound: TParseArrayBound);
   var nm: string; si, cnt, elemSz: integer; typ: SymTab.TTypeInfo; litLen: word;
       hasInit, isEmptyArr, isLitInit: boolean; initVal: longint; buf, rsfx: string;
-      isArr: boolean;
+      isArr: boolean; totalBytes: longint;
       names: array[1..MaxVarNames] of string[Scan.MaxName]; nNames, ni: integer;
 begin
   while (Scan.CurTokKind = TIdent) and not SymTab.IsKw(SymTab.KwConst) and not SymTab.IsKw(SymTab.KwType)
@@ -271,15 +271,64 @@ begin
         the 'T[N]' and empty-bound 'T[]' forms (isEmptyArr), matching
         ParseParams' own identical isArr flag for a formal parameter. }
       if isArr or isEmptyArr then SymTab.SymSetIsArr(si, true);
-      if isLitInit then
-        SymTab.SymSetVal(si, litLen)
-      else if isGlobal then begin
+      { PLAN.TXT S1.3: SIZE(variable)/LEN(array) need a plain 'T[N]'
+        array's own declared element count N, but nothing previously
+        persisted it anywhere past this one ParseVarSection call -- cnt
+        was computed, used to size the .bss/.data reservation below,
+        then discarded. Reusing SymVal for this (the same field
+        isLitInit's own branch just below uses for a BASE64()/FILE()/
+        "..." literal-initialized array's own decoded byte COUNT) is
+        safe: the two cases are mutually exclusive by construction
+        (isArr is only ever TRUE here for the plain 'T[N]' form;
+        isLitInit's own isEmptyArr 'T[]' form never sets isArr TRUE the
+        same way, see this procedure's own isArr-vs-isEmptyArr comment
+        just above) -- SymVal for an ordinary SymVar row was otherwise
+        always left at its own zero default for this case. Stored as
+        the raw ELEMENT COUNT (not a byte size, unlike litLen) so
+        RecTypes.SIZE(v) can derive TOTAL bytes as TySize(elemTy)*N
+        while LEN(v) can return N directly without needing to divide
+        back out an element size the way the literal-init case's own
+        byte count does. }
+      if isArr and not isLitInit then SymTab.SymSetVal(si, cnt);
+      if isLitInit then begin
+        SymTab.SymSetVal(si, litLen);
+        SymTab.SymSetIsLitInit(si, true)
+      end else if isGlobal then begin
         if isArr and (typ.ty = TyRec) then begin
-          { array of RECORD: reserve the true byte count directly. }
+          { array of RECORD: reserve the true byte count directly.
+            PLAN.TXT S1.4: totalBytes is a genuine longint product
+            (elemSz, up to TySize's own LONGINT=4, times cnt, up to
+            ParseArrayBound's own 32767 cap) -- checked against
+            MaxArrayLit (the same 65535-byte real-mode segment limit
+            BASE64()/FILE() literals already enforce) BEFORE narrowing
+            to the 'resb <N>' text, not after: NASM's own 'resb'
+            argument has no size limit of its own to catch this, so an
+            over-budget array would otherwise silently reserve however
+            many bytes IntStr's own longint text says, actually
+            exceeding what a single .bss segment can really hold. }
+          totalBytes := longint(RecTypes.TySize(typ)) * longint(cnt);
+          if totalBytes > MaxArrayLit then begin
+            Scan.ReportError('array exceeds ' + IntStr(longint(MaxArrayLit))
+              + ' bytes: ' + nm + ' (' + IntStr(totalBytes) + ' bytes)');
+            totalBytes := 1
+          end;
           ensureSect(sectBss);
-          buf := nm + ': resb ' + IntStr(longint(RecTypes.TySize(typ)) * longint(cnt));
+          buf := nm + ': resb ' + IntStr(totalBytes);
           emit1(buf)
         end else if isArr then begin
+          { array of scalar: 'resw'/'resb'/'resd cnt' -- NASM's own
+            resw/resd already multiply cnt by the element's own size
+            internally, so the byte-size check here (same MaxArrayLit
+            bound as the array-of-RECORD case just above) must do that
+            multiplication BY HAND first; NASM never gets a chance to
+            reject an over-budget count itself, since resw/resd/resb
+            take a plain element COUNT, not a byte total. }
+          totalBytes := longint(RecTypes.TySize(typ)) * longint(cnt);
+          if totalBytes > MaxArrayLit then begin
+            Scan.ReportError('array exceeds ' + IntStr(longint(MaxArrayLit))
+              + ' bytes: ' + nm + ' (' + IntStr(totalBytes) + ' bytes)');
+            cnt := 1
+          end;
           ensureSect(sectBss);
           RecTypes.ResSuffix(typ.ty, rsfx);
           buf := nm + ': ' + rsfx + ' ' + IntStr(longint(cnt));
@@ -302,7 +351,23 @@ begin
           ParseRecordType's own field-alignment padding. }
         elemSz := RecTypes.TySize(typ);
         if (elemSz >= 2) and Odd(frameOfs) then Inc(frameOfs);
-        if isArr then elemSz := elemSz * cnt;
+        if isArr then begin
+          { PLAN.TXT S1.4: same overflow check as the global array
+            cases above, and for the same reason -- 'elemSz * cnt' is
+            a plain 'integer * integer' here, silently wrapping past
+            32767 with no warning at all before this fix (a local
+            frame realistically can never hold anywhere near
+            MaxArrayLit's own 65535 bytes anyway, given the 8086
+            stack's own real-world size, but the CHECK itself is what
+            was missing, not just a generous-enough limit). }
+          totalBytes := longint(elemSz) * longint(cnt);
+          if totalBytes > MaxArrayLit then begin
+            Scan.ReportError('array exceeds ' + IntStr(longint(MaxArrayLit))
+              + ' bytes: ' + nm + ' (' + IntStr(totalBytes) + ' bytes)');
+            totalBytes := elemSz
+          end;
+          elemSz := integer(totalBytes)
+        end;
         frameOfs := frameOfs + elemSz;
         SymTab.SymSetOfs(si, frameOfs)
       end

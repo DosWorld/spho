@@ -140,9 +140,7 @@ BEGIN
   CX := 0;
   DX := 1;
   DI := 0;
-  ASM
-    stc
-  END;
+  SetCFlag(TRUE);
   INT(21H);
   IF CFLAG THEN
     DX := fname;
@@ -163,9 +161,7 @@ BEGIN
   BX := 1;
   CX := 0;
   DX := 12H;
-  ASM
-    stc
-  END;
+  SetCFlag(TRUE);
   INT(21H);
   IF CFLAG THEN
     DX := fname;
@@ -741,10 +737,8 @@ VAR srcOfs : WORD;   (* NOT named si: register names are case-insensitive
 BEGIN
   srcOfs := line;
   SI := srcOfs;
-  ASM
-    cld
-    lodsb
-  END;
+  SetDFlag(FALSE);
+  AL := LOADB();
   INC(srcOfs);
   WHILE AL # 0 DO
     WriteByte(fp, AX);   (* clobbers SI internally (via BlockWrite)
@@ -752,9 +746,7 @@ BEGIN
                                   instead of relying on the register
                                   surviving the call *)
     SI := srcOfs;
-    ASM
-      lodsb
-    END;
+    AL := LOADB();
     INC(srcOfs)
   END
 END WriteLine;
@@ -841,9 +833,7 @@ BEGIN
   AX := 7141H;
   CX := 0;
   SI := 0;
-  ASM
-    stc
-  END;
+  SetCFlag(TRUE);
   INT(21H);
   IF CFLAG THEN
     DX := fname;

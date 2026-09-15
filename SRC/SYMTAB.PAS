@@ -85,6 +85,26 @@ const
   KwChar = 39;
   KwDiv = 40; KwMod = 41; KwExternal = 42; KwOr = 43;
 
+  { PLAN.TXT S2.5/2.3: flag-control and memory-primitive statement
+    keywords -- same tier as KwInt/KwPush/KwPop above (a reserved
+    keyword, not a builtin-identifier name like ADR/SIZE/LEN/ODD),
+    per the plan's own explicit syntax (SetDFlag(TRUE), LOADB(), etc). }
+  KwSetIFlag = 44; KwSetCFlag = 45; KwSetDFlag = 46;
+  KwLoadB = 47; KwLoadW = 48; KwStoreB = 49; KwStoreW = 50;
+  KwCopyB = 51; KwCopyW = 52;
+
+  { PLAN.TXT S2.2: port I/O -- same tier/reasoning as the S2.5/2.3
+    keywords just above. INPORTB/INPORTW are expression forms (like
+    LOADB/LOADW); OUTPORTB/OUTPORTW are statement forms taking two
+    arguments (port, value). }
+  KwInPortB = 53; KwInPortW = 54; KwOutPortB = 55; KwOutPortW = 56;
+
+  { PLAN.TXT S2.4: carry-aware arithmetic and rotations -- same tier/
+    reasoning as the S2.5/2.3/2.2 keywords above. All six are
+    statement forms taking two arguments (destination, source/count). }
+  KwAddCarry = 57; KwSubBorrow = 58;
+  KwRol = 59; KwRor = 60; KwRcl = 61; KwRcr = 62;
+
   { Sy*: one id per symbol (LexSym rows' own `id`), numbered in
     declaration order. Only the 15 symbols Spho ever checks via
     IsSym/IsLexSym/Expect get a Sy* constant used at a call site; the
@@ -274,7 +294,7 @@ type
                                                     substitutes this in place of the SPHINX name
                                                     when non-empty; ParseProcedure also emits one
                                                     "extern <this-or-the-SPHINX-name>" line. }
-    isExported: array[1..Chunk] of boolean       { TRUE for a 'PROCEDURE Name*(...)' declaration
+    isExported: array[1..Chunk] of boolean;      { TRUE for a 'PROCEDURE Name*(...)' declaration
                                                     (DOCS/SPHINX.MD's own '*' export marker) --
                                                     previously only a parse-time-local `exported`
                                                     boolean in ParseProcedure (Spho.pas), used
@@ -282,6 +302,25 @@ type
                                                     persisted here so EmitSHD (Spho.pas) can later
                                                     enumerate which PROCEDUREs belong in this
                                                     module's own .SHD header. }
+    isAddressTaken: array[1..Chunk] of boolean   { OPT.TXT's own R6 finding
+                                                    ("Keep... address-taken entry points
+                                                    conservative") -- TRUE iff ADR(ProcName) was
+                                                    ever parsed for this row (DOCS/SPHINX.MD's own
+                                                    "a PROCEDURE... yield[s] a constant offset...
+                                                    useful for installing an interrupt vector or
+                                                    any other function-pointer-style use"). Once a
+                                                    procedure's own address has been taken this
+                                                    way, it may be CALLED indirectly (through a
+                                                    stored vector, an installed interrupt handler,
+                                                    or hand-written raw ASM) from code this
+                                                    translator's own call-graph builder
+                                                    (PHOpt.PAS's deferred R6 analysis) has no
+                                                    visibility into at all -- such a procedure's
+                                                    own "output demand" must stay fully unknown
+                                                    (the same conservative default every return
+                                                    used before R6 existed), never narrowed from
+                                                    only the DIRECT, by-name call sites this unit
+                                                    can actually see and reason about. }
   end;
 
   { SymChunk: CONST/VAR detail table -- one block of Chunk entries,
@@ -333,6 +372,22 @@ type
                                                     SymIsArr alone can't distinguish the two: both a
                                                     local array VAR and a local array-typed param
                                                     have isArr=TRUE, isLocal=TRUE. }
+    isLitInit: array[1..Chunk] of boolean;       { SymVar rows only: TRUE iff this row's own
+                                                    SymVal holds a BASE64()/FILE()/"..." literal
+                                                    initializer's own decoded BYTE COUNT (PLAN.TXT
+                                                    S1.3) -- ParseVarSection now also stores an
+                                                    ordinary 'T[N]' array's own declared ELEMENT
+                                                    COUNT in that same SymVal field (see GlobVar's
+                                                    own header comment on why reusing it is safe),
+                                                    so RecTypes.SIZE()/LEN() need this flag to tell
+                                                    the two apart: a byte count (this flag TRUE)
+                                                    needs no further scaling; an element count
+                                                    (this flag FALSE, isArr TRUE) needs
+                                                    TySize(elemTy)*N for SIZE, or bare N for LEN.
+                                                    FALSE for every other SymVar row (an ordinary
+                                                    scalar, a plain non-array VAR, or a RECORD
+                                                    instance -- SIZE() for those derives straight
+                                                    from ty/recIdx instead, no SymVal involved). }
     isExported: array[1..Chunk] of boolean      { SymConst rows only: TRUE
                                                     for a 'CONST Name* = ...;' declaration
                                                     (DOCS/SPHINX.MD's own '*' export marker,
@@ -376,6 +431,7 @@ procedure SymName(si: integer; var dst: string);
 function SymKind(si: integer): integer;
 function SymTy(si: integer): integer;
 procedure SymSetTy(si, ty, recIdx: integer);
+function SymRecIdx(si: integer): integer;
 function SymIsLocal(si: integer): boolean;
 procedure SymSetIsLocal(si: integer; v: boolean);
 function SymOfs(si: integer): integer;
@@ -386,6 +442,8 @@ function SymIsArr(si: integer): boolean;
 procedure SymSetIsArr(si: integer; v: boolean);
 function SymIsParam(si: integer): boolean;
 procedure SymSetIsParam(si: integer; v: boolean);
+function SymIsLitInit(si: integer): boolean;
+procedure SymSetIsLitInit(si: integer; v: boolean);
 function SymVal(si: integer): longint;
 procedure SymSetVal(si: integer; val: longint);
 function SymAppend(const nm: string; kind: integer): integer;
@@ -413,8 +471,11 @@ procedure ProcSetIsFar(pi: integer; isFar: boolean);
 procedure ProcSetForward(pi: integer; isFar: boolean);
 procedure ProcSetExternal(pi: integer; isFar: boolean; const externName: string);
 function ProcFindExternal(const nm: string; var externName: string): boolean;
+function ProcIsExternal(pi: integer): boolean;
 procedure ProcSetExported(pi: integer; v: boolean);
 function ProcIsExported(pi: integer): boolean;
+procedure ProcSetAddressTaken(pi: integer);
+function ProcIsAddressTaken(pi: integer): boolean;
 procedure ProcSetParams(pi: integer; var regFlags: array of boolean; var sis: array of integer; n: integer);
 function ProcParamIsReg(pi, i: integer; var regName: string): boolean;
 function ProcParamIsLong(pi, i: integer): boolean;
@@ -565,6 +626,7 @@ begin
   last^.isReg[k] := false;   { fresh entries default -- explicit init, VAR rows only }
   last^.isArr[k] := false;   { fresh entries default -- explicit init, VAR rows only }
   last^.isParam[k] := false; { fresh entries default -- explicit init, VAR rows only }
+  last^.isLitInit[k] := false; { fresh entries default -- explicit init, VAR rows only }
   last^.isExported[k] := false; { fresh entries default -- explicit init, SymConst rows only }
   SymAppend := si
 end;
@@ -599,6 +661,16 @@ begin SymChunkFor(si, c, k); SymTy := c^.ty[k] end;
 procedure SymSetTy(si, ty, recIdx: integer);
   var c: PSymChunk; k: integer;
 begin SymChunkFor(si, c, k); c^.ty[k] := ty; c^.recIdx[k] := recIdx end;
+
+{ SymRecIdx: recIdx's own read side, added for PLAN.TXT S1.3
+  (SIZE(recordVar) needs a RECORD-instance VAR's own recIdx to compute
+  RecTypes.TySize -- TTypeInfo's own header comment on why this pair
+  was write-only from outside SymTab until now: no caller ever needed
+  it back before). Meaningful only when SymTy(si) = TyRec, same
+  contract TTypeInfo.recIdx itself already documents. }
+function SymRecIdx(si: integer): integer;
+  var c: PSymChunk; k: integer;
+begin SymChunkFor(si, c, k); SymRecIdx := c^.recIdx[k] end;
 
 function SymIsLocal(si: integer): boolean;
   var c: PSymChunk; k: integer;
@@ -639,6 +711,14 @@ begin SymChunkFor(si, c, k); SymIsParam := c^.isParam[k] end;
 procedure SymSetIsParam(si: integer; v: boolean);
   var c: PSymChunk; k: integer;
 begin SymChunkFor(si, c, k); c^.isParam[k] := v end;
+
+function SymIsLitInit(si: integer): boolean;
+  var c: PSymChunk; k: integer;
+begin SymChunkFor(si, c, k); SymIsLitInit := c^.isLitInit[k] end;
+
+procedure SymSetIsLitInit(si: integer; v: boolean);
+  var c: PSymChunk; k: integer;
+begin SymChunkFor(si, c, k); c^.isLitInit[k] := v end;
 
 function SymVal(si: integer): longint;
   var c: PSymChunk; k: integer;
@@ -760,6 +840,7 @@ begin
   last^.retTyKnown[k] := false;
   last^.isExternal[k] := false;
   last^.isExported[k] := false;
+  last^.isAddressTaken[k] := false;
   LexTab.Add(nm, LexProc, pi);
   ProcReserve := pi
 end;
@@ -779,6 +860,20 @@ begin ProcChunkFor(pi, c, k); c^.isExported[k] := v end;
 function ProcIsExported(pi: integer): boolean;
   var c: PProcChunk; k: integer;
 begin ProcChunkFor(pi, c, k); ProcIsExported := c^.isExported[k] end;
+
+{ ProcSetAddressTaken/ProcIsAddressTaken: OPT.TXT's own R6 finding --
+  see TProcChunk's own isAddressTaken field comment above for why this
+  exists. Spho.pas's own ADR(ProcName) parse (EmitBuiltinValue) sets
+  this the one time a procedure's own address is actually taken;
+  PHOpt.PAS's own deferred R6 call-graph analysis reads it back to
+  force a conservative (fully unknown) output demand for that row. }
+procedure ProcSetAddressTaken(pi: integer);
+  var c: PProcChunk; k: integer;
+begin ProcChunkFor(pi, c, k); c^.isAddressTaken[k] := true end;
+
+function ProcIsAddressTaken(pi: integer): boolean;
+  var c: PProcChunk; k: integer;
+begin ProcChunkFor(pi, c, k); ProcIsAddressTaken := c^.isAddressTaken[k] end;
 
 procedure ProcSetForward(pi: integer; isFar: boolean);
   var c: PProcChunk; k: integer;
@@ -810,6 +905,15 @@ begin
   c^.isFar[k] := isFar; c^.valid[k] := false; c^.isFwdKnown[k] := true;
   c^.isExternal[k] := true; c^.externName[k] := InternOrZero(externName)
 end;
+
+{ ProcIsExternal: pi-indexed sibling of ProcFindExternal (which is
+  name-indexed) -- OPT.TXT's own R6 finding: SPHO.PAS's own
+  OptimizeAllDeferred only ever has a bare procId (SymTab's own `pi`)
+  in hand when it builds PHOpt.BuildCallGraph's own isConservative
+  array, one boolean per row, never a name to look up by. }
+function ProcIsExternal(pi: integer): boolean;
+  var c: PProcChunk; k: integer;
+begin ProcChunkFor(pi, c, k); ProcIsExternal := c^.isExternal[k] end;
 
 { ProcFindExternal: TRUE iff nm names an EXTERNAL-declared procedure --
   externName is set to the real linker-visible symbol name (nm itself
@@ -1244,6 +1348,17 @@ begin
   LexTab.Add('DIV', LexKw, KwDiv); LexTab.Add('MOD', LexKw, KwMod);
   LexTab.Add('EXTERNAL', LexKw, KwExternal);
   LexTab.Add('OR', LexKw, KwOr);
+
+  LexTab.Add('SETIFLAG', LexKw, KwSetIFlag); LexTab.Add('SETCFLAG', LexKw, KwSetCFlag);
+  LexTab.Add('SETDFLAG', LexKw, KwSetDFlag);
+  LexTab.Add('LOADB', LexKw, KwLoadB); LexTab.Add('LOADW', LexKw, KwLoadW);
+  LexTab.Add('STOREB', LexKw, KwStoreB); LexTab.Add('STOREW', LexKw, KwStoreW);
+  LexTab.Add('COPYB', LexKw, KwCopyB); LexTab.Add('COPYW', LexKw, KwCopyW);
+  LexTab.Add('INPORTB', LexKw, KwInPortB); LexTab.Add('INPORTW', LexKw, KwInPortW);
+  LexTab.Add('OUTPORTB', LexKw, KwOutPortB); LexTab.Add('OUTPORTW', LexKw, KwOutPortW);
+  LexTab.Add('ADDCARRY', LexKw, KwAddCarry); LexTab.Add('SUBBORROW', LexKw, KwSubBorrow);
+  LexTab.Add('ROL', LexKw, KwRol); LexTab.Add('ROR', LexKw, KwRor);
+  LexTab.Add('RCL', LexKw, KwRcl); LexTab.Add('RCR', LexKw, KwRcr);
 
   LexTab.Add('(', LexSym, SyLParen); LexTab.Add(')', LexSym, SyRParen);
   LexTab.Add('[', LexSym, SyLBrack); LexTab.Add(']', LexSym, SyRBrack);

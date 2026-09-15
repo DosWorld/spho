@@ -86,6 +86,20 @@ const
   MnJb = 39; MnJae = 40; MnJa  = 41; MnJbe = 42; MnJc  = 43; MnJnc = 44;
   MnJz = 45; MnJnz = 46;
 
+  { PLAN.TXT S2.5/2.3: flag-control (zero-operand, AppendInstr0) and
+    memory-primitive (zero/one-operand string instructions) mnemonics.
+    REP-prefixed forms get their OWN constant (MnRepStosb, not a
+    separate "REP" prefix flag on MnStosb) -- same "one constant per
+    exact NASM text" convention MnCallFar already established for
+    'CALL FAR' above, not a new shape. }
+  MnCld = 47; MnStd = 48; MnSti = 49; MnCli = 50; MnStc = 51; MnClc = 52;
+  MnLodsb = 53; MnLodsw = 54;
+  MnStosb = 55; MnStosw = 56; MnRepStosb = 57; MnRepStosw = 58;
+  MnMovsb = 59; MnMovsw = 60; MnRepMovsb = 61; MnRepMovsw = 62;
+  MnAdc = 63; MnSbb = 64;
+  MnRol = 65; MnRor = 66; MnRcl = 67; MnRcr = 68;
+  MnInB = 69; MnInW = 70; MnOutB = 71; MnOutW = 72;
+
 type
   { TOperation: one recorded emission, appended in the exact order
     Spho.pas used to WRITE it directly (Phase 3 item 5: "preserve the
@@ -183,6 +197,55 @@ type
                             ParseModule's own top-level EnsureSection
                             (SectCode) call runs before any declaration
                             is parsed. }
+    genSaveId: word;     { OPT.TXT Stage C's own "generated-save-pair
+                            identity" emitter metadata (see SPHO.PAS's
+                            own nextGenSaveId/EmitGenSave*). 0 (the
+                            default -- NewOpSlot, SPHO.PAS, always sets
+                            it) means "not a compiler-generated
+                            scratch-register save/restore this pass
+                            can identify"; a nonzero value is shared by
+                            EXACTLY one PUSH and its own matching POP,
+                            unique across the whole translation.
+                            PHOpt.PAS's own C1/C2/C3 matchers (Stage C)
+                            use a nonzero, MATCHING pair as their
+                            required "generated-save and private-stack
+                            proof" (OPT.TXT S6) -- proof this exact
+                            PUSH/POP pair is compiler-owned scratch,
+                            not user-written PUSH()/POP() or a USES
+                            register-preservation pair (SPHO.PAS never
+                            sets this field for either of those),
+                            before considering removing or folding
+                            through it. Meaningless (left 0, harmlessly)
+                            for TOpLabel/TOpAsm and every TOpInstr this
+                            field was never explicitly set for. }
+    callProcId: integer; { OPT.TXT's own R6 finding ("Return/call
+                            observability must be proved") -- for an
+                            MnCall/MnCallFar TOpInstr only: the resolved
+                            SymTab procedure index (SymTab.ProcFindAny's
+                            own `pi`) this call site targets, IF the
+                            callee is a same-module, direct, by-name
+                            call resolved at EmitCall time (0 -- the
+                            default, NewOpSlot always sets it -- means
+                            "not a proven direct internal call": an
+                            indirect/external/unresolved-forward call,
+                            or simply any non-MnCall/MnCallFar
+                            operation, none of which this unit's own
+                            call-graph builder can safely reason about).
+                            PHOpt.PAS's own deferred call-graph analysis
+                            (built once, after CheckPendingCalls has
+                            resolved every pending call site, per
+                            SPHO.PAS's own RunBody) uses this to compute
+                            each internal procedure's own real "output
+                            demand" -- which of AX/DX/flags some ACTUAL
+                            caller reads after the call returns -- so
+                            ComputeLiveness/LocalDeadAfter's own RETN
+                            handling no longer has to assume every
+                            return is observed in full, the way it
+                            unconditionally did before this field
+                            existed. Meaningless (left 0, harmlessly)
+                            for every operation this field was never
+                            explicitly set for, same convention as
+                            genSaveId above. }
   end;
 
   POpChunk = ^TOpChunk;
@@ -230,6 +293,21 @@ begin
     MnJa:  MnemonicText := 'JA';  MnJbe: MnemonicText := 'JBE';
     MnJc:  MnemonicText := 'JC';  MnJnc: MnemonicText := 'JNC';
     MnJz:  MnemonicText := 'JZ';  MnJnz: MnemonicText := 'JNZ';
+    MnCld: MnemonicText := 'CLD'; MnStd: MnemonicText := 'STD';
+    MnSti: MnemonicText := 'STI'; MnCli: MnemonicText := 'CLI';
+    MnStc: MnemonicText := 'STC'; MnClc: MnemonicText := 'CLC';
+    MnLodsb: MnemonicText := 'LODSB'; MnLodsw: MnemonicText := 'LODSW';
+    MnStosb: MnemonicText := 'STOSB'; MnStosw: MnemonicText := 'STOSW';
+    MnRepStosb: MnemonicText := 'REP STOSB';
+    MnRepStosw: MnemonicText := 'REP STOSW';
+    MnMovsb: MnemonicText := 'MOVSB'; MnMovsw: MnemonicText := 'MOVSW';
+    MnRepMovsb: MnemonicText := 'REP MOVSB';
+    MnRepMovsw: MnemonicText := 'REP MOVSW';
+    MnAdc: MnemonicText := 'ADC'; MnSbb: MnemonicText := 'SBB';
+    MnRol: MnemonicText := 'ROL'; MnRor: MnemonicText := 'ROR';
+    MnRcl: MnemonicText := 'RCL'; MnRcr: MnemonicText := 'RCR';
+    MnInB: MnemonicText := 'IN'; MnInW: MnemonicText := 'IN';
+    MnOutB: MnemonicText := 'OUT'; MnOutW: MnemonicText := 'OUT';
     else MnemonicText := ''   { MnNop, or an out-of-range value --
                                   SerializeOne's own MnNop skip means
                                   this branch is never actually reached

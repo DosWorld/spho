@@ -1,6 +1,7 @@
 MODULE OUT;
 
 PROCEDURE Out_Char*(c : BYTE); NEAR;
+USES AX, CX, DX;
 BEGIN
   DL := c;
   AH := 2;
@@ -8,29 +9,27 @@ BEGIN
 END Out_Char;
 
 PROCEDURE Out_Ln*; NEAR;
+USES AX, CX, DX;
 BEGIN
   DL := 0DH; AH := 2; INT(21H);
   DL := 0AH; AH := 2; INT(21H)
 END Out_Ln;
 
 PROCEDURE Out_String*(buf : INTEGER); NEAR;
+USES AX, CX, DX;
 BEGIN
   SI := buf;
-  ASM
-  cld
-  lodsb
-  END;
+  SetDFlag(FALSE);
+  AL := LOADB();
   WHILE AL # 0 DO
     DL := AL;
     AH := 2; INT(21H);
-    ASM
-      lodsb
-    END;
+    AL := LOADB()
   END
 END Out_String;
 
 PROCEDURE Out_Word*(n : WORD); NEAR;
-USES DX;
+USES AX, BX, DX;
 BEGIN
   AX := n;
   DX := 0;
@@ -45,6 +44,7 @@ BEGIN
 END Out_Word;
 
 PROCEDURE Out_Int*(n : INTEGER); NEAR;
+USES AX;
 BEGIN
   AX := n;
   IF AX.INTEGER < 0 THEN

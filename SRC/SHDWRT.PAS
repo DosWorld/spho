@@ -102,11 +102,18 @@ begin
     Emits.Emit(shdEs, false, '')
   end;
 
-  { TYPE: only '*'-exported RECORDs this module declared (the only TYPE
-    shape DOCS/SPHINX.MD supports -- RecTypes.ParseBaseType's own
-    "aliasTy = TyRec" check is the only real TYPE-section form parsed
-    anywhere in this translator), fields in their own original
-    declaration order (TypeField's own 0-based fi). }
+  { TYPE: every '*'-exported TYPE declaration this module parsed --
+    either a real RECORD (TypeAliasTy = TyRec, fields in their own
+    original declaration order, TypeField's own 0-based fi) or a
+    scalar alias (PLAN.TXT S1.7: "Preserve aliases in generated
+    headers when exported" -- RecTypes.ParseTypeSection's own
+    non-RECORD branch, TypeAppend(nm, typ.ty), was already a real,
+    working TYPE shape before this fix; only THIS regeneration step
+    had never been taught about it, always assuming RECORD
+    unconditionally and printing a nonsense empty 'Handle = RECORD
+    END;' for a scalar alias like 'TYPE Handle = WORD;' instead of the
+    real 'Handle = WORD;' an importer actually needs to resolve the
+    same alias itself). }
   any := false;
   for i := 0 to SymTab.TypeCount - 1 do
     if SymTab.TypeIsExported(i) then any := true;
@@ -115,16 +122,21 @@ begin
     for i := 0 to SymTab.TypeCount - 1 do begin
       if not SymTab.TypeIsExported(i) then continue;
       SymTab.TypeName(i, nm);
-      Emits.Emit(shdEs, false, '  ' + nm + ' = RECORD');
-      nf := SymTab.TypeNFields(i);
-      for fi := 0 to nf - 1 do begin
-        SymTab.TypeField(i, fi, fnm, typ, cnt);
-        EmitFieldType(typ, cnt, tnm);
-        line := '    ' + fnm + ' : ' + tnm;
-        if fi < nf - 1 then line := line + ';';
-        Emits.Emit(shdEs, false, line)
-      end;
-      Emits.Emit(shdEs, false, '  END;')
+      if SymTab.TypeAliasTy(i) <> TyRec then begin
+        TySphinxName(SymTab.TypeAliasTy(i), tnm);
+        Emits.Emit(shdEs, false, '  ' + nm + ' = ' + tnm + ';')
+      end else begin
+        Emits.Emit(shdEs, false, '  ' + nm + ' = RECORD');
+        nf := SymTab.TypeNFields(i);
+        for fi := 0 to nf - 1 do begin
+          SymTab.TypeField(i, fi, fnm, typ, cnt);
+          EmitFieldType(typ, cnt, tnm);
+          line := '    ' + fnm + ' : ' + tnm;
+          if fi < nf - 1 then line := line + ';';
+          Emits.Emit(shdEs, false, line)
+        end;
+        Emits.Emit(shdEs, false, '  END;')
+      end
     end;
     Emits.Emit(shdEs, false, '')
   end;

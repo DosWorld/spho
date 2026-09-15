@@ -126,10 +126,23 @@ procedure ReportError(const msg: string);
 
 { ---------------- low-level scanning ---------------- }
 
-{ IsIdentStart/IsIdentCh/SkipBlanks/ParseNumText/ParseHexDigits/
-  ParseNumBuf are internal to RawNext/ReadAsmLine's own scanning -- no
-  caller outside this unit needs them, so they stay implementation-only
-  rather than padding the interface. }
+{ IsIdentStart/IsIdentCh/SkipBlanks/ParseNumText/ParseHexDigits are
+  internal to RawNext/ReadAsmLine's own scanning -- no caller outside
+  this unit needs them, so they stay implementation-only rather than
+  padding the interface.
+
+  ParseNumBuf, below, is the one exception: OPT.TXT's own R5 finding --
+  PHOPT.PAS's own C2 (CollapseByteConstScaffolding) needs to parse a
+  numeric literal operand's own already-gathered text (decimal, C-style
+  "0x1A" hex prefix, trailing "1Ah"/"1AH" hex suffix, trailing "101b"
+  binary suffix) the SAME way this scanner itself already does at parse
+  time -- OperandText (SRC/SPHO.PAS) emits a literal operand as its own
+  VERBATIM source text, not a normalized decimal re-spelling, so a
+  hex-suffixed "41H" reaches PHOPT.PAS's own matchers exactly as
+  written. Reusing this unit's own existing parser (rather than a
+  second, independently-maintained one in PHOPT.PAS) is the "shared
+  numeric parser" OPT.TXT's own R5 resolution asks for. }
+function ParseNumBuf(const buf: string; len: integer; var v: longint; var errMsg: string): boolean;
 
 procedure SkipAsmLead;
 procedure ReadAsmLine(var buf, firstWord: string; var atEnd: boolean);
@@ -525,7 +538,7 @@ end;
 { RawNext: fetch the next token's raw text/kind/value. }
 procedure RawNext;
   var i, j: integer; q: char; msg: string; buf, buf2: string;
-      savedMark: TScanMark;
+      savedMark: TScanMark; overLong: boolean;
 begin
   SkipBlanks;
   tokText := ''; tokVal := 0;
@@ -541,6 +554,25 @@ begin
   if IsIdentStart(ch) then begin
     i := 0; buf := '';
     while IsIdentCh(ch) and (i < MaxTok-1) do begin buf := buf + ch; Inc(i); NextCh end;
+    if IsIdentCh(ch) then begin
+      { Identifier continues past MaxTok-1 chars -- PLAN.TXT S1.1:
+        report cleanly instead of silently truncating buf AND leaving
+        the remaining characters sitting in the source to be re-scanned
+        as a bogus SEPARATE token next call (confirmed the hard way: a
+        70-char identifier used to silently become a 63-char TIdent
+        immediately followed by a spurious 7-char TIdent, desyncing the
+        whole parse into a cascade of confusing "expected ..." errors
+        with no indication the real problem was an oversized name at
+        all). Still consume the rest of the run here (not just report)
+        so the scanner's own position lands cleanly past the WHOLE
+        identifier, exactly where it would sit had this token simply
+        been accepted whole -- the one call site that already needs
+        this same "scanner overflow, not a destination-range check"
+        separation PLAN.TXT S1.1 asks for. }
+      msg := 'identifier exceeds ' + Util.IntStr(longint(MaxTok - 1)) + ' characters: ' + buf + '...';
+      ReportError(msg);
+      while IsIdentCh(ch) do NextCh
+    end;
     tokText := buf; tokKind := TIdent;
     { TRegPair fast path: buf is a register name, immediately (no
       whitespace/comment -- ch is checked raw, not via SkipBlanks)
@@ -587,6 +619,22 @@ begin
           and (i < MaxTok-1) do begin
       buf := buf + ch; Inc(i); NextCh
     end;
+    if (Upcase(ch) in ['0'..'9','A'..'F']) or (ch = 'H') or (ch = 'h') or (ch = 'x') or (ch = 'X') then begin
+      { Numeric literal continues past MaxTok-1 chars -- same "scanner
+        overflow, not a destination-range check" separation as the
+        identifier case just above (PLAN.TXT S1.1) -- ParseNumBuf's own
+        length checks (decimal >10 digits, hex >8, etc, "literal too
+        large") only ever see buf AFTER this truncation already
+        happened, so a literal long enough to hit BOTH problems at once
+        used to report a real "too large" diagnostic immediately
+        followed by a spurious desync (the leftover, unconsumed tail
+        re-scanned as its own bogus token) instead of just the one
+        clean error. Still consume the rest of the run so the scanner's
+        own position lands cleanly past the whole literal. }
+      msg := 'numeric literal exceeds ' + Util.IntStr(longint(MaxTok - 1)) + ' characters: ' + buf + '...';
+      ReportError(msg);
+      while (Upcase(ch) in ['0'..'9','A'..'F']) or (ch = 'H') or (ch = 'h') or (ch = 'x') or (ch = 'X') do NextCh
+    end;
     tokText := buf; tokKind := TNum;
     tokVal := ParseNumText(tokText)
   end else if (ch = '"') or (ch = '''') then begin
@@ -604,18 +652,33 @@ begin
       the two source characters '\' and 'n'. This applies to BOTH "..."
       and '...' (a '...' char literal is exactly one character, but
       that character may itself be spelled as an escape, e.g. '\t'). }
-    q := ch; NextCh; i := 0; buf := '';
+    q := ch; NextCh; i := 0; buf := ''; overLong := false;
     while (ch <> q) and (ch <> #0) do begin
       if ch = '\' then begin
         NextCh;
         if i < MaxStrLit-1 then begin buf := buf + ScanEscape; Inc(i) end
-        else ScanEscape   { buffer full: call only to consume the escape's own characters, result discarded }
+        else begin
+          ScanEscape;   { buffer full: consume the escape, discard its result }
+          overLong := true
+        end
       end else begin
-        if i < MaxStrLit-1 then begin buf := buf + ch; Inc(i) end;
+        if i < MaxStrLit-1 then begin buf := buf + ch; Inc(i) end
+        else overLong := true;
         NextCh
       end
     end;
     if ch = q then NextCh;
+    if overLong then begin
+      { String literal exceeds MaxStrLit-1 decoded bytes -- PLAN.TXT
+        S1.1: report cleanly instead of silently keeping only the
+        first MaxStrLit-1 bytes with no indication anything was lost.
+        No desync risk here unlike the identifier/numeric cases above
+        (the scan loop already consumes all the way to the closing
+        quote regardless of overLong), so this is purely the missing
+        diagnostic, not a scanner-position fix. }
+      msg := 'string literal exceeds ' + Util.IntStr(longint(MaxStrLit - 1)) + ' decoded bytes';
+      ReportError(msg)
+    end;
     tokText := buf;
     if q = '"' then
       tokKind := TStr

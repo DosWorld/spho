@@ -113,6 +113,13 @@ const
   TyByte = SymTab.TyByte; TyBool = SymTab.TyBool; TyWord = SymTab.TyWord;
   TyInt = SymTab.TyInt; TyLong = SymTab.TyLong; TyRec = SymTab.TyRec;
   TIdent = Scan.TIdent;
+  { MaxArrayLit: the largest byte count PLAN.TXT S1.4's own overflow
+    check accepts for a RECORD field's own array-typed member --
+    same value/reasoning as SPHO.PAS's own MaxArrayLit and GlobVar's
+    own duplicate of it (a fixed translator-wide real-mode-segment
+    limit, not caller-configurable, so duplicating the literal here
+    is simpler than a new cross-unit dependency just for one constant). }
+  MaxArrayLit = 65535;
 
 function TySize(typ: SymTab.TTypeInfo): integer;
   var i, sum, fsz: integer; fnm: string; ftyp: SymTab.TTypeInfo; fcnt: word;
@@ -218,7 +225,7 @@ procedure ParseRecordType(const nm: string; exported: boolean;
                            sectStruc: integer;
                            emit1: TEmit1; emit2: TEmit2; ensureSect: TEnsureSection;
                            parseArrayBound: TParseArrayBound);
-  var ti, elemSz, fsz, ofs: integer; typ: SymTab.TTypeInfo; cnt: word; fieldName: string;
+  var ti, elemSz, ofs: integer; fsz: longint; typ: SymTab.TTypeInfo; cnt: word; fieldName: string;
       buf, sfx: string; more: boolean;
 begin
   ti := SymTab.TypeAppend(nm, TyRec);
@@ -237,7 +244,20 @@ begin
     end;
     SymTab.TypeAddField(ti, fieldName, typ, cnt);
     elemSz := TySize(typ);
-    fsz := elemSz * integer(cnt);
+    { PLAN.TXT S1.4: fsz is a genuine longint product (elemSz, up to
+      TySize's own LONGINT=4, times cnt, up to ParseArrayBound's own
+      32767 cap) -- checked against MaxArrayLit (the field's own byte
+      count alone; ofs, the running struc-wide total, isn't separately
+      re-checked here, since TASM.EXE's own struc assembly already
+      fails loudly on a genuinely oversized offset -- this check's own
+      job is only to stop fsz itself from silently wrapping the way
+      "elemSz * integer(cnt)" used to before ofs ever saw it). }
+    fsz := longint(elemSz) * longint(cnt);
+    if fsz > MaxArrayLit then begin
+      Scan.ReportError('array field exceeds ' + IntStr(longint(MaxArrayLit))
+        + ' bytes: ' + fieldName + ' (' + IntStr(fsz) + ' bytes)');
+      fsz := elemSz
+    end;
     if (elemSz >= 2) and (Odd(ofs)) then begin
       { TASM's struc requires every member line to have its own label
         (a bare unlabeled 'resb 1', legal in .bss, is rejected inside

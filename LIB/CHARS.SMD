@@ -1,0 +1,52 @@
+MODULE CHARS;
+
+PROCEDURE IsDigit*(AL) : BOOLEAN; NEAR;
+BEGIN
+  DEC(AL, 30H);
+  ASM
+    CMP AL, 0AH
+  END;
+  SUBBorrow(AX, AX);
+  ASM
+    NEG AX
+  END
+END IsDigit;
+
+PROCEDURE IsAlpha*(AL) : BOOLEAN; NEAR;
+BEGIN
+  ASM
+    OR AL, 20H
+    SUB AL, 61H
+    CMP AL, 1AH
+  END;
+  SUBBorrow(AX, AX);
+  ASM
+    NEG AX
+  END
+END IsAlpha;
+
+PROCEDURE UCase*(AL): CHAR; NEAR;
+BEGIN
+  ASM
+    CMP AL, 61H
+    JB  .done
+    CMP AL, 7AH
+    JA  .done
+    SUB AL, 20H
+    .done:
+  END
+END UCase;
+
+PROCEDURE LCase*(AL): CHAR; NEAR;
+BEGIN
+  ASM
+    CMP AL, 41H
+    JB  .done
+    CMP AL, 5AH
+    JA  .done
+    ADD AL, 20H
+    .done:
+  END
+END LCase;
+
+END CHARS.

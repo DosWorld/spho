@@ -280,10 +280,8 @@ BEGIN
       CX := keep;
       PUSH(DS);
       POP(ES);
-      ASM
-        cld
-        rep movsb
-      END;
+      SetDFlag(FALSE);
+      COPYB(TRUE);
       bufFill := keep;
       pos := WindowSize;
       ShiftChains(shiftBy, keep)

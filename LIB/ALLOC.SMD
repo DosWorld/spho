@@ -1,0 +1,249 @@
+MODULE ALLOC;
+
+
+CONST
+  StatusFree = 0;
+  StatusBusy = 1;
+
+TYPE
+  MemHeader = RECORD
+    Prev  : WORD;
+    Next  : WORD;
+    Size  : WORD;
+    State : WORD
+  END;
+
+VAR
+  MemStartSeg : WORD;
+
+(* HeaderInit: build the single free block covering a just-acquired DOS
+   memory block. blockSeg = paragraph segment of the block's first byte
+   (its own MEMHEADER occupies that paragraph); blockParas = the block's
+   total size in paragraphs, header included. Shared by MemInit's own
+   two DOS-allocation call sites (the deliberately-oversized probe alloc
+   and the real, clamped one) -- SYSTEM.ASM's MEM_INIT body, including
+   its "reject a block under 16 paragraphs" guard: without it, a
+   degenerate blockParas (e.g. 0, reachable if a caller passes
+   minPara=maxPara=0 to MemInit) would underflow Size := blockParas-1
+   to 0xFFFF, making the free list believe it owns a block that was
+   never actually allocated from DOS. *)
+PROCEDURE HeaderInit(blockSeg, blockParas : INTEGER); NEAR;
+BEGIN
+  IF blockParas < 16 THEN RETURN END;
+  MemStartSeg := blockSeg;
+  ES := blockSeg;
+  BX := 0;
+  [ES:BX].MemHeader.Prev := 0;
+  [ES:BX].MemHeader.Next := 0;
+  [ES:BX].MemHeader.Size := blockParas - 1;
+  [ES:BX].MemHeader.State := StatusFree
+END HeaderInit;
+
+(* MemInit: full SYSTEM_INIT sequence (minus the DPMI/i87/PSP/exit-proc
+   pieces SYSTEM.ASM's common_init handles, out of scope for this heap-
+   only port) -- probe how much free DOS conventional memory exists
+   (INT 21h/AH=48h with an impossible BX=0FFFFh request always fails,
+   returning the true largest-free-block size in BX), reject if that is
+   below minPara, clamp it to maxPara, allocate exactly that many
+   paragraphs for real, and hand the resulting block to HeaderInit.
+   minPara/maxPara mirror the $M stack,min,max directive's own AX/BX
+   call-in convention (DOCS/BUILD.MD, TOCMAIN.MOD's GenEntryStub).
+   Returns TRUE on success, FALSE if free memory < minPara (caller
+   should treat FALSE as fatal -- SYSTEM.ASM's own ErrWithMsg("Not
+   enough memory.$") path). *)
+PROCEDURE MemInit*(minPara, maxPara : INTEGER) : BOOLEAN; NEAR;
+VAR free : INTEGER; want : INTEGER; got : INTEGER;
+BEGIN
+  AX := 4800H;
+  BX := 0FFFFH;
+  INT(21H);
+  free := BX;
+  (* Paragraph counts (0..65535) are UNSIGNED, but SPHO's relational
+     codegen (RelJumps) has no unsigned comparison mode -- a plain
+     '<' emits a signed Jcc, which misreads free counts above 32767
+     paragraphs (>512KB free, a common case) as negative. SYSTEM.ASM's
+     own SYSTEM_INIT uses unsigned cmp/jae for this exact check; done
+     here via an explicit ASM cmp (register operands only -- an ASM
+     block is copied verbatim, so it cannot reference an Oberon local's
+     [bp+N] frame slot by name) + CFLAG test (CFLAG is JC/JNC,
+     SPHINX.MD §7.5 -- unsigned '<' is exactly "carry set"). A same-line
+     'ASM stmt END' is unsafe: ParseAsm looks for a line whose FIRST
+     word is 'END', so the block must occupy its own line(s), same as
+     every other ASM use in this codebase (see EXAMPLES/SPHO/FILES.SMD). *)
+  AX := free;
+  BX := minPara;
+  ASM
+    cmp ax, bx
+  END;
+  IF CFLAG THEN RETURN FALSE END;
+  want := maxPara;
+  AX := free;
+  BX := maxPara;
+  ASM
+    cmp ax, bx
+  END;
+  IF CFLAG THEN want := free END;
+  IF want < 16 THEN RETURN FALSE END;
+  AH := 48H;
+  BX := want;
+  INT(21H);
+  IF CFLAG THEN RETURN FALSE END;
+  got := AX;
+  HeaderInit(got, want);
+  RETURN TRUE
+END MemInit;
+
+(* MemDone: release the whole DOS memory block MemInit acquired, back to
+   DOS -- SYSTEM.ASM's dos_done (INT 21h/AH=49h, ES=the block's own
+   segment). Must be the last heap operation; nothing may call
+   MemAlloc/MemFree/MemAvail after this. *)
+PROCEDURE MemDone*; NEAR;
+BEGIN
+  ES := MemStartSeg;
+  AH := 49H;
+  INT(21H)
+END MemDone;
+
+(* MemAlloc: allocate sizeBytes of payload. Returns the payload segment
+   (offset 0), or 0 on failure -- same paragraphs-rounded-up split/
+   take-whole free-list walk as SYSTEM.ASM's SYSTEM_Alloc, minus the DPMI
+   branch. *)
+PROCEDURE GetMem*(sizeBytes : INTEGER) : INTEGER; NEAR;
+VAR need : INTEGER; cur : INTEGER; rem : INTEGER; newSeg : INTEGER; nextSeg : INTEGER; needPlus1 : INTEGER;
+BEGIN
+  need := sizeBytes + 15;
+  ASM
+    shr ax, 1
+    shr ax, 1
+    shr ax, 1
+    shr ax, 1
+  END;
+  need := AX;
+  IF need = 0 THEN RETURN 0 END;
+  needPlus1 := need + 1;
+
+  cur := MemStartSeg;
+  WHILE cur # 0 DO
+    ES := cur;
+    BX := 0;
+    (* SPHO's IF condition is a single 'a REL b' test (DOCS/SPHO.MD's own
+       "Known simplifications" -- no '&'/'OR' composition in a
+       condition), so the two-part "free AND big enough" test is two
+       nested IFs instead of one parenthesized '&' expression. *)
+    IF [ES:BX].MemHeader.State = StatusFree THEN
+    IF [ES:BX].MemHeader.Size >= need THEN
+      rem := [ES:BX].MemHeader.Size;
+      IF rem >= needPlus1 THEN
+        (* split: allocated block stays at cur, free remainder starts
+           right after the payload paragraphs just carved off *)
+        rem := rem - need - 1;
+        newSeg := cur + 1 + need;
+        nextSeg := [ES:BX].MemHeader.Next;
+
+        [ES:BX].MemHeader.State := StatusBusy;
+        [ES:BX].MemHeader.Size := need;
+        [ES:BX].MemHeader.Next := newSeg;
+
+        ES := newSeg;
+        BX := 0;
+        [ES:BX].MemHeader.State := StatusFree;
+        [ES:BX].MemHeader.Size := rem;
+        [ES:BX].MemHeader.Prev := cur;
+        [ES:BX].MemHeader.Next := nextSeg;
+
+        IF nextSeg # 0 THEN
+          ES := nextSeg;
+          BX := 0;
+          [ES:BX].MemHeader.Prev := newSeg
+        END
+      ELSE
+        (* take the whole block, no remainder worth splitting off.
+           ES:BX already hold cur:0 from the scan above -- nothing
+           since then wrote them. *)
+        [ES:BX].MemHeader.State := StatusBusy
+      END;
+      RETURN cur + 1
+    END
+    END;
+    (* ES:BX already hold cur:0 here too when the size/free test just
+       above didn't match (the nested IFs above only ever read through
+       [ES:BX], never reassign it) -- no reload needed. *)
+    cur := [ES:BX].MemHeader.Next
+  END;
+  RETURN 0
+END MemAlloc;
+
+(* MemFreeMerge: absorb the next neighbour blkSeg into hostSeg only
+   when both segments are non-zero and both blocks are free. FreeMem
+   obtains this adjacent pair from the list's Next/Prev links. *)
+PROCEDURE MemFreeMerge(hostSeg, blkSeg : INTEGER) : BOOLEAN; NEAR;
+VAR blkSize : INTEGER; blkNext : INTEGER;
+BEGIN
+  IF hostSeg = 0 THEN RETURN FALSE END;
+  IF blkSeg = 0 THEN RETURN FALSE END;
+
+  ES := hostSeg;
+  BX := 0;
+
+  IF [ES:BX].MemHeader.State # StatusFree THEN RETURN FALSE END;
+  ES := blkSeg;
+  BX := 0;
+  IF [ES:BX].MemHeader.State # StatusFree THEN RETURN FALSE END;
+  blkSize := [ES:BX].MemHeader.Size;
+  blkNext := [ES:BX].MemHeader.Next;
+
+  ES := hostSeg;
+  BX := 0;
+  [ES:BX].MemHeader.Size := [ES:BX].MemHeader.Size + blkSize + 1;
+  [ES:BX].MemHeader.Next := blkNext;
+
+  IF blkNext # 0 THEN
+    ES := blkNext;
+    BX := 0;
+    [ES:BX].MemHeader.Prev := hostSeg
+  END;
+  RETURN TRUE
+END MemFreeMerge;
+
+(* MemFree: release a block previously returned by MemAlloc (its payload
+   segment, ptrSeg) and merge with a free neighbour on either side.
+   ptrSeg = 0 is accepted as a no-op (mirrors SYSTEM_Free's NIL check). *)
+PROCEDURE FreeMem*(ptrSeg : INTEGER); NEAR;
+VAR blkSeg, nextSeg, prevSeg : WORD;
+BEGIN
+  IF ptrSeg = 0 THEN RETURN END;
+  blkSeg := ptrSeg - 1;
+  ES := blkSeg;
+  BX := 0;
+  IF [ES:BX].MemHeader.State = StatusFree THEN RETURN END;
+  [ES:BX].MemHeader.State := StatusFree;
+
+  ES := blkSeg;
+  BX := 0;
+  nextSeg := [ES:BX].MemHeader.Next;
+  MemFreeMerge(blkSeg, nextSeg);
+
+  ES := blkSeg;
+  BX := 0;
+  prevSeg := [ES:BX].MemHeader.Prev;
+  MemFreeMerge(prevSeg, blkSeg)
+END MemFree;
+
+(* MemAvail: total free paragraphs across the whole free list -- same
+   walk-and-sum as SYSTEM_MemAvail's real-mode path. *)
+PROCEDURE MemAvail*() : INTEGER; NEAR;
+BEGIN
+  DX := 0;
+  AX := MemStartSeg;
+  WHILE AX # 0 DO
+    ES := AX;
+    BX := 0;
+    IF [ES:BX].MemHeader.State = StatusFree THEN
+      INC(DX, [ES:BX].MemHeader.Size)
+    END;
+    AX := [ES:BX].MemHeader.Next
+  END;
+  RETURN DX
+END MemAvail;
+
+END ALLOC.
