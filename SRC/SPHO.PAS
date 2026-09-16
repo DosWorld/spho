@@ -497,6 +497,20 @@ begin
                              or SymTab.ProcIsAddressTaken(i)
   end;
   PHOpt.BuildCallGraph(nProcs, nRanges, optRanges, optConservative);
+  { OPT.TXT's own R13 finding, "Stage G": InlineVoidCalls, the first
+    real inlining RULE, must run ONCE, module-wide, here -- AFTER
+    BuildCallGraph (its own eligibility proof, IsSafeInlineCandidate,
+    is built by BuildInlineSafety just below, which reuses the SAME
+    ranges/optConservative BuildCallGraph itself just consumed) and
+    BEFORE the per-range PHOpt.Optimize loop below, so an inlined
+    clone's own freshly-spliced operations still receive every normal
+    Stage A-F pass, exactly like the original source they were copied
+    from already does. See PHOPT.PAS's own InlineVoidCalls header
+    comment for the full scope/restrictions of this first, deliberately
+    narrow slice (DOCS/SPHO.MD/DOCS/TRBUG.MD/OPT.TXT's own R13 entry
+    all have the full story). }
+  PHOpt.BuildInlineSafety(nProcs, nRanges, optRanges, optConservative);
+  PHOpt.InlineVoidCalls(nProcs, nRanges, optRanges, optConservative);
   rc := comp.optRangeHead;
   while rc <> nil do begin
     for k := 1 to rc^.count do

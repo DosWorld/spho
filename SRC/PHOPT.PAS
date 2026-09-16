@@ -1165,6 +1165,492 @@ procedure BuildCallGraph(nProcs: integer; nRanges: integer;
   (Error 34: Invalid function result type). }
 procedure DemandFor(procId: integer; var d: TProcDemand);
 
+{ BuildInlineSafety: OPT.TXT's own R13 finding ("Stage G: retained
+  bodies, inlining and specialization"), the SECOND piece of missing
+  infrastructure that finding's own STATUS text names -- "Select
+  nonrecursive direct internal callees with known effects; reject
+  opaque assembly/unsupported entry paths." This is NOT the inlining
+  rule itself (no operation is ever cloned or inserted here -- that is
+  InsertOpAfter's own, already-built, still-unused-by-any-rule job);
+  this is purely the PROOF a future inlining rule will need before it
+  may ever consider cloning some procedure P into a call site at all.
+
+  For every same-module procedure appearing in `ranges` (the same
+  flattened, module-wide array BuildCallGraph itself already consumes
+  -- SPHO.PAS's own OptimizeAllDeferred builds it once, from
+  comp.optRangeHead, after CheckPendingCalls has resolved every
+  pending call site), proves ALL of:
+
+  1. "reject opaque assembly" -- P's own body contains no raw ASM
+     (Types.TOpAsm) anywhere in its own range. Cloning could copy the
+     raw text verbatim (R13's own resolution text explicitly forbids
+     exactly that: "No copying serialized ASM strings"), and this
+     analysis has no way to reason about what an opaque ASM block
+     itself reads/writes/calls, so a procedure containing one can never
+     be proven safe to inline, regardless of anything else about it.
+  2. "reject... unsupported entry paths" -- every CALL/CALL FAR inside
+     P's own body is itself a proven direct, same-module call
+     (Types.TOperation's own callProcId <> 0, the exact same proof
+     BuildCallGraph itself already relies on) -- an indirect call
+     (through a register/memory operand) or a call to something
+     EXTERNAL/exported/address-taken (isConservative[callee], the same
+     parallel array BuildCallGraph takes) makes P's own call subtree
+     impossible to fully account for, so P itself cannot be proven
+     safe either.
+  3. "nonrecursive" -- P is not reachable from itself by following
+     zero or more proven-direct CALL edges (a direct self-call P->P,
+     or an indirect cycle P->Q->...->P) -- classic graph cycle
+     detection over the same call-edge adjacency built while proving
+     (2) above, since a recursive callee has no fixed, finite clone
+     size a future inlining rule could ever budget for.
+  4. P itself is not marked isConservative (external/exported/
+     address-taken) -- an exported or address-taken procedure may be
+     called from entirely outside this pass's own visibility (another
+     module's own IMPORT, or an indirect call this analysis cannot
+     trace), so even a P that would otherwise pass (1)-(3) can still
+     never be proven fully accounted-for as an inlining CANDIDATE
+     itself (it remains a perfectly fine, safely-callable CALLEE for
+     someone else's own (2) proof, exactly as BuildCallGraph's own
+     isConservative already treats it for demand purposes -- this is a
+     narrower, ADDITIONAL restriction on which procedures may
+     themselves be CLONED, not a change to what counts as a safe call
+     target).
+
+  Called separately from, and does not depend on, BuildCallGraph/
+  DemandFor -- a future inlining rule needs both (DemandFor for what a
+  clone's own trailing register/flag effects must preserve;
+  IsSafeInlineCandidate for whether cloning is even permissible in the
+  first place), but neither analysis reads the other's own result, so
+  either may run first, independently, and this one may be skipped
+  entirely by any caller that never intends to inline anything. }
+procedure BuildInlineSafety(nProcs: integer; nRanges: integer;
+                             const ranges: array of TProcRange;
+                             const isConservative: array of boolean);
+
+{ IsSafeInlineCandidate: the one query BuildInlineSafety's own result
+  exists to answer -- TRUE only if procId was proven safe per ALL FOUR
+  conditions in BuildInlineSafety's own header comment above. FALSE
+  (the conservative default, "never safe to inline") if
+  BuildInlineSafety was never called at all this run, or procId is out
+  of range/was never analyzed -- the same "unanalyzed means fully
+  conservative" convention DemandFor's own known=FALSE default already
+  establishes. }
+function IsSafeInlineCandidate(procId: integer): boolean;
+
+{ CloneOpRange: OPT.TXT's own R13 finding, the THIRD piece of missing
+  infrastructure -- "Clone operations with fresh labels and remapped
+  frames" (the label half; frame remapping -- BP-relative parameter/
+  local operand text -- is a separate, still-unbuilt piece, see this
+  procedure's own "NOT done here" paragraph below) and "label
+  uniqueness" (R13's own Acceptance text, named explicitly).
+
+  A real, previously-undocumented hazard this primitive exists to fix:
+  SPHO.PAS's own label counter (ctx.labelCnt) resets to 0 at the START
+  of every PROCEDURE (ParseProcedure), and ".L<N>" is NASM's own LOCAL-
+  label syntax (a leading dot scopes a label to the nearest enclosing
+  non-local label, i.e. the enclosing procedure's own entry label) --
+  so label ids are only unique WITHIN one procedure's own body BY
+  CONSTRUCTION, never across the whole module. Splicing procedure P's
+  own operations into a call site inside a DIFFERENT procedure Q
+  (InsertOpAfter's own job, already built) without renaming P's own
+  labels first would place them inside Q's own NASM local-label scope,
+  where a P-defined ".L3" could collide with a pre-existing Q-defined
+  ".L3", or with a label from some EARLIER clone already spliced into
+  the same call site.
+
+  Copies [startChunk,startSlot..endChunk,endSlot] operation-by-operation
+  (via InsertOpAfter, one splice per source operation, immediately
+  after `afterC,afterK`, in original left-to-right order -- matching
+  R13's own resolution text, "evaluate arguments once in original
+  left-to-right order," here applied to the clone's own instruction
+  order generally, not specifically argument evaluation, which is a
+  separate future piece). Two independent renamings, both via a
+  caller-supplied fresh-id scheme (PHOPT.PAS cannot call SPHO.PAS's
+  own NewLabel/nextGenSaveId counters -- SPHO.PAS uses PHOpt, never the
+  reverse, kept that way deliberately, see this unit's own header
+  comment on staying isolated from Types/StrTab/Util/Regs86/Scan):
+
+  1. Every TOpLabel operation's own labelId, and every jump/Jcc
+     operand TEXT that exactly matches one (a plain text-substitution
+     table built from a first pass over the source range collecting
+     every locally-DEFINED label name -- never parsed as ".L<N>", so
+     this works regardless of SPHO.PAS's own exact label-name spelling
+     convention) -- renamed to ".LC<cloneId>_<n>", n counting up from 1
+     in the order each distinct label was first discovered. cloneId is
+     the caller's own responsibility to make unique per clone
+     operation (never reused) -- the same "caller mints a fresh id,
+     this unit only consumes it" contract EmitGenSavePush's own
+     genSaveId already establishes on the SPHO.PAS side, mirrored here.
+     A jump/Jcc operand that does NOT match anything in the source
+     range's own label table (a jump to a label OUTSIDE the cloned
+     range -- should not occur in a well-formed single-procedure range,
+     since this dialect's own jumps are always local-label-scoped, but
+     not assumed impossible here) is left completely unchanged, copied
+     verbatim -- this primitive never invents or rejects an out-of-range
+     jump target, it only ever renames what it can PROVE is locally
+     defined within the very range being cloned.
+  2. Every nonzero genSaveId (Stage C's own compiler-owned PUSH/POP
+     pairing tag, Types.TOperation's own field) is likewise remapped,
+     via a SEPARATE numbering axis from labels (genSaveIdBase, the
+     caller's own next-available id, incremented once per DISTINCT
+     source genSaveId found, not once per operation -- a PUSH/POP
+     pair shares one id, and must still share the SAME new id after
+     remapping, or Stage C's own genSaveId-matching rules could never
+     recognize the clone's own pair as a real compiler-owned save at
+     all). Copying a nonzero genSaveId UNCHANGED would create a real
+     hazard: the ORIGINAL procedure still has its own copy of that same
+     id elsewhere, so a later Stage C rule scanning a region spanning
+     both the clone and a stale reference to the original could pair
+     the clone's own PUSH with the original's own POP (same numeric
+     id, two unrelated physical operations) -- exactly the kind of
+     silent mismatched-pair corruption this whole "generated-save-pair
+     identity" mechanism exists to prevent in the first place.
+
+  NOT done here -- explicitly out of scope for this primitive, future
+  pieces of R13 in their own right:
+  - "remapped frames": a clone's own frame-relative operand text
+    (locals/parameters at some [bp-N]/[bp+N] offset, or PLAIN operand
+    text referencing a caller-supplied name that must become the
+    ARGUMENT actually passed at this call site) is copied VERBATIM,
+    completely unexamined -- this primitive has no notion of a
+    procedure's own frame layout at all (PHOPT.PAS stays isolated from
+    SymTab, which owns that), so a caller must not yet use this on any
+    range containing such operands without its own additional
+    frame-remapping pass first (not built).
+  - argument binding ("evaluate arguments once...") and the actual
+    decision of WHERE/WHEN to call this (a real inlining rule) are
+    both still entirely unbuilt -- this primitive is purely "given a
+    source range and an insertion point, produce a correctly
+    label/genSaveId-clean copy there," nothing about WHETHER cloning
+    this particular call site is a good idea at all (that is
+    IsSafeInlineCandidate's own, already-built, separate job).
+  - preserving "returned register/flag effects" is unaffected by this
+    primitive either way (it copies operations verbatim aside from the
+    two renamings above, so whatever effects the source range already
+    has are preserved automatically by not touching anything else) --
+    listed here only so a future caller does not mistake THIS
+    primitive's own silence on the topic for having verified it.
+
+  firstC/firstK: the CLONE's own first inserted operation's own final
+  position -- added for OPT.TXT's own R13 inlining rule (InlineVoidCalls,
+  below), which needs to scope RemapFrameOperands to EXACTLY the
+  freshly-inserted range, never anything before it (the original CALL
+  itself is not part of the clone and must never be frame-remapped).
+  Captured directly from the SAME first InsertOpAfter call pass 2's
+  own loop already makes -- no separate lookup/re-derivation needed. }
+procedure CloneOpRange(startChunk: POpChunk; startSlot: integer;
+                        endChunk: POpChunk; endSlot: integer;
+                        afterC: POpChunk; afterK: integer;
+                        cloneId: word; genSaveIdBase: word;
+                        var firstC: POpChunk; var firstK: integer;
+                        var lastC: POpChunk; var lastK: integer);
+
+{ ValidateFrameOperands: a READ-ONLY twin of RemapFrameOperands' own
+  rejection test, below -- proves whether a range's own memory operands
+  would ALL survive RemapFrameOperands' own conservative-rejection
+  proof (every '[' ... ']' operand either not a memory reference at
+  all, or a PROVEN plain frame object, isFrameObject), WITHOUT writing
+  anything back and WITHOUT needing frameBase at all (irrelevant to
+  whether an operand PROVES as a frame object in the first place, only
+  to what its own new offset becomes once it already has).
+
+  Exists to fix a real, previously-latent correctness bug found via
+  code review (DOCS/TRBUG.MD's own dedicated entry has the full story):
+  InlineVoidCalls used to NOP the original CALL and splice the callee's
+  own body in via CloneOpRange BEFORE ever calling RemapFrameOperands
+  at all -- if RemapFrameOperands THEN failed (a genuinely reachable
+  case: IsSafeInlineCandidate never itself checks for an indexed/
+  computed memory operand like an array-element reference, arr[i],
+  DOCS/SPHINX.MD's own "Array element indexing"), the transformation
+  was left PERMANENTLY HALF-APPLIED -- the real CALL already destroyed,
+  an unremapped, wrong clone left spliced in its place. This primitive
+  lets a caller PROVE eligibility on the callee's own ORIGINAL,
+  not-yet-cloned body -- before NOP'ing anything or calling
+  CloneOpRange at all -- so a caller than only ever commits the whole
+  transformation once every later step is already guaranteed to
+  succeed, never partway. Call this BEFORE CloneOpRange/NOP'ing;
+  RemapFrameOperands itself is still the one that actually performs the
+  rewrite, on the CLONE's own already-spliced range, exactly as before
+  -- this primitive only ever answers "would it accept this," it never
+  substitutes for the real rewrite pass. }
+function ValidateFrameOperands(startChunk: POpChunk; startSlot: integer;
+                                endChunk: POpChunk; endSlot: integer): boolean;
+
+{ RemapFrameOperands: OPT.TXT's own R13 finding, the FOURTH piece of
+  missing infrastructure -- "remapped frames," the half of "Clone
+  operations with fresh labels and remapped frames" CloneOpRange's own
+  header comment explicitly left undone.
+
+  A clone's own frame-object operands (Types.TOperand's own
+  isFrameObject/frameOffset, DecodeOperand) -- a local/parameter at
+  some proven [BP-N]/[BP+N] in the SOURCE procedure's own frame -- mean
+  something ENTIRELY different once spliced into a DIFFERENT
+  procedure's own body: that destination procedure's own frame was
+  never allocated any space for the clone's own locals at all. This
+  primitive rewrites every proven frame-object operand's own offset by
+  adding frameBase (the destination's own CURRENT frame size, in
+  bytes, before this clone -- the caller's own responsibility to know,
+  e.g. by having tracked every GrowDestinationFrame call already made
+  for earlier clones at this same site), shifting the clone's own
+  locals down into fresh space below whatever the destination already
+  uses, never colliding with them. maxOffset comes back holding the
+  LARGEST resulting offset actually used across BOTH locals and
+  parameters (word, since a real frame offset is always small/positive
+  here -- MaxFrameProof=32767 is itself well within word range).
+  maxLocalOffset comes back holding the same, but counting ONLY
+  negative-offset ([BP-N]) frame objects -- a real, previously-latent
+  bug found via a full regression run (DOCS/TRBUG.MD's own dedicated
+  entry has the full story): GrowDestinationFrame, below, is documented
+  as growing ONLY the negative-offset SUB SP,N local region, never the
+  positive-offset ([BP+N]) parameter space (which needs no SUB SP,N
+  space at all -- it always sits above the return address, already real
+  regardless of frame size). A caller that fed the COMBINED maxOffset
+  to GrowDestinationFrame as its own destFrameSize (as an early draft
+  of InlineVoidCalls did) would grow SUB SP,N using a PARAMETER's own
+  offset, reserving real stack space no local variable actually needs
+  -- confirmed directly: a clone with only stack parameters and zero
+  locals (TESTS/STGM.PAS's own VoidArgs case) grew the caller's SUB
+  SP,N to the parameter's own remapped magnitude, not 0. A caller
+  driving GrowDestinationFrame must use maxLocalOffset, not maxOffset.
+
+  Only ever renames operands PROVEN isFrameObject (DecodeOperand's own
+  narrow, exact "BP, optionally one constant, nothing else" proof --
+  the same proof StoreForwarding/LoadModifyStore/
+  FoldSavedOperandSelfDest already trust for a DIFFERENT reason,
+  reused here unchanged). Returns FALSE (rejecting the WHOLE range,
+  remapping nothing) the moment any INDEXED or otherwise unproven
+  memory operand is found ('[BP+SI+2]', a computed address, anything
+  DecodeOperand cannot fully account for) -- this primitive has no way
+  to know whether an unproven address might ALSO be frame-relative in
+  some way it cannot see, so it never guesses; a caller must treat
+  FALSE as "this range cannot be safely frame-remapped at all," the
+  same conservative-rejection discipline BuildInlineSafety's own
+  four proof conditions already establish for a different question. A
+  PARAMETER passed on the stack (a proven frame object with a
+  POSITIVE offset, [BP+N] -- this dialect's own register/stack/mixed
+  parameter convention, README.MD S6) is remapped exactly the same
+  way as a negative-offset local; this primitive does not itself
+  distinguish the two, since both are equally "this clone's own
+  frame-relative storage that needs fresh, non-colliding space" from
+  its own point of view -- a future caller is responsible for actually
+  supplying the ARGUMENT values a parameter-shaped clone expects
+  (argument binding, still unbuilt, a separate R13 piece).
+
+  Only ever call this AFTER CloneOpRange has already spliced its own
+  copy in (startChunk/startSlot/endChunk/endSlot here name the CLONE's
+  own now-real position, not the original source range) -- remapping
+  the ORIGINAL source range's own operands in place would corrupt the
+  still-live original procedure. }
+function RemapFrameOperands(startChunk: POpChunk; startSlot: integer;
+                             endChunk: POpChunk; endSlot: integer;
+                             frameBase: word; var maxOffset: word;
+                             var maxLocalOffset: word): boolean;
+
+{ GrowDestinationFrame: the OTHER half RemapFrameOperands' own header
+  comment names -- makes newFrameSize bytes of frame space at
+  [BP-1..BP-newFrameSize] REAL in the destination procedure's own
+  prologue (SRC/SPHO.PAS's own ParseProcedure -- "PUSH BP; MOV BP,SP;
+  [SUB SP,N]" -- already emitted, fixed, by the time this analysis
+  ever runs; this primitive edits/extends that existing prologue, it
+  never re-derives one from scratch). destStartChunk/destStartSlot is
+  the DESTINATION procedure's own very first operation (its own
+  TProcRange.startChunk/startSlot, the same range BuildCallGraph/
+  BuildInlineSafety already take one per procedure).
+
+  Two supported shapes, found by scanning forward from the
+  destination's own start for its own prologue:
+  1. Already has "PUSH BP; MOV BP,SP; SUB SP,N" (a real, pre-existing
+     local frame) -- if newFrameSize > N, the existing SUB SP,N
+     operation's own op2 is rewritten in place to newFrameSize (a
+     larger frame; nothing SHRINKS a frame this primitive did not
+     itself just grow). Returns TRUE.
+  2. Already has "PUSH BP; MOV BP,SP" but NO following SUB SP,N (a
+     frame for STACK PARAMETERS only, no locals of its own yet, ctx.
+     frameOfs=0 at emission time) -- a fresh "SUB SP,newFrameSize"
+     operation is INSERTED (via InsertOpAfter, already built)
+     immediately after the MOV BP,SP. Returns TRUE.
+
+  Explicitly UNSUPPORTED, returns FALSE, remaps nothing: the
+  destination has NO frame at all (no PUSH BP/MOV BP,SP found -- SPHO.
+  PAS's own needsFrame was FALSE for it, meaning it also addresses its
+  own parameters/locals, if any, entirely differently, e.g. plain
+  register parameters with nothing stack-relative at all). Retrofitting
+  a genuinely NEW BP-based frame onto a procedure that never had one --
+  inserting PUSH BP/MOV BP,SP where NEITHER existed before, plus
+  proving every OTHER SP-relative reference already in that
+  procedure's own body still means the same thing afterward -- is a
+  fundamentally different, much larger transformation than extending
+  an EXISTING frame, and is NOT attempted by this primitive; a caller
+  must simply never choose such a destination as a clone site, the
+  same "this call site is out of scope, not incorrectly forced" stance
+  IsSafeInlineCandidate's own conservative-rejection convention already
+  establishes for callee selection. }
+function GrowDestinationFrame(destStartChunk: POpChunk; destStartSlot: integer;
+                               destEndChunk: POpChunk; destEndSlot: integer;
+                               newFrameSize: word): boolean;
+
+{ BindStackArgs: OPT.TXT's own R13 finding, the FIFTH piece of missing
+  infrastructure -- argument binding, the one remaining piece before a
+  real inlining rule could tie InsertOpAfter/IsSafeInlineCandidate/
+  CloneOpRange/RemapFrameOperands/GrowDestinationFrame together.
+
+  A key simplification found while designing this, avoiding a much
+  larger, riskier undertaking: SRC/SPHO.PAS's own EmitCall/
+  ExtractRegArg already leave EVERY argument sitting exactly where a
+  REAL call to the callee would read it from, right before the CALL
+  operation itself -- a REGISTER-named parameter's own value already
+  sits in that exact register (README.MD's own "a register-named
+  parameter has no address" -- it has no [BP+N] storage at all, the
+  callee's own body just reads the register directly by name), and
+  every STACK parameter's own value is a real word already PUSHed,
+  in the exact layout the callee's own [BP+N] reads already expect
+  ("[bp+4] = last pushed param (rightmost)", README.MD). This
+  primitive therefore does NOT need to recognize or re-derive
+  EmitCall's own argument-evaluation code at all (a call site's own
+  existing PUSH/ExtractRegArg sequence is left completely untouched,
+  neither read nor deleted) -- a REGISTER parameter needs NO glue
+  whatsoever (the clone's own body already references that same
+  register directly, CloneOpRange having copied its operand text
+  verbatim, unexamined, since it is not a frame object); only a STACK
+  parameter needs glue, copying its already-pushed value from its own
+  known SP-relative position (relative to the CALL site, BEFORE CALL
+  itself pushes a return address) into the clone's own remapped
+  [BP+N] frame slot.
+
+  callArgWords: the caller's own count of real STACK-pushed words
+  still on the stack immediately before CALL, in PUSH order (index 1
+  = first pushed = LEFTMOST argument = the HIGHEST resulting [BP+N] in
+  the callee; index callArgWords = last pushed = RIGHTMOST argument =
+  [BP+4], README.MD's own convention). A register-pair (LONGINT)
+  argument contributes TWO consecutive entries (its own high word
+  pushed first, low word second, EmitCall's own "AppendInstr1(MnPush,
+  'word '+hiWord); AppendInstr1(MnPush, 'word '+opnd)" order) --
+  callArgWords counts WORDS, not source-level arguments, matching
+  [BP+N]'s own byte-granular numbering directly (no separate width
+  table needed: N words means N*2 bytes of stack parameter space,
+  read back the same way the callee's own [BP+4],[BP+6],... reads
+  already would).
+
+  Inserts callArgWords "POP ax" / "MOV [BP+<destOff>],ax"-shaped pairs
+  (via InsertOpAfter, immediately after afterC/afterK -- typically
+  right where the CALL used to be, AFTER the clone's own operations
+  are already spliced in and frame-remapped, so the callee's own first
+  real operation can immediately read a fully-populated frame) -- one
+  pair per stack word, POPping it off the TOP of the physical stack
+  (walking top-to-bottom: the LAST-pushed word, physically highest,
+  pops FIRST) INTO frameBase's own [BP+4],[BP+6],... range (matching
+  RemapFrameOperands' own positive-offset convention for a stack
+  parameter, shifted the identical way a local would be -- the
+  automatic top-to-bottom POP order lands the LAST-pushed word at the
+  LOWEST [BP+N] with no separate srcOff computation needed at all,
+  README.MD's own "[bp+4] = last pushed param" convention). Returns the
+  final insertion position the same way CloneOpRange does (var lastC/
+  lastK), so a caller can chain further insertions (or the clone
+  itself) right after.
+
+  POP, NOT a computed "MOV ax,[SP+srcOff]" read -- a real bug found via
+  a full regression run once InlineVoidCalls was wired into SPHO.PAS's
+  own OptimizeAllDeferred (DOCS/TRBUG.MD's own dedicated entry has the
+  full story): 8086 has NO SP-relative addressing mode at all, SP
+  cannot be used as a base/index register (TASM: "register not usable
+  as base/index on 8086") -- the EXACT SAME problem SRC/SPHO.PAS's own
+  ExtractRegArg already hit and documented, years before R13 existed
+  ("a first attempt using a literal [sp+N] operand failed to assemble",
+  DOCS/SPHO.MD). Since the pushed argument words are always the LAST
+  thing on the physical stack at this point (the original EmitCall's
+  own argument-push run is NOP'd by this rule's own caller, never
+  actually executed at runtime -- the real pushed words are still
+  physically there, untouched), a plain POP walks them off with no
+  addressing mode needed at all, matching ExtractRegArg's own "prefer
+  POP over a computed SP-relative read" precedent. x86 has no direct
+  memory-to-memory MOV either way -- each "bind" is still really two
+  operations (POP into a scratch register, then MOV that register into
+  the destination), the same "route an arbitrary memory-to-memory move
+  through AX" shape this whole codebase's own codegen uses everywhere
+  else this need arises, just POP-sourced here instead of a plain MOV-
+  sourced read. AX is NOT preserved across this call (matching
+  EmitCall's own convention that argument evaluation is free to clobber
+  AX) -- a caller inlining a call whose own RETURN value or surrounding
+  context needs AX preserved across the whole argument-binding sequence
+  must save it itself first, the same "this primitive only does what
+  its own name says" discipline RemapFrameOperands' own silence on
+  register/flag preservation already establishes for a different
+  topic. }
+procedure BindStackArgs(afterC: POpChunk; afterK: integer;
+                         callArgWords: integer; frameBase: word;
+                         var lastC: POpChunk; var lastK: integer);
+
+{ InlineVoidCalls: OPT.TXT's own R13 finding -- the first, narrowest
+  possible REAL inlining RULE tying every one of the five infrastructure
+  pieces above together (InsertOpAfter/IsSafeInlineCandidate/
+  CloneOpRange/RemapFrameOperands+GrowDestinationFrame/BindStackArgs)
+  into one end-to-end transformation. Deliberately the narrowest slice
+  that is still a genuinely real, observable optimization -- everything
+  else R13's own resolution/acceptance text still asks for (constant-
+  tuple specialization, a real size budget, whole-module reachability
+  removing the now-possibly-dead original) remains unattempted; this
+  is "can this whole pipeline actually inline ONE real call correctly
+  at all," not the finished feature.
+
+  Scope, each a real, deliberate restriction, not an oversight:
+  - Callee must pass IsSafeInlineCandidate (nonrecursive, no opaque
+    ASM, every call it makes is itself a proven direct non-conservative
+    call, not itself external/exported/address-taken).
+  - Callee must have NO register-named parameters -- detected
+    PURELY SYNTACTICALLY, without any SymTab access (PHOPT.PAS stays
+    isolated from it): SPHO.PAS's own EmitCall pushes EVERY argument
+    first, register-destined ones included, then extracts register
+    arguments afterward via ExtractRegArg, a distinctive multi-
+    operation "PUSH BP; MOV BP,SP; PUSH [BP+N]; ..." sequence that can
+    ONLY ever appear between a call's own argument-push run and the
+    CALL itself -- a SECOND, NESTED occurrence of a real procedure's
+    own "PUSH bp; MOV bp,sp" prologue pair, unmistakable from the
+    caller's own single OUTER prologue (CountArgPushRun below detects
+    this directly, rejecting the whole call site the moment a second
+    such pair is found anywhere before CALL). This is a real,
+    previously-missing fix (DOCS/TRBUG.MD's own dedicated entry): an
+    earlier draft relied SOLELY on the trailing-PUSH-run's own LENGTH
+    being smaller than expected, reasoning that ExtractRegArg's own
+    trailing non-PUSH operations would always shrink it -- true, but
+    NOT sufficient on its own: for a register argument in the LAST
+    parameter position, the trailing count can come back as EXACTLY 0,
+    indistinguishable from a genuinely zero-argument call, even while a
+    REAL, earlier stack argument remains physically on the stack,
+    unbound and un-popped.
+  - Callee must have NO return value used as a value (this rule only
+    ever inlines a call used as a bare STATEMENT, "Foo(x);", never
+    "y := Foo(x)" or "Foo(x) + 1" -- detected the same purely-syntactic
+    way: only a CALL whose own next real operation does NOT read AX
+    (LocalDeadAfter, Stage B's own existing proof, reused unchanged)
+    is eligible; nothing here inspects the callee's own declared
+    return type at all, since PHOPT.PAS cannot).
+  - Only STACK-passed arguments (BindStackArgs' own only supported
+    shape) -- a call site is eligible only when its own argument-push
+    run, immediately before CALL, is no more than MaxInlineArgWords
+    PUSH operations with nothing else interleaved.
+  - No inlining budget/frequency heuristic at all yet -- every
+    syntactically eligible call site to a safe callee is inlined,
+    unconditionally (OPT.TXT's own "Budget actual assembled size" is a
+    separate, still-unbuilt piece; this rule does not yet know or care
+    whether inlining any given call site makes the module smaller or
+    larger).
+  - The ORIGINAL callee body is left in place, untouched, even if every
+    one of its own call sites end up inlined (OPT.TXT's own "remove
+    originals only after a complete reachability/address-taken proof"
+    is a separate, still-unbuilt piece -- this rule only ever ADDS
+    code, it never removes a procedure).
+
+  Must run ONCE, module-wide, using the SAME ranges/isConservative
+  BuildCallGraph/BuildInlineSafety already take -- AFTER both of those
+  have already run (this rule's own eligibility proof depends on
+  IsSafeInlineCandidate's own result), and BEFORE any per-range
+  Optimize call (an inlined clone's own operations still need every
+  Stage A-F rule's own normal pass over them, exactly like the
+  original source they came from already received). }
+procedure InlineVoidCalls(nProcs: integer; nRanges: integer;
+                           const ranges: array of TProcRange;
+                           const isConservative: array of boolean);
+
 { Optimize: walk this procedure's own operation range in place,
   [startChunk,startSlot] up to and including the current tail
   (endChunk,endSlot) -- both endpoints inclusive, same 1-based slot
@@ -1225,6 +1711,15 @@ var
     separate "never analyzed" flag needed. }
   demandTable: array[0..MaxProcs-1] of TProcDemand;
   demandTableValid: boolean;
+
+  { inlineSafe/inlineSafeValid: OPT.TXT's own R13 finding -- the
+    persistent result of the one BuildInlineSafety call a future
+    inlining rule (not yet built) would make, consulted by
+    IsSafeInlineCandidate for the rest of that run. Same "starts FALSE,
+    no separate never-analyzed flag needed" convention as
+    demandTable/demandTableValid above. }
+  inlineSafe: array[0..MaxProcs-1] of boolean;
+  inlineSafeValid: boolean;
 
 { Advance: step (c,k) one slot forward within [.., endChunk/endSlot]
   (inclusive) -- the one shared cursor-stepping rule every walker below
@@ -5109,6 +5604,1004 @@ begin
   end
 end;
 
+const MaxCloneLabels = MaxBlocks; { see CloneOpRange's own header
+  comment above -- a real procedure has far fewer distinct labels than
+  MaxBlocks (roughly one per block boundary at most), so reusing the
+  same bound R12's own TDomBitset already established is a generous,
+  already-justified ceiling, not a new one invented for this. }
+
+{ CloneOpRange: see its own header comment in the interface section
+  above for the full "what"/"why"/"NOT done here." }
+procedure CloneOpRange(startChunk: POpChunk; startSlot: integer;
+                        endChunk: POpChunk; endSlot: integer;
+                        afterC: POpChunk; afterK: integer;
+                        cloneId: word; genSaveIdBase: word;
+                        var firstC: POpChunk; var firstK: integer;
+                        var lastC: POpChunk; var lastK: integer);
+  var oldNames: array[1..MaxCloneLabels] of StrTab.TStrTabId;
+      newNames: array[1..MaxCloneLabels] of StrTab.TStrTabId;
+      nLabels: integer;
+      oldSaveIds: array[1..MaxCloneLabels] of word;
+      newSaveIds: array[1..MaxCloneLabels] of word;
+      nSaveIds: integer;
+      c: POpChunk; k: integer;
+
+  { RenameLabelText: if id names exactly one of the source range's own
+    locally-defined labels (a linear scan over oldNames -- nLabels is
+    small, no bitset/hash needed), return its already-assigned fresh
+    replacement; otherwise return id completely unchanged (a jump
+    target outside this range, or an ordinary non-label operand that
+    simply doesn't match any real label name -- either way, not this
+    primitive's business to alter). id=0 (StrTab's own "empty operand"
+    convention) always passes through unchanged, matching every other
+    id=0 case throughout this unit. }
+  function RenameLabelText(id: StrTab.TStrTabId): StrTab.TStrTabId;
+    var i: integer;
+  begin
+    RenameLabelText := id;
+    if id = 0 then exit;
+    for i := 1 to nLabels do
+      if oldNames[i] = id then begin RenameLabelText := newNames[i]; exit end
+  end;
+
+  { RenameSaveId: same linear-scan-and-substitute shape as
+    RenameLabelText above, on the separate genSaveId numbering axis --
+    0 (Types.TOperation's own "not a compiler-owned save/restore
+    operation" default) always passes through unchanged. }
+  function RenameSaveId(id: word): word;
+    var i: integer;
+  begin
+    RenameSaveId := id;
+    if id = 0 then exit;
+    for i := 1 to nSaveIds do
+      if oldSaveIds[i] = id then begin RenameSaveId := newSaveIds[i]; exit end
+  end;
+
+  var newOp: TOperation;
+begin
+  nLabels := 0; nSaveIds := 0;
+  { Pass 1: collect every label this range itself DEFINES (TOpLabel's
+    own labelId), and every DISTINCT nonzero genSaveId it contains,
+    each assigned a fresh replacement immediately as first discovered
+    -- both tables are built in one single forward walk, since neither
+    collection depends on the other, and both need to be COMPLETE
+    before pass 2 (below) can safely substitute anything (a forward
+    jump to a label not yet seen at scan time would otherwise miss its
+    own rename). }
+  c := startChunk; k := startSlot;
+  repeat
+    if (c^.ops[k].kind = TOpLabel) and (c^.ops[k].labelId <> 0) then begin
+      if nLabels < MaxCloneLabels then begin
+        nLabels := nLabels + 1;
+        oldNames[nLabels] := c^.ops[k].labelId;
+        newNames[nLabels] := StrTab.Put('.LC' + Util.IntStr(cloneId)
+                                         + '_' + Util.IntStr(nLabels))
+      end
+    end;
+    if c^.ops[k].genSaveId <> 0 then begin
+      if RenameSaveId(c^.ops[k].genSaveId) = c^.ops[k].genSaveId then begin
+        { not seen yet (RenameSaveId's own "unchanged" result, since
+          this genSaveId is not in oldSaveIds yet) -- assign it the
+          next fresh id along this clone's own separate numbering
+          axis. }
+        if nSaveIds < MaxCloneLabels then begin
+          nSaveIds := nSaveIds + 1;
+          oldSaveIds[nSaveIds] := c^.ops[k].genSaveId;
+          newSaveIds[nSaveIds] := genSaveIdBase + word(nSaveIds) - 1
+        end
+      end
+    end
+  until not Advance(c, k, endChunk, endSlot);
+  { Pass 2: copy the range operation-by-operation, in original
+    left-to-right order, via InsertOpAfter (one splice per source
+    operation, each immediately after the PREVIOUS clone's own newly-
+    inserted position -- lastC/lastK tracks this across the whole
+    loop, seeded from the caller's own afterC/afterK before the first
+    splice). newOp starts as a byte-for-byte copy of the source
+    operation (record assignment), then only labelId/op1/op2/genSaveId
+    are ever rewritten -- every other field (kind, needTab, mnemonic,
+    sect, callProcId) is preserved completely unchanged, matching this
+    procedure's own "preserves returned register/flag effects... by
+    not touching anything else" contract. }
+  lastC := afterC; lastK := afterK;
+  c := startChunk; k := startSlot;
+  firstC := nil; firstK := 0;
+  repeat
+    newOp := c^.ops[k];
+    if newOp.kind = TOpLabel then
+      newOp.labelId := RenameLabelText(newOp.labelId)
+    else begin
+      newOp.op1 := RenameLabelText(newOp.op1);
+      newOp.op2 := RenameLabelText(newOp.op2)
+    end;
+    newOp.genSaveId := RenameSaveId(newOp.genSaveId);
+    InsertOpAfter(lastC, lastK, newOp, lastC, lastK);
+    if firstC = nil then begin firstC := lastC; firstK := lastK end
+  until not Advance(c, k, endChunk, endSlot)
+end;
+
+{ ValidateFrameOperands: see its own header comment in the interface
+  section above for the full "what"/"why". A deliberately narrower,
+  READ-ONLY mirror of RemapFrameOperands' own RewriteOperand nested
+  function, below -- same frame-object proof, same rejection contract,
+  but never writes an operand back and needs no frameBase/maxOffset
+  bookkeeping at all (irrelevant to a pure eligibility check). }
+function ValidateFrameOperands(startChunk: POpChunk; startSlot: integer;
+                                endChunk: POpChunk; endSlot: integer): boolean;
+  var c: POpChunk; k: integer; o: TOperand; s: string;
+
+  function OperandOk(opId: StrTab.TStrTabId): boolean;
+  begin
+    OperandOk := true;
+    if opId = 0 then exit;
+    StrTab.Get(opId, s);
+    if (Length(s) = 0) or (s[1] <> '[') then begin
+      if not (Util.EqualICase(Copy(s, 1, 5), 'byte ')
+              or Util.EqualICase(Copy(s, 1, 5), 'word ')) then exit
+    end;
+    DecodeOperand(s, o);
+    if o.kind <> OpKindMem then exit;
+    if not o.isFrameObject then begin OperandOk := false; exit end
+  end;
+
+begin
+  ValidateFrameOperands := true;
+  c := startChunk; k := startSlot;
+  repeat
+    if c^.ops[k].kind = TOpInstr then begin
+      if not OperandOk(c^.ops[k].op1) then begin
+        ValidateFrameOperands := false; exit
+      end;
+      if not OperandOk(c^.ops[k].op2) then begin
+        ValidateFrameOperands := false; exit
+      end
+    end
+  until not Advance(c, k, endChunk, endSlot)
+end;
+
+{ RemapFrameOperands: see its own header comment in the interface
+  section above for the full "what"/"why". }
+function RemapFrameOperands(startChunk: POpChunk; startSlot: integer;
+                             endChunk: POpChunk; endSlot: integer;
+                             frameBase: word; var maxOffset: word;
+                             var maxLocalOffset: word): boolean;
+  var c: POpChunk; k: integer; o: TOperand; opTxt: string;
+      newOff: longint; sign: string; rewrittenId: StrTab.TStrTabId;
+
+  { RewriteOperand: if opId decodes as a proven frame object, computes
+    its own replacement id into the OUTER local rewrittenId (a plain
+    function result/outer-local return, not a `var opId` parameter --
+    a debugging note, not a real compiler-bug workaround: an EARLIER
+    draft of this whole function had a genuine LOGIC bug, reconstructing
+    the replacement operand text from absOff -- the ORIGINAL magnitude
+    -- instead of newOff -- the actual NEW, already-frameBase-shifted
+    offset -- so a remap could silently reproduce the OLD text
+    unchanged whenever absOff and newOff happened to print identically
+    at the call site under test, initially misread as a `var`-parameter
+    write-back failure before the real cause was found via careful
+    isolated reproduction, TESTS/STGK.PAS's own driver catching it
+    directly) and returns TRUE; if opId is a memory operand ('[' ...
+    ']') that FAILED the frame-object proof (an indexed/computed
+    address this primitive cannot safely reason about), return FALSE,
+    signaling the whole range must be rejected; a non-memory operand
+    (opId=0, a register, an immediate, anything DecodeOperand's own
+    bare[1]<>'[' fast exit already lets through unexamined) is left
+    completely alone (rewrittenId left EQUAL to opId, a harmless
+    no-op assignment back) and always returns TRUE -- only a REAL
+    memory reference is ever this function's concern at all. }
+  function RewriteOperand(opId: StrTab.TStrTabId): boolean;
+    var s: string; absOff: longint;
+  begin
+    RewriteOperand := true;
+    rewrittenId := opId;
+    if opId = 0 then exit;
+    StrTab.Get(opId, s);
+    if (Length(s) = 0) or (s[1] <> '[') then begin
+      { also check the byte/word-prefixed spelling MemOpndPrefix itself
+        already strips for DecodeOperand -- 'byte [BP-2]'/'word [BP-2]'
+        are exactly as much a frame object as the unprefixed form, this
+        function must recognize both the same way DecodeOperand does. }
+      if not (Util.EqualICase(Copy(s, 1, 5), 'byte ')
+              or Util.EqualICase(Copy(s, 1, 5), 'word ')) then exit
+    end;
+    DecodeOperand(s, o);
+    if o.kind <> OpKindMem then exit;   { not a memory operand at all
+      -- unreachable in practice given the checks above, kept as a
+      guard rather than assumed. }
+    if not o.isFrameObject then begin
+      RewriteOperand := false; exit   { a real memory operand that did
+        NOT prove as a plain frame object -- reject the whole range,
+        per this function's own documented conservative-rejection
+        contract. }
+    end;
+    absOff := o.frameOffset;
+    if absOff < 0 then absOff := -absOff;
+    newOff := longint(frameBase) + absOff;
+    if newOff > longint(maxOffset) then maxOffset := word(newOff);
+    { maxLocalOffset: the SAME newOff, but ONLY when this operand was a
+      NEGATIVE-offset ([BP-N]) local -- GrowDestinationFrame's own
+      SUB SP,N growth must never be driven by a POSITIVE-offset ([BP+N])
+      parameter's own magnitude (see this function's own header comment
+      above for the bug this fixes). }
+    if (o.frameOffset < 0) and (newOff > longint(maxLocalOffset)) then
+      maxLocalOffset := word(newOff);
+    if o.frameOffset >= 0 then sign := '+' else sign := '-';
+    { Rebuild ONLY the '[...]' base-register portion as 'BP<sign>N' --
+      any byte/word prefix or explicit SEG: override MemOpndPrefix/
+      DecodeOperand already stripped out on the way IN is preserved by
+      re-deriving it from s itself here (a plain substring copy of
+      whatever came before the base text), rather than re-synthesizing
+      a prefix this function has no independent knowledge of -- exactly
+      the same "never invent what you didn't already prove" discipline
+      RewriteOperand's own indexed-address rejection above follows. }
+    if Util.EqualICase(Copy(s, 1, 5), 'byte ') or Util.EqualICase(Copy(s, 1, 5), 'word ')
+    then opTxt := Copy(s, 1, 6) + 'BP' + sign + Util.IntStr(newOff) + ']'
+    else opTxt := '[BP' + sign + Util.IntStr(newOff) + ']';
+    rewrittenId := StrTab.Put(opTxt)
+  end;
+
+begin
+  RemapFrameOperands := true;
+  maxOffset := 0;
+  maxLocalOffset := 0;
+  c := startChunk; k := startSlot;
+  repeat
+    if c^.ops[k].kind = TOpInstr then begin
+      if not RewriteOperand(c^.ops[k].op1) then begin
+        RemapFrameOperands := false; exit
+      end;
+      c^.ops[k].op1 := rewrittenId;
+      if not RewriteOperand(c^.ops[k].op2) then begin
+        RemapFrameOperands := false; exit
+      end;
+      c^.ops[k].op2 := rewrittenId
+    end
+  until not Advance(c, k, endChunk, endSlot)
+end;
+
+{ GrowDestinationFrame: see its own header comment in the interface
+  section above for the full "what"/"why". }
+function GrowDestinationFrame(destStartChunk: POpChunk; destStartSlot: integer;
+                               destEndChunk: POpChunk; destEndSlot: integer;
+                               newFrameSize: word): boolean;
+  var c, mc, sc: POpChunk; k, mk, sk: integer; txt: string;
+      newC: POpChunk; newK: integer; ins: TOperation; curSize: word;
+      ok: boolean;
+begin
+  GrowDestinationFrame := false;
+  c := destStartChunk; k := destStartSlot;
+  { Find "PUSH BP" -- must be THIS procedure's own very first real
+    operation or the second (its entry label may occupy the first
+    slot); scanned via NextReal so an already-deleted (MnNop) operation
+    ahead of it is transparently skipped, matching every other prologue
+    -shape scan's own convention. }
+  if not ((c^.ops[k].kind = TOpInstr) and (c^.ops[k].mnemonic = MnPush)) then begin
+    if not NextReal(c, k, destEndChunk, destEndSlot) then exit
+  end;
+  if not ((c^.ops[k].kind = TOpInstr) and (c^.ops[k].mnemonic = MnPush)) then exit;
+  StrTab.Get(c^.ops[k].op1, txt);
+  if not Util.EqualICase(txt, 'bp') then exit;   { no PUSH BP at all --
+    this procedure has no frame; unsupported, per this function's own
+    documented "NO -- returns FALSE" case. }
+  mc := c; mk := k;
+  if not NextReal(mc, mk, destEndChunk, destEndSlot) then exit;
+  if not ((mc^.ops[mk].kind = TOpInstr) and (mc^.ops[mk].mnemonic = MnMov)) then exit;
+  StrTab.Get(mc^.ops[mk].op1, txt);
+  if not Util.EqualICase(txt, 'bp') then exit;
+  StrTab.Get(mc^.ops[mk].op2, txt);
+  if not Util.EqualICase(txt, 'sp') then exit;   { PUSH BP not followed
+    by MOV BP,SP -- not this dialect's own real prologue shape at all;
+    conservatively unsupported rather than guessed at. }
+  { Optional third operation: SUB SP,N -- may or may not be present
+    (SRC/SPHO.PAS's own ParseProcedure only emits it when ctx.frameOfs
+    > 0 at emission time). }
+  sc := mc; sk := mk;
+  ok := NextReal(sc, sk, destEndChunk, destEndSlot);
+  if ok and (sc^.ops[sk].kind = TOpInstr) and (sc^.ops[sk].mnemonic = MnSub) then begin
+    StrTab.Get(sc^.ops[sk].op1, txt);
+    if Util.EqualICase(txt, 'sp') then begin
+      { Case 1: already has SUB SP,N -- grow it in place if the new
+        size is genuinely larger (never shrink a frame this call did
+        not itself just grow -- an equal or smaller newFrameSize means
+        the existing space is already enough, left untouched). }
+      StrTab.Get(sc^.ops[sk].op2, txt);
+      if ParseDecimalLiteral(txt, curSize) and (word(newFrameSize) > curSize) then
+        sc^.ops[sk].op2 := StrTab.Put(Util.IntStr(longint(newFrameSize)));
+      GrowDestinationFrame := true; exit
+    end
+  end;
+  { Case 2: PUSH BP; MOV BP,SP with no following SUB SP,N at all --
+    insert a fresh one immediately after MOV BP,SP (InsertOpAfter,
+    already built). }
+  ins.kind := TOpInstr; ins.needTab := false; ins.mnemonic := MnSub;
+  ins.labelId := 0; ins.sect := mc^.ops[mk].sect;
+  ins.genSaveId := 0; ins.callProcId := 0;
+  ins.op1 := StrTab.Put('sp');
+  ins.op2 := StrTab.Put(Util.IntStr(longint(newFrameSize)));
+  InsertOpAfter(mc, mk, ins, newC, newK);
+  GrowDestinationFrame := true
+end;
+
+{ BindStackArgs: see its own header comment in the interface section
+  above for the full "what"/"why". }
+procedure BindStackArgs(afterC: POpChunk; afterK: integer;
+                         callArgWords: integer; frameBase: word;
+                         var lastC: POpChunk; var lastK: integer);
+  var i: integer; destOff: integer; ins: TOperation; curSect: byte;
+begin
+  lastC := afterC; lastK := afterK;
+  curSect := afterC^.ops[afterK].sect;
+  for i := 1 to callArgWords do begin
+    { destOff: this word's own target [BP+N] in the callee's remapped
+      frame. Every pushed word is popped off the TOP of the stack, top-
+      to-bottom -- the LAST-pushed word (physically highest, [SP+0]) is
+      always popped FIRST, iteration i=1, landing at the callee's own
+      LOWEST parameter offset, [BP+4] (README.MD's own "[bp+4] = last
+      pushed param" convention, matched automatically by popping in
+      push-order reverse, no separate srcOff computation needed at
+      all); the FIRST-pushed word is popped LAST, i=callArgWords,
+      landing highest. Then shifted by frameBase the identical way
+      RemapFrameOperands shifts every other frame object, so this lands
+      in the SAME already-reserved space GrowDestinationFrame made
+      real.
+
+      POP, not "MOV ax,[SP+N]" -- a real bug found via a full
+      regression run once InlineVoidCalls was wired into SPHO.PAS's own
+      OptimizeAllDeferred: 8086 has NO SP-relative addressing mode at
+      all, SP cannot be a base/index register (TASM: "register not
+      usable as base/index on 8086") -- the EXACT same problem
+      ExtractRegArg's own history already hit and documented
+      (DOCS/SPHO.MD). Since the pushed argument words are always the
+      LAST thing on the stack at this point (nothing else has been
+      pushed since the original EmitCall's own argument-push run, now
+      NOP'd but never actually executed at runtime -- the real pushed
+      words are still physically there), a plain POP walks them off
+      top-to-bottom with no addressing mode needed at all, the same
+      "prefer POP over a computed SP-relative read" precedent
+      ExtractRegArg's own header comment already established. }
+    destOff := longint(frameBase) + 4 + (i - 1) * 2;
+    ins.kind := TOpInstr; ins.needTab := false; ins.mnemonic := MnPop;
+    { sect: inherited from the anchor position itself, NOT hardcoded to
+      0 (SectData) -- a real, separate bug found the same regression
+      run: SerializeSection groups every operation by its OWN sect
+      field regardless of its position in the operation stream, so a
+      hardcoded SectData silently relocated these instructions into
+      ".data", outside any procedure body at all. Matches
+      GrowDestinationFrame's own existing "ins.sect :=
+      mc^.ops[mk].sect" convention. }
+    ins.labelId := 0; ins.sect := curSect;
+    ins.genSaveId := 0; ins.callProcId := 0;
+    ins.op1 := StrTab.Put('ax'); ins.op2 := 0;
+    InsertOpAfter(lastC, lastK, ins, lastC, lastK);
+    ins.kind := TOpInstr; ins.mnemonic := MnMov;
+    ins.op1 := StrTab.Put('[BP+' + Util.IntStr(destOff) + ']');
+    ins.op2 := StrTab.Put('ax');
+    InsertOpAfter(lastC, lastK, ins, lastC, lastK)
+  end
+end;
+
+const MaxInlineArgWords = 2 * 32;  { 2*MaxParams (SymTab.MaxParams=32,
+  SRC/SYMTAB.PAS -- PHOPT.PAS cannot reference it directly, so the
+  bound is copied as a plain literal), *2 since a single LONGINT
+  argument pushes two words. A generous, already-justified ceiling on
+  "how many PUSH operations could a real, in-bound argument list ever
+  produce," the same "reuse an existing project-wide bound rather than
+  invent a new one" discipline MaxCloneLabels above already follows. }
+
+const InlineGenSaveIdSpacing = 1000;  { InlineVoidCalls' own per-clone
+  genSaveId numbering spacing -- each successfully-inlined clone gets
+  its own block [cloneId*InlineGenSaveIdSpacing ..
+  cloneId*InlineGenSaveIdSpacing + MaxCloneLabels - 1] of fresh
+  genSaveIds (CloneOpRange's own genSaveIdBase parameter), well clear
+  of MaxCloneLabels=512 (the most any ONE clone could ever actually
+  use) so no single clone's own ids can ever spill into its own
+  neighbor's block. }
+const MaxInlineClones = 65535 div InlineGenSaveIdSpacing;  { the largest
+  cloneId InlineGenSaveIdSpacing can multiply by and still fit in a
+  16-bit word (Types.TOperation's own genSaveId field) without
+  wrapping -- a real, previously-latent bug found via code review:
+  word(cloneId) * 1000 wraps silently past cloneId=66 (66*1000=66000,
+  mod 65536 = 464), landing back inside an EARLIER clone's own already-
+  assigned id block and corrupting its PUSH/POP pairing. InlineVoidCalls
+  itself must stop inlining, rather than wrap, once cloneId would
+  exceed this bound -- see its own use below. }
+
+{ FindCalleeInlineBody: locate the callee's own INLINABLE body -- from
+  its own first real operation AFTER the prologue (PUSH BP; MOV BP,SP;
+  optional SUB SP,N -- the SAME three-shape scan GrowDestinationFrame's
+  own header comment already documents) through and INCLUDING its own
+  ".return" label (SPHO.PAS's own ParseProcedure -- unconditionally
+  emitted at the end of every procedure body, whether or not anything
+  actually jumps to it), but EXCLUDING everything from there onward
+  (the real epilogue: MOV SP,BP; POP BP; RETN -- meaningless once
+  inlined in place, since there is no real CALL/RETURN framing left to
+  unwind). Every internal "JMP .return" a mid-body RETURN statement
+  compiles to is thereby included in the cloned range, landing
+  correctly on the cloned ".return" label itself once CloneOpRange's
+  own label renaming runs -- exactly the behavior a real RETURN inside
+  the inlined body needs: skip the rest of the inlined body, fall
+  through to whatever comes after the whole inline, precisely as it
+  already does when NOT inlined at all.
+
+  Returns FALSE (rejecting the whole callee as unsupported by this
+  rule) for any shape GrowDestinationFrame's own callee-side twin,
+  ProveFrameShape below, already conservatively refuses -- this
+  helper shares that exact same frame-shape recognition, applied to
+  the CALLEE side now instead of the destination side. }
+function FindCalleeInlineBody(calleeStartChunk: POpChunk; calleeStartSlot: integer;
+                               calleeEndChunk: POpChunk; calleeEndSlot: integer;
+                               var bodyStartC: POpChunk; var bodyStartK: integer;
+                               var bodyEndC: POpChunk; var bodyEndK: integer;
+                               var calleeFrameSize: word): boolean;
+  var c, mc, sc: POpChunk; k, mk, sk: integer; txt: string; ok: boolean;
+begin
+  FindCalleeInlineBody := false;
+  c := calleeStartChunk; k := calleeStartSlot;
+  if not ((c^.ops[k].kind = TOpInstr) and (c^.ops[k].mnemonic = MnPush)) then begin
+    if not NextReal(c, k, calleeEndChunk, calleeEndSlot) then exit
+  end;
+  if not ((c^.ops[k].kind = TOpInstr) and (c^.ops[k].mnemonic = MnPush)) then exit;
+  StrTab.Get(c^.ops[k].op1, txt);
+  if not Util.EqualICase(txt, 'bp') then exit;   { no frame at all --
+    the callee never even reaches a real body via this scan; treated
+    the same conservative "unsupported, not attempted" way
+    GrowDestinationFrame's own no-frame case already is. }
+  mc := c; mk := k;
+  if not NextReal(mc, mk, calleeEndChunk, calleeEndSlot) then exit;
+  if not ((mc^.ops[mk].kind = TOpInstr) and (mc^.ops[mk].mnemonic = MnMov)) then exit;
+  StrTab.Get(mc^.ops[mk].op1, txt);
+  if not Util.EqualICase(txt, 'bp') then exit;
+  StrTab.Get(mc^.ops[mk].op2, txt);
+  if not Util.EqualICase(txt, 'sp') then exit;
+  calleeFrameSize := 0;
+  sc := mc; sk := mk;
+  ok := NextReal(sc, sk, calleeEndChunk, calleeEndSlot);
+  if not ok then exit;   { nothing at all follows the prologue -- no
+    room for a real body OR a ".return" label either; conservatively
+    unsupported, same as every other shape this function cannot
+    account for. }
+  bodyStartC := sc; bodyStartK := sk;   { the callee's own real body
+    always starts at the first real operation AFTER "MOV BP,SP" -- the
+    prologue itself (PUSH BP; MOV BP,SP; optional SUB SP,N) is never
+    cloned, only the real body between it and .return. Defaults to the
+    very next real operation (no SUB SP,N case, below re-confirmed);
+    only advanced FURTHER, past a genuine SUB SP,N, when one is
+    actually found. }
+  if (sc^.ops[sk].kind = TOpInstr) and (sc^.ops[sk].mnemonic = MnSub) then begin
+    StrTab.Get(sc^.ops[sk].op1, txt);
+    if Util.EqualICase(txt, 'sp') then begin
+      StrTab.Get(sc^.ops[sk].op2, txt);
+      if ParseDecimalLiteral(txt, calleeFrameSize) then begin
+        if not NextReal(sc, sk, calleeEndChunk, calleeEndSlot) then exit;
+        bodyStartC := sc; bodyStartK := sk
+      end
+    end
+  end;
+  if not FindLabel('.return', bodyStartC, bodyStartK, calleeEndChunk, calleeEndSlot,
+                    bodyEndC, bodyEndK) then exit;   { every real
+    procedure body always has one (see this function's own header
+    comment) -- FALSE here means something this scan cannot account
+    for, conservatively rejected rather than guessed at. }
+  FindCalleeInlineBody := true
+end;
+
+{ CountArgPushRun: walk BACKWARD is not available in this unit (every
+  existing walker, Advance/NextReal, is forward-only) -- instead,
+  counts the run of PURE, UNINTERRUPTED PUSH operations immediately
+  preceding (callC,callK) (the CALL itself) by walking FORWARD from
+  the caller's own range start and tracking a running "trailing PUSH
+  count" that resets to 0 the instant any REAL non-PUSH operation is
+  seen, incrementing on every real PUSH -- so by the time this forward
+  walk actually reaches (callC,callK), the running count already IS
+  exactly the length of the immediately-preceding pure-PUSH run,
+  without ever needing to walk backward at all.
+
+  A register-argument call site is ALSO explicitly rejected via a
+  SEPARATE, direct check made during this SAME forward walk: SPHO.PAS's
+  own ExtractRegArg (ANY register-destined argument) always begins with
+  a NESTED "PUSH bp; MOV bp,sp" pair -- syntactically UNMISTAKABLE from
+  a real procedure's own single OUTER prologue, which only ever occurs
+  ONCE, at the VERY START of the caller's own range. This scan rejects
+  (-1) outright the moment such a pair is found ANYWHERE before CALL --
+  EXCEPT at the caller's own known prologue position (startChunk,
+  startSlot) itself, and EXCEPT anywhere INSIDE one of the nClones
+  already-successfully-spliced clone ranges (cloneFirstC/K..
+  cloneLastC/K, up to nClones of them, the caller's OWN record of every
+  clone IT has already committed earlier in this SAME InlineVoidCalls
+  pass) -- both real, previously-missing exemptions (DOCS/TRBUG.MD's
+  own dedicated entry has the full story):
+
+  (1) A plain "have I seen a prologue pair yet" FLAG cannot tell "the
+  caller's own real prologue" apart from a genuinely nested
+  ExtractRegArg pair -- both are merely "the first one this scan
+  happens to see" -- so it correctly rejects a real nested pair within
+  THIS call's own argument evaluation, but ALSO wrongly rejects the
+  caller's own harmless, legitimate outer prologue the very first time
+  this scan runs at all. Comparing the pair's own POSITION against the
+  caller's KNOWN, fixed prologue position instead of a flag fixes this
+  half.
+
+  (2) Even fixed that way, a position check alone is not enough: an
+  EARLIER successful inline (within this SAME pass) may already have
+  spliced a callee whose own body happens to contain a nested prologue
+  pair from ITS OWN internal call to a third procedure with a register
+  argument (IsSafeInlineCandidate never itself screens a callee for
+  this -- it is a perfectly safe thing to CALL, only unsafe to inline
+  INTO). Scanning a LATER, completely unrelated call site then walks
+  THROUGH that earlier clone's own embedded pair on the way to its own
+  CALL, and would be falsely rejected for a reason having nothing to do
+  with its own shape -- confirmed directly via a hand-built two-call
+  fixture and instrumentation (TESTS/STGM.PAS's own "embedded" case).
+  Exempting any pair found strictly inside an already-recorded clone
+  range closes this the rest of the way: a genuine ExtractRegArg pair
+  for THIS call's own argument evaluation is never inside an EARLIER
+  clone's own range (it belongs to the CALLER's own still-original
+  code, not to spliced-in content), so it is still caught exactly as
+  before.
+
+  This second check is a real, previously-missing fix (DOCS/TRBUG.MD's
+  own dedicated entry has the full story) -- the trailing-PUSH-run
+  count ALONE is not sufficient to reject every register-argument call
+  site: ExtractRegArg's own sequence always ENDS in a non-PUSH
+  operation ("ADD sp,N"), which correctly resets the running count to
+  something SMALLER than the call's own real total -- but for a callee
+  with a register argument in the LAST parameter position and no
+  arguments after it, the trailing count can come back as EXACTLY 0,
+  indistinguishable from a genuinely zero-argument call, even though a
+  REAL stack argument (any EARLIER parameter, still genuinely pushed
+  and never consumed by ExtractRegArg's own dance) remains physically
+  on the stack, needing to be bound -- confirmed directly via a
+  hand-traced "Foo(x, BX)" sequence (x stack-bound, BX register-bound,
+  the LAST parameter): the real word for x is still on the stack at
+  CALL time, but the OLD code's own trailing count came back 0,
+  which InlineVoidCalls would have accepted as "no stack arguments at
+  all," silently leaving x's own real value unbound and the caller's
+  own stack unbalanced.
+
+  Returns -1 (reject) if (callC,callK) is never reached at all within
+  [startChunk,startSlot..endChunk,endSlot] (a caller-side bug, should
+  be unreachable given how this is only ever called with a position
+  already found within the very same range) or if the trailing count
+  would exceed MaxInlineArgWords. pushStartC/pushStartK come back
+  holding the FIRST push operation's own position (meaningless when
+  the return value is <= 0, i.e. no argument-push run at all) -- the
+  caller's own later "NOP out this whole argument-push run plus the
+  CALL itself" step needs this to know where that run actually begins,
+  since this function's own forward-only design never had to record it
+  for the counting itself. }
+function CountArgPushRun(startChunk: POpChunk; startSlot: integer;
+                          endChunk: POpChunk; endSlot: integer;
+                          callC: POpChunk; callK: integer;
+                          nClones: integer;
+                          const cloneFirstC: array of POpChunk;
+                          const cloneFirstK: array of integer;
+                          const cloneLastC: array of POpChunk;
+                          const cloneLastK: array of integer;
+                          var pushStartC: POpChunk; var pushStartK: integer): integer;
+  var c: POpChunk; k: integer; running: integer;
+      runStartC: POpChunk; runStartK: integer;
+      pushBpC: POpChunk; pushBpK: integer; sawPushBp: boolean; txt: string;
+
+  { PositionInsideAnyClone: TRUE iff (pc,pk) lies within
+    [cloneFirstC[i],cloneFirstK[i]..cloneLastC[i],cloneLastK[i]] for
+    some already-recorded clone i -- a small, bounded forward walk per
+    clone (clone bodies and nClones are both small in practice, and
+    this only ever runs on the rare occasion a "PUSH bp; MOV bp,sp"
+    pair is found at all, never on every operation this scan visits). }
+  function PositionInsideAnyClone(pc: POpChunk; pk: integer): boolean;
+    var i: integer; wc: POpChunk; wk: integer;
+  begin
+    PositionInsideAnyClone := false;
+    for i := 0 to nClones - 1 do begin
+      wc := cloneFirstC[i]; wk := cloneFirstK[i];
+      repeat
+        if (wc = pc) and (wk = pk) then begin
+          PositionInsideAnyClone := true; exit
+        end
+      until ((wc = cloneLastC[i]) and (wk = cloneLastK[i]))
+            or not Advance(wc, wk, cloneLastC[i], cloneLastK[i])
+    end
+  end;
+
+begin
+  CountArgPushRun := -1;
+  running := 0;
+  sawPushBp := false;
+  c := startChunk; k := startSlot;
+  repeat
+    if (c = callC) and (k = callK) then begin
+      CountArgPushRun := running;
+      if running > 0 then begin pushStartC := runStartC; pushStartK := runStartK end;
+      exit
+    end;
+    if (c^.ops[k].kind = TOpInstr) and (c^.ops[k].mnemonic = MnPush) then begin
+      { ExtractRegArg detection: a "PUSH bp" immediately followed by
+        "MOV bp,sp" is this scan's own two-step matcher for a NESTED
+        prologue -- sawPushBp/pushBpC/pushBpK remember "the last real op
+        was exactly this PUSH bp, AT THIS POSITION," consumed (and
+        reset) by the very next real op's own check below, whichever
+        kind it turns out to be. }
+      StrTab.Get(c^.ops[k].op1, txt);
+      sawPushBp := Util.EqualICase(txt, 'bp');
+      if sawPushBp then begin pushBpC := c; pushBpK := k end;
+      if running = 0 then begin runStartC := c; runStartK := k end;
+      running := running + 1;
+      if running > MaxInlineArgWords then begin CountArgPushRun := -1; exit end
+    end else if c^.ops[k].kind = TOpInstr then begin
+      if sawPushBp and (c^.ops[k].mnemonic = MnMov) then begin
+        StrTab.Get(c^.ops[k].op1, txt);
+        if Util.EqualICase(txt, 'bp') then begin
+          StrTab.Get(c^.ops[k].op2, txt);
+          if Util.EqualICase(txt, 'sp') then begin
+            if not (((pushBpC = startChunk) and (pushBpK = startSlot))
+                    or PositionInsideAnyClone(pushBpC, pushBpK)) then begin
+              { a "PUSH bp; MOV bp,sp" pair that is NEITHER the caller's
+                own known, fixed prologue position NOR inside an
+                already-recorded clone range -- ExtractRegArg's own
+                unmistakable signature -- found anywhere before CALL:
+                reject outright, regardless of the trailing PUSH count
+                computed so far. See this function's own header comment
+                for the full reasoning behind both exemptions. }
+              CountArgPushRun := -1; exit
+            end
+          end
+        end
+      end;
+      sawPushBp := false;
+      running := 0   { includes an already-deleted (MnNop) operation --
+        this scan has no NextReal-style "skip deleted ops transparently"
+        convention here, since a genuinely deleted PUSH inside an
+        argument-push run should not occur in code this rule is ever
+        asked to consider in the first place; conservatively resetting
+        on it, rather than skipping it, is the safe default. }
+    end else if (c^.ops[k].kind = TOpLabel) or (c^.ops[k].kind = TOpAsm) then begin
+      sawPushBp := false;
+      running := 0   { a label or a raw ASM statement mid-argument-
+        evaluation is not something this dialect's own EmitCall could
+        ever produce for a plain argument list (ASM is a STATEMENT in
+        SPHINX Oberon, DOCS/SPHINX.MD S12, and can therefore never sit
+        inside an argument EXPRESSION's own evaluation), but both are
+        treated as a barrier anyway, conservatively, rather than
+        assumed impossible -- a real inconsistency fixed via code
+        review: an earlier draft gave TOpLabel this same conservative
+        treatment but left TOpAsm falling through this if/elsif chain
+        entirely unhandled, silently leaving `running` unchanged
+        instead of resetting it. }
+    end
+  until not Advance(c, k, endChunk, endSlot)
+end;
+
+{ InlineVoidCalls: see its own header comment in the interface section
+  above for the full "what"/"why"/"scope." }
+procedure InlineVoidCalls(nProcs: integer; nRanges: integer;
+                           const ranges: array of TProcRange;
+                           const isConservative: array of boolean);
+  var ri, calleeRi, callee, argWords: integer;
+      c: POpChunk; k: integer;
+      calleeIdx: array[0..MaxProcs-1] of integer;
+      bodyStartC, bodyEndC, firstC, lastC: POpChunk;
+      bodyStartK, bodyEndK, firstK, lastK: integer;
+      callerBodyStartC, callerBodyEndC: POpChunk;
+      callerBodyStartK, callerBodyEndK: integer;
+      pushStartC: POpChunk; pushStartK: integer;
+      nopC: POpChunk; nopK: integer;
+      calleeFrameSize, callerFrameSize, destFrameSize, maxOff: word;
+      maxLocalOff: word;
+      cloneId: word; ok: boolean;
+      { nClones/cloneFirstC.../cloneLastC...: every successfully-
+        committed clone's own [firstC,firstK..lastC,lastK] range,
+        recorded here so CountArgPushRun's own nested-prologue detector
+        can tell "an earlier clone's own embedded content" apart from a
+        genuine register-argument call site -- see CountArgPushRun's
+        own header comment for the false-rejection bug this fixes.
+        Sized MaxInlineClones, the same provably-safe bound cloneId
+        itself is already gated against. }
+      nClones: integer;
+      cloneFirstC: array[0..MaxInlineClones-1] of POpChunk;
+      cloneFirstK: array[0..MaxInlineClones-1] of integer;
+      cloneLastC: array[0..MaxInlineClones-1] of POpChunk;
+      cloneLastK: array[0..MaxInlineClones-1] of integer;
+      { curEndChunk/curEndSlot: this RANGE's own real end position,
+        kept up to date across successive successful inlines WITHIN the
+        SAME range -- a real, previously-latent bug found via code
+        review: ranges[ri].endChunk/endSlot is a plain (POpChunk,
+        integer) position, captured ONCE by SPHO.PAS's own
+        OptimizeAllDeferred before InlineVoidCalls ever runs. Every
+        successful inline inserts new operations (GrowDestinationFrame's
+        own SUB SP,N; CloneOpRange's own clone body; BindStackArgs' own
+        POP/store pairs) via InsertOpAfter, whose own Case 1 (the common
+        case: slack in the same chunk) shifts every LATER slot in that
+        SAME chunk to a higher index IN PLACE -- including the range's
+        own real end position, if it happens to live in the SAME
+        physical chunk as the insertion point (entirely plausible for
+        any small/medium procedure, Chunk=64 slots). Left untouched,
+        ranges[ri].endSlot silently drifts stale after the FIRST
+        successful inline in a range, and every bounded scan that trusts
+        it (this procedure's own outer scan below, LocalDeadAfter, the
+        caller-frame-size lookup) can then terminate at the WRONG
+        operation -- confirmed directly: a caller with two independent,
+        both-otherwise-eligible bare-statement calls had its own SECOND
+        call silently never even reached by the outer scan below, once
+        the FIRST call's own successful inline shifted the range's real
+        end out from under the stale endSlot. Updated after every
+        successful commit by comparing curEndChunk^.count before/after:
+        purely observational (no new output parameters needed on
+        GrowDestinationFrame/CloneOpRange/BindStackArgs), correct
+        regardless of exactly which of the three inserted how many
+        operations where, as long as the chunk that grew is the SAME
+        chunk curEndChunk currently names (if it grew a DIFFERENT
+        chunk, curEndSlot's own meaning in curEndChunk is unaffected).
+        The rarer case -- InsertOpAfter's own Case 2, a FULL chunk
+        SPLIT (curEndChunk itself was completely full at the insertion
+        point, moving its own [k+1..Chunk] remainder, which curEndSlot
+        may have been part of, into a brand new chunk) -- is also
+        handled: detected via curEndChunk^.next changing combined with
+        curEndSlot no longer fitting in curEndChunk's own new, smaller
+        .count, followed into the new chunk with the same slot
+        arithmetic InsertOpAfter's own Case 2 itself uses. }
+      curEndChunk: POpChunk; curEndSlot: integer;
+      endChunkCountBefore: integer; endChunkNextBefore: POpChunk;
+begin
+  cloneId := 1;
+  nClones := 0;
+  for callee := 0 to MaxProcs - 1 do calleeIdx[callee] := -1;
+  for ri := 0 to nRanges - 1 do
+    if (ranges[ri].procId >= 0) and (ranges[ri].procId < MaxProcs) then
+      calleeIdx[ranges[ri].procId] := ri;
+  for ri := 0 to nRanges - 1 do begin
+    c := ranges[ri].startChunk; k := ranges[ri].startSlot;
+    curEndChunk := ranges[ri].endChunk; curEndSlot := ranges[ri].endSlot;
+    repeat
+      if (c^.ops[k].kind = TOpInstr)
+         and ((c^.ops[k].mnemonic = MnCall) or (c^.ops[k].mnemonic = MnCallFar))
+         and (c^.ops[k].callProcId <> 0) then begin
+        callee := c^.ops[k].callProcId;
+        if (callee >= 0) and (callee < MaxProcs) and (callee <> ranges[ri].procId)
+           and (cloneId < MaxInlineClones)   { stop inlining, rather
+             than wrap genSaveIdBase (see MaxInlineClones' own header
+             comment) -- a real bug fix, not a new restriction this
+             rule's own scope already didn't have: every module this
+             translator has ever actually built stays far below this
+             bound in practice, it only guards the theoretical case. }
+           and IsSafeInlineCandidate(callee) then begin
+          { "return value unused" -- this call's own result, if any,
+            must not be read afterward (this rule only ever inlines a
+            bare-statement call, never a value use); LocalDeadAfter,
+            Stage B's own existing proof, reused unchanged. }
+          if LocalDeadAfter(c, k, curEndChunk, curEndSlot,
+                             RegMaskAX, FlagMaskNone) then begin
+            argWords := CountArgPushRun(ranges[ri].startChunk, ranges[ri].startSlot,
+                                         c, k, c, k, nClones, cloneFirstC, cloneFirstK,
+                                         cloneLastC, cloneLastK, pushStartC, pushStartK);
+            if argWords >= 0 then begin
+              calleeRi := calleeIdx[callee];
+              if calleeRi >= 0 then begin
+                { Pre-validate the CALLEE's own body shape BEFORE
+                  touching the caller's own operation stream at all --
+                  FindCalleeInlineBody is a pure, read-only scan (no
+                  InsertOpAfter of its own), safe to call speculatively
+                  here without any risk of leaving a half-done inline
+                  behind if it says no. This ordering matters: NOP'ing
+                  the original CALL only ever happens once this proof
+                  has already succeeded, so a rejected candidate never
+                  loses its own real CALL. }
+                if FindCalleeInlineBody(ranges[calleeRi].startChunk, ranges[calleeRi].startSlot,
+                                         ranges[calleeRi].endChunk, ranges[calleeRi].endSlot,
+                                         bodyStartC, bodyStartK, bodyEndC, bodyEndK,
+                                         calleeFrameSize) then begin
+                  { callerFrameSize: the CALLER's own real, current frame
+                    size -- needed as frameBase below so the clone's own
+                    remapped locals never collide with the caller's own
+                    pre-existing [BP-N] locals. Found via the exact same
+                    prologue scan FindCalleeInlineBody already applies to
+                    the callee, applied here to the CALLER's own range
+                    instead -- purely syntactic, no separate helper
+                    needed. bodyEndC/bodyEndK from THIS call (the
+                    caller's own ".return") are discarded; only the
+                    frame-size side effect is wanted here. Also pure/
+                    read-only, same as the callee-side call above.
+
+                    A FAILURE here (no PUSH BP/MOV BP,SP prologue at
+                    all -- a caller with only register parameters and no
+                    locals, SPHO.PAS's own needsFrame=false convention,
+                    can absolutely still make a bare-statement stack-
+                    argument call) must ABORT this call site entirely,
+                    not default callerFrameSize to 0 and proceed anyway
+                    -- a real, previously-latent correctness bug found
+                    via code review (DOCS/TRBUG.MD's own dedicated
+                    entry): GrowDestinationFrame's OWN only failure
+                    paths are this EXACT same "no PUSH BP"/"PUSH BP not
+                    followed by MOV BP,SP" shape, so a caller proven to
+                    lack it here can never make GrowDestinationFrame
+                    succeed later either -- proceeding anyway used to
+                    NOP the original CALL and splice the clone in
+                    FIRST, discovering the doomed GrowDestinationFrame
+                    failure only afterward, with no way back. Checked
+                    HERE, before anything is mutated, so a caller with
+                    no real frame simply leaves this call site
+                    untouched, exactly like every other ineligible site. }
+                  if FindCalleeInlineBody(ranges[ri].startChunk, ranges[ri].startSlot,
+                                           curEndChunk, curEndSlot,
+                                           callerBodyStartC, callerBodyStartK,
+                                           callerBodyEndC, callerBodyEndK,
+                                           callerFrameSize)
+                     { ValidateFrameOperands: proves the CALLEE's own
+                       ORIGINAL body (not yet cloned) contains no
+                       indexed/computed memory operand that would later
+                       make RemapFrameOperands reject the CLONE -- the
+                       other half of this same atomicity fix. Checked
+                       on the ORIGINAL body (bodyStartC/bodyStartK here
+                       still name the callee's own real range, before
+                       CloneOpRange ever runs) since RemapFrameOperands
+                       itself may only ever run AFTER cloning (it
+                       mutates in place) -- IsSafeInlineCandidate never
+                       itself screens for this shape (an indexed array-
+                       element reference, arr[i], DOCS/SPHINX.MD's own
+                       "Array element indexing", is a completely
+                       ordinary, safe-to-CALL construct; it is only
+                       unsafe to INLINE, a distinction this whole
+                       function's own job is to draw). A real,
+                       previously-latent correctness bug found via code
+                       review: an earlier draft called CloneOpRange and
+                       NOP'd the original CALL BEFORE ever finding out
+                       RemapFrameOperands would reject the clone,
+                       leaving a permanently half-applied, broken
+                       transformation behind on rejection -- the real
+                       CALL destroyed, an unremapped, wrong clone left
+                       in its place. }
+                     and ValidateFrameOperands(bodyStartC, bodyStartK, bodyEndC, bodyEndK)
+                  then begin
+                    { endChunkCountBefore/endChunkNextBefore: curEndChunk's
+                      own .count/.next right before this whole commit
+                      sequence's own insertions begin -- compared against
+                      their own values AFTER (below) to keep
+                      curEndChunk/curEndSlot correct across this inline,
+                      INCLUDING the rarer case where curEndChunk itself
+                      gets SPLIT (InsertOpAfter's own Case 2: a full
+                      chunk's own remainder moves into a brand new
+                      chunk) -- see curEndChunk/curEndSlot's own
+                      declaration comment above for the full bug this
+                      fixes. }
+                    endChunkCountBefore := curEndChunk^.count;
+                    endChunkNextBefore := curEndChunk^.next;
+                    { NOP out the original CALL and its own argument
+                      PUSH run (if any) HERE -- only now that EVERY
+                      later step is already proven it must succeed
+                      (the callee's own body shape, the caller's own
+                      real frame, and the callee's own frame-object
+                      operands have all been validated above) -- and
+                      BEFORE CloneOpRange/RemapFrameOperands/
+                      GrowDestinationFrame/BindStackArgs run below. A
+                      real ordering bug found via self-review, separate
+                      from the atomicity fix above: GrowDestinationFrame
+                      may insert a fresh "SUB SP,N" into the CALLER's
+                      own prologue, STRICTLY BEFORE (c,k) in the very
+                      same chunk -- InsertOpAfter's own Case 1 shifts
+                      every later slot in that chunk right by one IN
+                      PLACE, which silently invalidates (c,k) itself (it
+                      would now name whatever got shifted into the old
+                      slot, not the CALL anymore). NOP'ing the CALL/PUSH
+                      run here, while (c,k) is still guaranteed fresh,
+                      sidesteps this entirely -- every later step below
+                      only ever inserts AFTER (c,k) (CloneOpRange's own
+                      afterC/afterK, BindStackArgs' own afterC/afterK),
+                      which never moves (c,k) itself, only what comes
+                      after it. (c,k)'s own original mnemonic/callProcId
+                      are not needed again past this point -- only its
+                      POSITION, as an insertion anchor, which NOP does
+                      not disturb. }
+                    if argWords > 0 then begin
+                      nopC := pushStartC; nopK := pushStartK;
+                      while not ((nopC = c) and (nopK = k)) do begin
+                        nopC^.ops[nopK].mnemonic := MnNop;
+                        if not Advance(nopC, nopK, c, k) then break
+                      end
+                    end;
+                    c^.ops[k].mnemonic := MnNop;
+                    cloneId := cloneId + 1;
+                    CloneOpRange(bodyStartC, bodyStartK, bodyEndC, bodyEndK,
+                                 c, k, cloneId,
+                                 word(cloneId) * InlineGenSaveIdSpacing,
+                                 firstC, firstK, lastC, lastK);
+                    { Record this clone's own [firstC,firstK..lastC,lastK]
+                      range for CountArgPushRun's own later nested-
+                      prologue exemption (see its own header comment) --
+                      nClones is already provably < MaxInlineClones here
+                      (the SAME bound cloneId was gated against above),
+                      so this array write can never overflow. }
+                    if nClones < MaxInlineClones then begin
+                      cloneFirstC[nClones] := firstC; cloneFirstK[nClones] := firstK;
+                      cloneLastC[nClones] := lastC; cloneLastK[nClones] := lastK;
+                      nClones := nClones + 1
+                    end;
+                    { firstC/firstK: the clone's own real first operation
+                      -- NOT (c,k), the CALL's own position, which is one
+                      operation too early (bug found via self-review: a
+                      RemapFrameOperands scan that started at the CALL
+                      itself was harmless in practice, since the CALL has
+                      no memory operand of interest, but was still the
+                      wrong scope on principle -- CloneOpRange now
+                      reports its own start directly, so the scope can
+                      be exact).
+
+                      RemapFrameOperands is now GUARANTEED to succeed
+                      here (ok is not even checked below) -- the clone
+                      is byte-for-byte the same operations
+                      ValidateFrameOperands already proved acceptable
+                      above, on the ORIGINAL body, and CloneOpRange
+                      never alters an operand's own memory-reference
+                      text at all (only TOpLabel/genSaveId fields, per
+                      its own header comment), so the SAME proof still
+                      holds on the clone verbatim. }
+                    ok := RemapFrameOperands(firstC, firstK, lastC, lastK,
+                                              callerFrameSize, maxOff, maxLocalOff);
+                    { destFrameSize: maxLocalOff, NOT maxOff -- a real
+                      bug found via code review: maxOff also folds in
+                      the clone's own POSITIVE-offset ([BP+N]) parameter
+                      references, which need no SUB SP,N space at all
+                      (GrowDestinationFrame's own documented contract is
+                      "[BP-1..BP-newFrameSize]", the local region only --
+                      see RemapFrameOperands' own header comment for the
+                      full story). Using maxOff here would have grown
+                      the caller's own frame using a PARAMETER's own
+                      magnitude, reserving real stack space no local
+                      variable of the clone's ever needs. }
+                    destFrameSize := maxLocalOff;
+                    { GrowDestinationFrame is now also GUARANTEED to
+                      succeed -- the caller's own PUSH BP/MOV BP,SP
+                      prologue shape was already proven present above
+                      (the very same shape this function's own only two
+                      failure paths check for), and this call never
+                      SHRINKS an existing frame, only grows or leaves it
+                      -- so BindStackArgs below always runs. }
+                    if GrowDestinationFrame(ranges[ri].startChunk, ranges[ri].startSlot,
+                                             curEndChunk, curEndSlot,
+                                             destFrameSize) then
+                      BindStackArgs(c, k, argWords, callerFrameSize, lastC, lastK);
+                    { Refresh curEndChunk/curEndSlot now that every
+                      insertion this commit could ever make (NOP is not
+                      an insertion; GrowDestinationFrame/CloneOpRange/
+                      BindStackArgs are the only three) has already
+                      happened -- purely observational, correct
+                      regardless of exactly which of the three inserted
+                      how many operations where.
+
+                      If curEndChunk^.next changed (InsertOpAfter's own
+                      Case 2 split it: it was completely full, and the
+                      insertion landed before curEndSlot's own old
+                      position, moving the whole [k+1..Chunk] remainder
+                      -- which, since curEndSlot was inside it, now
+                      includes the range's own real end -- into a brand
+                      new chunk) AND curEndSlot no longer fits within
+                      curEndChunk's own new, smaller .count, curEndSlot
+                      moved into that new chunk: follow it there,
+                      computing its own new slot the same way
+                      InsertOpAfter's own Case 2 itself does (old slot
+                      minus the truncated chunk's own new count). Simple
+                      same-chunk growth (the common case, no split at
+                      all) is still just curEndSlot += the observed
+                      count delta. }
+                    if (curEndChunk^.next <> endChunkNextBefore)
+                       and (curEndSlot > curEndChunk^.count) then begin
+                      { old slot s (> k) landed at overflow^.ops[s-k];
+                        curEndChunk^.count is now the TRUNCATED count,
+                        k+1 (InsertOpAfter's own Case 2), so k = count-1
+                        and s-k = curEndSlot - curEndChunk^.count + 1. }
+                      curEndSlot := curEndSlot - curEndChunk^.count + 1;
+                      curEndChunk := curEndChunk^.next
+                    end else
+                      curEndSlot := curEndSlot + (curEndChunk^.count - endChunkCountBefore)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    until not Advance(c, k, curEndChunk, curEndSlot)
+  end
+end;
+
 { ============================================================
   STAGE F: LOOP TRANSFORMATIONS (OPT.TXT S9) -- shared dominance/
   natural-loop infrastructure
@@ -6667,6 +8160,166 @@ begin
         allocated (BuildCfg's own New(cfg) runs unconditionally). }
     end
   until not changed or (passNum >= MaxDemandPasses)
+end;
+
+function IsSafeInlineCandidate(procId: integer): boolean;
+begin
+  if inlineSafeValid and (procId >= 0) and (procId < MaxProcs) then
+    IsSafeInlineCandidate := inlineSafe[procId]
+  else
+    IsSafeInlineCandidate := false
+end;
+
+{ BuildInlineSafety: see its own header comment in the interface
+  section above for the full "what"/"why". Three passes over `ranges`:
+
+  Pass 1 (one scan per range, no CFG/liveness needed at all -- this
+  analysis only ever asks "what does P's own body directly contain,"
+  never "what does the code AFTER some call observe," so it needs none
+  of BuildCallGraph's own control-flow machinery): for every operation
+  in every range, TOpAsm anywhere sets that range's own hasOpaque;
+  MnCall/MnCallFar with callProcId=0 (indirect/unresolved) OR
+  targeting a callee isConservative marks true (external/exported/
+  address-taken) sets that range's own hasUnsupportedCall -- covers
+  "reject opaque assembly/unsupported entry paths" directly. A proven
+  direct, non-conservative callee contributes nothing to either flag
+  here (it may still make the CALLEE itself unsafe as a future INLINE
+  CANDIDATE, via isConservative in pass 3 below, but it does not, by
+  itself, make the CALLER's own body opaque or unsupported).
+
+  Pass 2 (cycle detection, one bounded DFS per range): a range is
+  "onStack" (currently being explored) or "visited" (fully explored,
+  cycle-checked, never needs re-exploring) -- both TDomBitset-sized
+  (512 bits, matching MaxProcs=512 exactly, the same bitset type
+  ComputeDominance's own R12 infrastructure already established,
+  reused here rather than inventing a second 512-bit set type). Ties
+  directly into pass 1's own per-range scan: DFS re-walks a range's own
+  operations on demand (via rangeIndexOf, a procId->ranges-index lookup
+  built once up front) rather than a separately-stored edge list --
+  simpler, and this analysis is not performance-sensitive (runs once
+  per translation, not per optimizer pass). A callee reached while its
+  own procId is already onStack is a proven cycle (direct P->P, or
+  indirect P->Q->...->P) -- every range on the CURRENT dfs stack is
+  marked recursive, not just the one where the cycle was detected,
+  since every one of them is equally part of the same cycle and none
+  of them has a finite, boundable clone size either.
+
+  Pass 3 (final verdict, no further scanning needed): a range's own
+  procId is a safe inline CANDIDATE only if ALL of: not hasOpaque, not
+  hasUnsupportedCall, not recursive (all three from passes 1-2 above),
+  AND not itself isConservative (external/exported/address-taken --
+  the same array BuildCallGraph itself takes, reused here unchanged;
+  see this procedure's own header comment, condition 4, for why this
+  is a real, additional restriction distinct from hasUnsupportedCall). }
+procedure BuildInlineSafety(nProcs: integer; nRanges: integer;
+                             const ranges: array of TProcRange;
+                             const isConservative: array of boolean);
+  var i, ri, callee: integer; c: POpChunk; k: integer;
+      hasOpaque, hasUnsupportedCall, recursive: array[0..MaxProcs-1] of boolean;
+      rangeIndexOf: array[0..MaxProcs-1] of integer;
+      onStack, visited: TDomBitset;
+
+  { DfsRange: explore ranges[ri]'s own direct-call edges looking for a
+    cycle back to any procId currently onStack. Every range reachable
+    from ranges[ri] (including ranges[ri] itself) that turns out to
+    participate in ANY cycle is marked recursive := true here --
+    conservative on purpose: this analysis only needs a sound
+    over-approximation ("could this possibly be part of a cycle"), not
+    a precise SCC decomposition, since the only consumer (pass 3) ever
+    asks a single yes/no "safe to inline" question per procedure. }
+  procedure DfsRange(ri: integer);
+    var c2: POpChunk; k2: integer; callee2, calleeRi: integer;
+  begin
+    DomBitsetSet(onStack, ranges[ri].procId);
+    c2 := ranges[ri].startChunk; k2 := ranges[ri].startSlot;
+    repeat
+      if (c2^.ops[k2].kind = TOpInstr)
+         and ((c2^.ops[k2].mnemonic = MnCall) or (c2^.ops[k2].mnemonic = MnCallFar))
+         and (c2^.ops[k2].callProcId <> 0) then begin
+        callee2 := c2^.ops[k2].callProcId;
+        if (callee2 >= 0) and (callee2 < MaxProcs) then begin
+          if DomBitsetHas(onStack, callee2) then begin
+            { Cycle found -- ranges[ri].procId itself, and callee2 (both
+              already proven onStack), are part of it; ranges[ri].procId
+              is marked directly since it is THIS frame's own subject.
+              Every OTHER frame currently on the stack between callee2
+              and ranges[ri].procId is also part of the same cycle, and
+              will be marked by ITS OWN frame the same way as this
+              recursive call unwinds back through them -- no separate
+              stack-walk needed here. }
+            recursive[ranges[ri].procId] := true
+          end else if not DomBitsetHas(visited, callee2) then begin
+            calleeRi := rangeIndexOf[callee2];
+            if calleeRi >= 0 then begin
+              DfsRange(calleeRi);
+              if recursive[callee2] then recursive[ranges[ri].procId] := true
+            end
+          end
+        end
+      end
+    until not Advance(c2, k2, ranges[ri].endChunk, ranges[ri].endSlot);
+    DomBitsetClear(onStack); { NOTE: this clears the WHOLE set, not just
+      ranges[ri].procId's own bit -- correct here ONLY because callers
+      of DfsRange (both the top-level pass 2 loop and DfsRange's own
+      recursive call above) never rely on any OTHER bit already set in
+      onStack surviving a nested call: each top-level DfsRange call
+      starts with onStack already empty (see pass 2's own loop below),
+      and a nested call's own bit is re-added fresh via DomBitsetSet at
+      its own very next invocation regardless of this clear. Bounded,
+      not unbounded recursion: DfsRange only ever recurses into a
+      callee not already visited, and every range is marked visited
+      exactly once (below), so total recursive calls across this whole
+      procedure is at most nRanges. }
+    DomBitsetSet(visited, ranges[ri].procId)
+  end;
+
+begin
+  for i := 0 to MaxProcs - 1 do begin
+    hasOpaque[i] := false; hasUnsupportedCall[i] := false; recursive[i] := false;
+    rangeIndexOf[i] := -1; inlineSafe[i] := false
+  end;
+  for ri := 0 to nRanges - 1 do begin
+    if (ranges[ri].procId >= 0) and (ranges[ri].procId < MaxProcs) then
+      rangeIndexOf[ranges[ri].procId] := ri
+  end;
+  { Pass 1: opaque-ASM / unsupported-call-site scan, one pass per range. }
+  for ri := 0 to nRanges - 1 do begin
+    if (ranges[ri].procId >= 0) and (ranges[ri].procId < MaxProcs) then begin
+      c := ranges[ri].startChunk; k := ranges[ri].startSlot;
+      repeat
+        if c^.ops[k].kind = TOpAsm then
+          hasOpaque[ranges[ri].procId] := true
+        else if c^.ops[k].kind = TOpInstr then begin
+          if (c^.ops[k].mnemonic = MnCall) or (c^.ops[k].mnemonic = MnCallFar) then begin
+            callee := c^.ops[k].callProcId;
+            if callee = 0 then
+              hasUnsupportedCall[ranges[ri].procId] := true
+            else if (callee >= 0) and (callee < MaxProcs) then begin
+              if (callee < nProcs) and isConservative[callee] then
+                hasUnsupportedCall[ranges[ri].procId] := true
+            end
+          end
+        end
+      until not Advance(c, k, ranges[ri].endChunk, ranges[ri].endSlot)
+    end
+  end;
+  { Pass 2: cycle detection, one bounded DFS per not-yet-visited range. }
+  DomBitsetClear(onStack); DomBitsetClear(visited);
+  for ri := 0 to nRanges - 1 do begin
+    if (ranges[ri].procId >= 0) and (ranges[ri].procId < MaxProcs)
+       and not DomBitsetHas(visited, ranges[ri].procId) then
+      DfsRange(ri)
+  end;
+  { Pass 3: final per-procedure verdict. }
+  for ri := 0 to nRanges - 1 do begin
+    if (ranges[ri].procId >= 0) and (ranges[ri].procId < MaxProcs) then begin
+      i := ranges[ri].procId;
+      inlineSafe[i] := (not hasOpaque[i]) and (not hasUnsupportedCall[i])
+                        and (not recursive[i])
+                        and not ((i < nProcs) and isConservative[i])
+    end
+  end;
+  inlineSafeValid := true
 end;
 
 procedure OptimizePass(startChunk: POpChunk; startSlot: integer;
